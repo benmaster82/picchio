@@ -34,7 +34,7 @@
 
 /* ── Costanti ── */
 
-#define ST_MAX_TENSORS  8192   /* max tensori per file */
+#define ST_MAX_TENSORS  32768   /* max tensori per file (GPT-OSS ha ~1300/shard × 15) */
 #define ST_MAX_NAME     256    /* max lunghezza nome tensore */
 #define ST_MAX_FILES    64     /* max file (shard) aperti */
 
@@ -111,7 +111,7 @@ typedef struct {
 typedef struct {
     StFile files[ST_MAX_FILES];
     int n_files;
-    StTensor tensors[ST_MAX_TENSORS];
+    StTensor *tensors;     /* heap-allocated [ST_MAX_TENSORS] */
     int n_tensors;
 } StDB;
 
@@ -119,6 +119,7 @@ typedef struct {
 
 static void st_init(StDB *db) {
     memset(db, 0, sizeof(*db));
+    db->tensors = (StTensor *)calloc(ST_MAX_TENSORS, sizeof(StTensor));
 }
 
 /* ── Parser dell'header JSON per estrarre tensori ── */
@@ -405,6 +406,8 @@ static void st_close(StDB *db) {
             close(db->files[i].fd);
 #endif
     }
+    free(db->tensors);
+    db->tensors = NULL;
     db->n_files = 0;
     db->n_tensors = 0;
 }

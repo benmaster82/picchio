@@ -1822,13 +1822,33 @@ int main(int argc, char **argv) {
     Cfg *c = &m.c;
     m.L = calloc(c->n_layers, sizeof(Layer));
 
-    /* KV-cache (4K iniziali, ~9 MB con D=64 head_dim, 8 KV heads, 36 layer) */
-    int initial_ctx = 4096;
+    /* KV-cache (512 posizioni iniziali per stare in 16 GB RAM) */
+    int initial_ctx = 512;
+    const char *ctx_env = getenv("CTX");
+    if (ctx_env) initial_ctx = atoi(ctx_env);
     if (initial_ctx > c->ctx_len) initial_ctx = c->ctx_len;
     kv_init(&m.kv, c->n_layers, c->n_kv_heads, c->head_dim, initial_ctx);
 
-    /* Cache expert per-layer */
-    m.ecap = 32;
+    /* Cache expert per-layer — limita per stare in RAM.
+     * Ogni expert = ~12.4 MB. Con 16 GB RAM:
+     * - Densa: 1.1 GB
+     * - KV-cache: ~40 MB (512 pos)
+     * - OS/overhead: ~2 GB
+     * - Disponibile per expert: ~12 GB → ~960 slot totali → ~26 per layer
+     */
+    int pin_gb_env = 0;
+    { const char *v = getenv("PIN_GB"); if (v) pin_gb_env = atoi(v); }
+    int64_t avail_bytes = (pin_gb_env > 0 ? (int64_t)pin_gb_env : 6LL) * 1024*1024*1024;
+    int64_t expert_bytes = (int64_t)c->moe_inter * ((c->hidden + 1) / 2)  /* gate_up */
+                         + (int64_t)c->hidden * ((c->hidden + 1) / 2)     /* down */
+                         + (int64_t)(c->moe_inter + c->hidden) * 4;       /* scales+bias */
+    int total_slots = (int)(avail_bytes / expert_bytes);
+    m.ecap = total_slots / c->n_layers;
+    if (m.ecap < 4) m.ecap = 4;
+    if (m.ecap > 128) m.ecap = 128;
+    fprintf(stderr, "  expert cache: %d slot/layer × %d layer (%d expert totali, ~%.1f GB)\n",
+            m.ecap, c->n_layers, m.ecap * c->n_layers,
+            (double)m.ecap * c->n_layers * expert_bytes / 1e9);
     m.ecache = calloc(c->n_layers, sizeof(ESlot *));
     m.ecn = calloc(c->n_layers, sizeof(int));
     m.pin = calloc(c->n_layers, sizeof(ESlot *));
