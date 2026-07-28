@@ -240,10 +240,14 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                     if is_bias:
                         output_tensors[key] = tensor_np.astype(np.float32)
                         stats["bias"] += tensor_np.size * 4
-                    elif tensor_np.dtype == np.uint8:
-                        # Già packed (MXFP4 blocks) — passa direttamente
+                    elif "blocks" in key:
+                        # MXFP4 blocks — dequantizziamo con le scale associate
+                        # Salva temporaneamente, processeremo dopo con le scale
                         output_tensors[key] = tensor_np
-                        stats["expert_i4"] += tensor_np.nbytes
+                        stats["expert_i4"] += 0  # conteggio dopo
+                    elif "scales" in key:
+                        # MXFP4 scales E8M0 — salva per combinare con blocks
+                        output_tensors[key] = tensor_np
                     else:
                         # Expert weight F32 — quantizza a INT4
                         t_f32 = tensor_np.astype(np.float32)
@@ -334,6 +338,77 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
         
         output_tensors = {}
         convert_shard(str(shard_path), output_tensors, cfg, stats, dense_bits)
+        
+        # ── Post-processing: dequantizza MXFP4 blocks+scales → INT4 ──
+        blocks_keys = [k for k in list(output_tensors.keys()) if k.endswith("_blocks")]
+        for bk in blocks_keys:
+            base = bk[:-7]  # rimuovi "_blocks"
+            sk = base + "_scales"
+            
+            if sk not in output_tensors:
+                continue
+            
+            blocks = output_tensors[bk]   # uint8 [n_experts, rows, n_blocks, 16]
+            scales = output_tensors[sk]    # uint8 [n_experts, rows, n_blocks] E8M0
+            
+            n_exp = blocks.shape[0]
+            rows = blocks.shape[1]
+            n_blk = blocks.shape[2]
+            block_size = 32  # 16 bytes × 2 values/byte
+            cols = n_blk * block_size  # = 2880
+            
+            print(f"    MXFP4: {base} [{n_exp}×{rows}×{cols}]...", end="", flush=True)
+            
+            # Dequant per expert, riga per riga (vettorizzato per blocco)
+            for e in range(n_exp):
+                # blocks[e]: [rows, n_blk, 16] → unpack nibbles
+                blk_flat = blocks[e].reshape(rows, n_blk * 16)  # [rows, n_blk*16]
+                
+                # Unpack: 2 FP4 per byte
+                lo = blk_flat & 0x0F
+                hi = (blk_flat >> 4) & 0x0F
+                # Interleave: [lo0, hi0, lo1, hi1, ...]
+                nibbles = np.empty((rows, n_blk * 32), dtype=np.uint8)
+                nibbles[:, 0::2] = lo
+                nibbles[:, 1::2] = hi
+                nibbles = nibbles[:, :cols]  # trim
+                
+                # FP4 → float via LUT
+                values = FP4_LUT[nibbles]  # [rows, cols]
+                
+                # Scale E8M0: value = 2^(raw - 127)
+                sc = scales[e]  # [rows, n_blk]
+                sc_float = np.ldexp(np.ones_like(sc, dtype=np.float32),
+                                    sc.astype(np.int32) - 127)  # [rows, n_blk]
+                
+                # Broadcast scale per blocco di 32
+                sc_expanded = np.repeat(sc_float, block_size, axis=1)[:, :cols]
+                values *= sc_expanded
+                
+                # Quantizza a INT4
+                packed, row_scales = quantize_int4(values)
+                
+                # Salva con nome per Picchio:
+                # model.layers.X.mlp.experts.Y.{gate_up_proj|down_proj}
+                # Estraiamo layer e nome proiezione dal key
+                # base = "model.layers.X.mlp.experts.{gate_up_proj|down_proj}"
+                out_key = f"{base}.{e}"
+                output_tensors[out_key] = packed
+                output_tensors[out_key + ".qs"] = row_scales
+                stats["expert_i4"] += packed.nbytes + row_scales.nbytes
+            
+            # Rimuovi blocks e scales originali
+            del output_tensors[bk]
+            del output_tensors[sk]
+            print(f" ✓ ({n_exp} expert)")
+        
+        # Converti bias expert da BF16 a F32
+        bias_keys = [k for k in list(output_tensors.keys()) 
+                     if "experts" in k and "bias" in k and isinstance(output_tensors[k], np.ndarray)]
+        for bk in bias_keys:
+            t = output_tensors[bk]
+            if t.dtype != np.float32:
+                output_tensors[bk] = t.astype(np.float32)
         
         # Salva output shard
         out_name = f"model-{si:05d}.safetensors"

@@ -452,15 +452,19 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
 
     /* ── Carica gate_up_proj: [moe_inter, D] ── */
     snprintf(name, sizeof(name),
-             "model.layers.%d.mlp.experts.%d.gate_up_proj", layer, eid);
+             "model.layers.%d.mlp.experts.gate_up_proj.%d", layer, eid);
     StTensor *t_gu = st_find(g_db, name);
 
-    /* Prova formato alternativo (separato gate + up) */
+    /* Prova nomi alternativi */
     if (!t_gu) {
         snprintf(name, sizeof(name),
-                 "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, eid);
+                 "model.layers.%d.mlp.experts.%d.gate_up_proj", layer, eid);
         t_gu = st_find(g_db, name);
-        /* Se gate e up sono separati, serve logica diversa — per ora skip */
+    }
+    if (!t_gu) {
+        snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.experts.%d.gate_up_proj.weight", layer, eid);
+        t_gu = st_find(g_db, name);
     }
 
     if (!t_gu) {
@@ -494,24 +498,29 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         st_read_raw(g_db, t_gu, s->gu.q4, rb);
         /* Cerca scale */
         snprintf(name, sizeof(name),
-                 "model.layers.%d.mlp.experts.%d.gate_up_proj.qs", layer, eid);
+                 "model.layers.%d.mlp.experts.gate_up_proj.%d.qs", layer, eid);
         StTensor *t_s = st_find(g_db, name);
+        if (!t_s) {
+            snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.gate_up_proj.qs", layer, eid);
+            t_s = st_find(g_db, name);
+        }
         s->gu.s = falloc(I);
         if (t_s) st_read_raw(g_db, t_s, s->gu.s, I * 4);
         else for (int i = 0; i < I; i++) s->gu.s[i] = 1.0f;
         free(gu_f32);
-        goto load_down;
+        /* Skip la quantizzazione, vai a down_proj */
+    } else {
+        /* F32/BF16: quantizza gate_up a INT4 */
+        memset(&s->gu, 0, sizeof(QT));
+        s->gu.fmt = 2;
+        s->gu.O = I;
+        s->gu.I = D;
+        s->gu.q4 = (uint8_t *)malloc((int64_t)I * ((D + 1) / 2));
+        s->gu.s = falloc(I);
+        quantize_rows_i4(gu_f32, s->gu.q4, s->gu.s, I, D);
+        free(gu_f32);
     }
-
-    /* Quantizza gate_up a INT4 */
-    memset(&s->gu, 0, sizeof(QT));
-    s->gu.fmt = 2;
-    s->gu.O = I;
-    s->gu.I = D;
-    s->gu.q4 = (uint8_t *)malloc((int64_t)I * ((D + 1) / 2));
-    s->gu.s = falloc(I);
-    quantize_rows_i4(gu_f32, s->gu.q4, s->gu.s, I, D);
-    free(gu_f32);
 
     /* ── Carica gate_up bias ── */
     snprintf(name, sizeof(name),
@@ -522,11 +531,15 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         st_read_raw(g_db, t_gub, s->gu_bias, I * 4);
     }
 
-load_down:
     /* ── Carica down_proj: [D, D] ── */
     snprintf(name, sizeof(name),
-             "model.layers.%d.mlp.experts.%d.down_proj", layer, eid);
+             "model.layers.%d.mlp.experts.down_proj.%d", layer, eid);
     StTensor *t_d = st_find(g_db, name);
+    if (!t_d) {
+        snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.experts.%d.down_proj", layer, eid);
+        t_d = st_find(g_db, name);
+    }
     if (!t_d) {
         snprintf(name, sizeof(name),
                  "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, eid);
