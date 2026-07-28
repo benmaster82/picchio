@@ -651,6 +651,19 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
 
     /* Carica da disco */
     double t0 = now_s();
+    
+    /* Free vecchi dati se lo slot era occupato (eviction) */
+    if (victim->eid >= 0) {
+        free(victim->gu.q4); victim->gu.q4 = NULL;
+        free(victim->gu.s);  victim->gu.s = NULL;
+        free(victim->d.q4);  victim->d.q4 = NULL;
+        free(victim->d.s);   victim->d.s = NULL;
+        free(victim->gu_bias); victim->gu_bias = NULL;
+        free(victim->d_bias);  victim->d_bias = NULL;
+        free(victim->slab);    victim->slab = NULL;
+        free(victim->fslab);   victim->fslab = NULL;
+    }
+    
     expert_load(m, layer, eid, victim);
     m->t_edisk += now_s() - t0;
     victim->last_used = ++m->eclock;

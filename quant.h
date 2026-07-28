@@ -58,12 +58,16 @@ static inline int64_t qt_bytes(const QT *t) {
 /* ── Allocazione ── */
 
 static inline float *falloc(int64_t n) {
-    if (n < 0 || (uint64_t)n > SIZE_MAX / sizeof(float)) {
+    if (n <= 0 || (uint64_t)n > SIZE_MAX / sizeof(float)) {
         fprintf(stderr, "falloc: n=%lld fuori range\n", (long long)n);
         exit(1);
     }
-    float *p = malloc((size_t)n * sizeof(float));
-    if (!p) { fprintf(stderr, "OOM\n"); exit(1); }
+    float *p = (float *)malloc((size_t)n * sizeof(float));
+    if (!p) {
+        fprintf(stderr, "OOM (falloc %lld floats = %.1f MB)\n",
+                (long long)n, (double)n * 4 / 1e6);
+        exit(1);
+    }
     return p;
 }
 
