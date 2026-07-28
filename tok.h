@@ -143,181 +143,91 @@ static int tok_decode_byte_char(const char *s, int *advance) {
     return -1;
 }
 
-/* ── Parse del tokenizer.json (HuggingFace format) ── */
+/* ── Parse del tokenizer: formato binario Picchio (picchio_vocab.bin) ── */
+/* Molto più veloce del parsing JSON da 28 MB.
+ * Generato da export_vocab.py. */
 
-static int tok_load(Tokenizer *t, const char *path) {
-    memset(t, 0, sizeof(*t));
-
+static int tok_load_binary(Tokenizer *t, const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "tok: impossibile aprire %s\n", path);
-        return -1;
+    if (!f) return -1;
+
+    /* Header */
+    char magic[4];
+    uint32_t total, n_added, eos_id, pad_id;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "PVOC", 4) != 0) {
+        fclose(f); return -1;
     }
+    fread(&total, 4, 1, f);
+    fread(&n_added, 4, 1, f);
+    fread(&eos_id, 4, 1, f);
+    fread(&pad_id, 4, 1, f);
 
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = (char *)malloc(sz + 1);
-    if (!buf) { fclose(f); return -1; }
-    fread(buf, 1, sz, f);
-    buf[sz] = '\0';
-    fclose(f);
+    t->vocab_size = (int)total;
+    t->eos_id = (int)eos_id;
+    t->pad_id = (int)pad_id;
+    t->bos_id = -1;
 
-    /* Conta token nel vocabolario per allocare */
-    /* Il formato è: "vocab": {"token": id, ...} */
-    const char *vocab_start = strstr(buf, "\"vocab\"");
-    if (!vocab_start) {
-        /* Prova formato alternativo: "model": {"vocab": ...} */
-        vocab_start = strstr(buf, "\"model\"");
-        if (vocab_start) {
-            vocab_start = strstr(vocab_start, "\"vocab\"");
-        }
-    }
+    /* Alloca */
+    t->vocab = (char **)calloc(total, sizeof(char *));
+    t->vocab_len = (int *)calloc(total, sizeof(int));
 
-    if (!vocab_start) {
-        fprintf(stderr, "tok: 'vocab' non trovato in %s\n", path);
-        free(buf);
-        return -1;
-    }
-
-    /* Stima vocab size (conta le virgolette di apertura dei token) */
-    int estimated_size = 0;
-    const char *p = vocab_start;
-    const char *end = buf + sz;
-    int brace_depth = 0;
-    int in_vocab = 0;
-    while (p < end) {
-        if (*p == '{' && !in_vocab) { in_vocab = 1; brace_depth = 1; p++; continue; }
-        if (in_vocab) {
-            if (*p == '{') brace_depth++;
-            if (*p == '}') { brace_depth--; if (brace_depth == 0) break; }
-            if (*p == ':') estimated_size++;
-        }
-        p++;
-    }
-
-    if (estimated_size <= 0) estimated_size = 201088;
-    t->vocab_size = estimated_size;
-
-    /* Alloca strutture */
-    t->vocab = (char **)calloc(t->vocab_size, sizeof(char *));
-    t->vocab_len = (int *)calloc(t->vocab_size, sizeof(int));
-
-    /* Hash table: 4x vocab per bassa collisione */
+    /* Hash table */
     t->ht_cap = 1;
-    while (t->ht_cap < t->vocab_size * 4) t->ht_cap <<= 1;
+    while (t->ht_cap < total * 4) t->ht_cap <<= 1;
     t->ht_hash = (uint32_t *)calloc(t->ht_cap, sizeof(uint32_t));
     t->ht_id = (int *)malloc(t->ht_cap * sizeof(int));
     for (int i = 0; i < t->ht_cap; i++) t->ht_id[i] = -1;
 
-    /* Parse del vocabolario */
-    p = vocab_start;
-    /* Trova il primo '{' dopo "vocab" */
-    while (p < end && *p != '{') p++;
-    if (p >= end) { free(buf); return -1; }
-    p++;  /* skip '{' */
-
-    int max_id = 0;
-    int loaded = 0;
-    while (p < end && *p != '}') {
-        /* Skip whitespace e virgole */
-        while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' ||
-               *p == '\t' || *p == ',')) p++;
-        if (*p == '}') break;
-
-        /* Parse "token": id */
-        if (*p != '"') { p++; continue; }
-        p++;  /* skip opening quote */
-
-        /* Leggi token string (con gestione escape) */
-        char token_buf[TOK_MAX_TOKEN_LEN];
-        int tlen = 0;
-        while (p < end && *p != '"' && tlen < TOK_MAX_TOKEN_LEN - 1) {
-            if (*p == '\\' && p + 1 < end) {
-                p++;
-                switch (*p) {
-                    case 'n': token_buf[tlen++] = '\n'; break;
-                    case 'r': token_buf[tlen++] = '\r'; break;
-                    case 't': token_buf[tlen++] = '\t'; break;
-                    case '"': token_buf[tlen++] = '"'; break;
-                    case '\\': token_buf[tlen++] = '\\'; break;
-                    case '/': token_buf[tlen++] = '/'; break;
-                    case 'u': {
-                        /* Unicode escape \uXXXX */
-                        if (p + 4 < end) {
-                            char hex[5] = {p[1], p[2], p[3], p[4], 0};
-                            int cp = (int)strtol(hex, NULL, 16);
-                            p += 4;
-                            /* Encode codepoint as UTF-8 */
-                            if (cp < 0x80) {
-                                token_buf[tlen++] = (char)cp;
-                            } else if (cp < 0x800) {
-                                token_buf[tlen++] = (char)(0xC0 | (cp >> 6));
-                                token_buf[tlen++] = (char)(0x80 | (cp & 0x3F));
-                            } else {
-                                token_buf[tlen++] = (char)(0xE0 | (cp >> 12));
-                                token_buf[tlen++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                                token_buf[tlen++] = (char)(0x80 | (cp & 0x3F));
-                            }
-                        }
-                        break;
-                    }
-                    default: token_buf[tlen++] = *p; break;
-                }
-            } else {
-                token_buf[tlen++] = *p;
-            }
-            p++;
-        }
-        if (*p == '"') p++;  /* skip closing quote */
-
-        /* Skip to ':' */
-        while (p < end && *p != ':') p++;
-        if (p >= end) break;
-        p++;  /* skip ':' */
-
-        /* Parse id */
-        while (p < end && (*p == ' ' || *p == '\t')) p++;
-        int id = (int)strtol(p, (char **)&p, 10);
-
-        /* Store */
-        if (id >= 0 && id < t->vocab_size) {
-            t->vocab[id] = (char *)malloc(tlen + 1);
-            memcpy(t->vocab[id], token_buf, tlen);
-            t->vocab[id][tlen] = '\0';
-            t->vocab_len[id] = tlen;
-            tok_ht_insert(t, token_buf, tlen, id);
-            if (id > max_id) max_id = id;
-            loaded++;
-        }
+    /* Leggi token */
+    for (uint32_t i = 0; i < total; i++) {
+        uint16_t len;
+        if (fread(&len, 2, 1, f) != 1) break;
+        char *s = (char *)malloc(len + 1);
+        if (len > 0) fread(s, 1, len, f);
+        s[len] = '\0';
+        t->vocab[i] = s;
+        t->vocab_len[i] = (int)len;
+        if (len > 0)
+            tok_ht_insert(t, s, (int)len, (int)i);
     }
 
-    t->vocab_size = max_id + 1;
-
-    /* Special tokens */
-    t->eos_id = 200002;
-    t->bos_id = -1;  /* GPT-OSS non usa BOS esplicito */
-    t->pad_id = 199999;
-
-    /* Cerca special tokens nel JSON */
-    const char *added = strstr(buf, "\"added_tokens\"");
-    if (added) {
-        /* Parse added_tokens per trovare EOS/BOS/PAD */
-        const char *eos = strstr(added, "\"<|endoftext|>\"");
-        if (eos) {
-            const char *id_s = strstr(eos, "\"id\"");
-            if (id_s) {
-                id_s += 4;
-                while (*id_s && *id_s != ':') id_s++;
-                if (*id_s == ':') t->eos_id = (int)strtol(id_s + 1, NULL, 10);
-            }
-        }
-    }
-
-    free(buf);
-    fprintf(stderr, "  tok: %d token caricati (max_id=%d, eos=%d)\n",
-            loaded, max_id, t->eos_id);
+    fclose(f);
+    fprintf(stderr, "  tok: %d token caricati (binario, eos=%d)\n",
+            t->vocab_size, t->eos_id);
     return 0;
+}
+
+static int tok_load(Tokenizer *t, const char *path) {
+    memset(t, 0, sizeof(*t));
+
+    /* Prova prima il formato binario (veloce) */
+    {
+        /* Cerca picchio_vocab.bin nella stessa directory */
+        char bin_path[512];
+        /* Estrai directory dal path */
+        strncpy(bin_path, path, sizeof(bin_path) - 1);
+        char *last_sep = strrchr(bin_path, '/');
+        if (!last_sep) last_sep = strrchr(bin_path, '\\');
+        if (last_sep) {
+            strcpy(last_sep + 1, "picchio_vocab.bin");
+        } else {
+            strcpy(bin_path, "picchio_vocab.bin");
+        }
+        
+        if (tok_load_binary(t, bin_path) == 0) return 0;
+    }
+
+    /* Fallback: parse tokenizer.json (lento, supporto limitato) */
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "tok: impossibile aprire %s\n", path);
+        fprintf(stderr, "     Genera il vocab binario: python export_vocab.py\n");
+        return -1;
+    }
+    fclose(f);
+    fprintf(stderr, "tok: tokenizer.json trovato ma serve il formato binario.\n");
+    fprintf(stderr, "     Esegui: python export_vocab.py %s\n", path);
+    return -1;
 }
 
 /* ── Decode: token_id → stringa UTF-8 ── */
