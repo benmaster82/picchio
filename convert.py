@@ -282,7 +282,13 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                     if t_f32.ndim == 1:
                         output_tensors[key] = t_f32
                         stats["bias"] += t_f32.nbytes
+                    elif is_attn:
+                        # Attention: NON quantizzare (modules_to_not_convert)
+                        # Mantieni F32 per preservare qualità
+                        output_tensors[key] = t_f32
+                        stats["dense_i4"] += t_f32.nbytes
                     else:
+                        # Embedding/lm_head: quantizza a INT4 gs64
                         t_2d = t_f32.reshape(-1, t_f32.shape[-1])
                         packed, scales = quantize_int4(t_2d)
                         output_tensors[key] = packed

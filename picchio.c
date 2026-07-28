@@ -1623,10 +1623,18 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
         return 0;
     }
 
-    /* F32/BF16/F16: carica e quantizza */
+    /* F32/BF16/F16: carica */
     float *f = load_f32_tensor(db, name, (int64_t)O * I);
     if (!f) return -1;
 
+    /* Se il tensore è F32 nel file, tienilo F32 (attention, non quantizzare) */
+    if (t->dtype == ST_F32) {
+        qt->fmt = 0;
+        qt->qf = f;
+        return 0;
+    }
+
+    /* BF16/F16 → quantizza a INT4 */
     qt->q4 = (uint8_t *)malloc((int64_t)O * ((I + 1) / 2));
     qt->s = falloc(O);
     quantize_rows_i4(f, qt->q4, qt->s, O, I);
