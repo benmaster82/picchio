@@ -1,0 +1,26 @@
+# Binari
+*.exe
+*.o
+*.obj
+
+# Directory modello (60+ GB)
+test_model/
+gptoss_i4/
+gptoss_raw/
+
+# File temporanei
+*.log
+*.tmp
+do.sh
+
+# Hot-store (generato a runtime)
+.picchio_usage
+.picchio_kv
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
