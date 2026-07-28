@@ -1988,6 +1988,10 @@ int main(int argc, char **argv) {
 
     /* Se no tokenizer, stampa tutto direttamente (no harmony parsing) */
     if (!has_tokenizer) { in_final = 1; skip_header = 0; }
+    
+    /* Debug: mostra anche analysis se VERBOSE=1 */
+    int show_all = 0;
+    { const char *v = getenv("VERBOSE"); if (v && atoi(v)) show_all = 1; }
 
     for (int i = 0; i < max_tokens; i++) {
         /* Check stop tokens */
@@ -2009,16 +2013,37 @@ int main(int argc, char **argv) {
         } else if (tok_id == TOK_END) {
             /* Fine messaggio — non stampare */
         } else if (skip_header) {
-            /* Siamo nell'header — controlla se è "final" */
-            if (has_tokenizer) {
+            /* Siamo nell'header — controlla se è "final" o se è un token normale */
+            if (tok_id == TOK_CHANNEL || tok_id == TOK_START || tok_id == TOK_END ||
+                tok_id == TOK_MESSAGE) {
+                /* Token speciale nell'header — già gestito sopra */
+            } else if (has_tokenizer) {
                 const char *s = tok_decode(&tok, tok_id);
-                if (strstr(s, "final")) in_final = 1;
-                else if (strstr(s, "analysis")) in_final = 0;
-                else if (strstr(s, "commentary")) in_final = 0;
+                if (strstr(s, "final")) { in_final = 1; }
+                else if (strstr(s, "analysis")) { in_final = 0; }
+                else if (strstr(s, "commentary")) { in_final = 0; }
+                else {
+                    /* Token normale fuori da qualsiasi struttura — 
+                     * il modello sta generando senza header harmony.
+                     * Trattiamo come contenuto diretto. */
+                    skip_header = 0;
+                    in_final = 1;
+                    /* Stampa questo token */
+                    char decoded[512];
+                    tok_decode_raw(&tok, tok_id, decoded, sizeof(decoded));
+                    printf("%s", decoded);
+                    fflush(stdout);
+                }
+            } else {
+                /* No tokenizer, token normale: stampa */
+                skip_header = 0;
+                in_final = 1;
+                printf("[%d]", tok_id);
+                fflush(stdout);
             }
         } else {
-            /* Contenuto del messaggio — stampa se siamo in final (o sempre se no harmony) */
-            if (in_final || !has_tokenizer) {
+            /* Contenuto del messaggio — stampa se siamo in final (o verbose) */
+            if (in_final || show_all || !has_tokenizer) {
                 if (has_tokenizer) {
                     char decoded[512];
                     tok_decode_raw(&tok, tok_id, decoded, sizeof(decoded));
