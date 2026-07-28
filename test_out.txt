@@ -1,0 +1,13 @@
+  st: D:/gptoss_i4/model-00009.safetensors — 1359 tensori, 3.8 GB
+Tensori: 1359
+Trovato: model.layers.0.mlp.experts.gate_up_proj.0
+  dtype=6 ndim=1 shape=[8294400]
+  offset=[554777344, 563071744] (8294400 bytes)
+  read 32 bytes: 98 19 98 86 78 79 97 96 a9 98 88 39 c7 88 77 97 
+Scale trovate: bytes=23040
+  scale[0..3] = 0.013393 0.026786 0.017857 0.026786
+
+Test matmul INT4...
+  Letti 8294400 / 8294400 bytes di dati
+  y[0..4] = -0.0017 0.0019 0.0146 0.0412 -0.0072
+  OK - nessun crash
