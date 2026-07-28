@@ -1604,9 +1604,22 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
         char sn[300];
         snprintf(sn, sizeof(sn), "%s.qs", name);
         StTensor *ts = st_find(db, sn);
-        qt->s = falloc(O);
-        if (ts) st_read_raw(db, ts, qt->s, O * 4);
-        else for (int i = 0; i < O; i++) qt->s[i] = 1.0f;
+        if (ts) {
+            int64_t n_scale = st_numel(ts);
+            qt->s = (float *)malloc(n_scale * sizeof(float));
+            st_read_raw(db, ts, qt->s, n_scale * sizeof(float));
+            /* Determina se è group-scaled: n_scale > O significa gs */
+            if (n_scale > O) {
+                qt->block_size = (int)((int64_t)O * I / n_scale);
+                if (qt->block_size <= 0) qt->block_size = 64;
+            } else {
+                qt->block_size = 0;  /* per-row */
+            }
+        } else {
+            qt->s = (float *)malloc(O * sizeof(float));
+            for (int i = 0; i < O; i++) qt->s[i] = 1.0f;
+            qt->block_size = 0;
+        }
         return 0;
     }
 

@@ -252,12 +252,85 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4,
     }
 }
 
+/* ── Matmul INT4 Group-Scaled (gs64): una scala ogni 64 valori ── */
+/* scale layout: [O, n_groups] dove n_groups = ceil(I / 64)
+ * Packed data: identico a INT4 (2 nibble/byte, valore = nibble - 8) */
+
+static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
+                         const float *scale, int S, int I, int O, int gs) {
+    int rb = (I + 1) / 2;
+    int n_groups = (I + gs - 1) / gs;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const float *sc = scale + (int64_t)o * n_groups;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float a = 0;
+            int i = 0;
+            for (int g = 0; g < n_groups; g++) {
+                float group_sc = sc[g];
+                int g_start = g * gs;
+                int g_end = g_start + gs;
+                if (g_end > I) g_end = I;
+                float ga = 0;
+#ifdef __AVX2__
+                int gi = g_start;
+                __m256 acc = _mm256_setzero_ps();
+                const __m128i m4 = _mm_set1_epi8(0x0F);
+                const __m256i b8 = _mm256_set1_epi32(8);
+                for (; gi + 16 <= g_end; gi += 16) {
+                    __m128i by = _mm_loadl_epi64((const __m128i *)(w + (gi >> 1)));
+                    __m128i lo = _mm_and_si128(by, m4);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+                    __m128i nib = _mm_unpacklo_epi8(lo, hi);
+                    __m256 w0 = _mm256_cvtepi32_ps(
+                        _mm256_sub_epi32(_mm256_cvtepu8_epi32(nib), b8));
+                    __m256 w1 = _mm256_cvtepi32_ps(
+                        _mm256_sub_epi32(
+                            _mm256_cvtepu8_epi32(_mm_srli_si128(nib, 8)), b8));
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(xs + gi), w0, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(xs + gi + 8), w1, acc);
+                }
+                ga = hsum256(acc);
+                for (; gi < g_end; gi += 2) {
+                    uint8_t byte = w[gi >> 1];
+                    ga += xs[gi] * (float)((int)(byte & 0xF) - 8);
+                    if (gi + 1 < g_end) ga += xs[gi+1] * (float)((int)(byte >> 4) - 8);
+                }
+#else
+                for (int gi = g_start; gi + 1 < g_end; gi += 2) {
+                    uint8_t byte = w[gi >> 1];
+                    ga += xs[gi] * (float)((int)(byte & 0xF) - 8);
+                    ga += xs[gi+1] * (float)((int)(byte >> 4) - 8);
+                }
+                if (g_end > g_start && (g_end - g_start) % 2 == 1) {
+                    int gi = g_end - 1;
+                    uint8_t byte = w[gi >> 1];
+                    ga += xs[gi] * (float)((int)(byte & 0xF) - 8);
+                }
+#endif
+                a += ga * group_sc;
+            }
+            i = I; (void)i;
+            y[(int64_t)s * O + o] = a;
+        }
+    }
+}
+
 /* ── Dispatcher: sceglie il kernel in base al formato ── */
 
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
     if (w->fmt == 0) { matmul_f32(y, x, w->qf, S, w->I, w->O); return; }
     if (w->fmt == 1) { matmul_q8(y, x, w->q8, w->s, S, w->I, w->O); return; }
-    if (w->fmt == 2) { matmul_i4(y, x, w->q4, w->s, S, w->I, w->O); return; }
+    if (w->fmt == 2) {
+        /* Se block_size > 0, usa group-scaled */
+        if (w->block_size > 0)
+            matmul_i4_gs(y, x, w->q4, w->s, S, w->I, w->O, w->block_size);
+        else
+            matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
+        return;
+    }
     /* fmt==3 MXFP4: TODO — per la v1 convertiamo a INT4 a tempo di build */
     fprintf(stderr, "matmul_qt: formato %d non supportato\n", w->fmt);
     exit(1);

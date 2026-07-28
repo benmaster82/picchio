@@ -42,9 +42,10 @@ except ImportError:
 
 # ── INT4 quantizzazione simmetrica per-riga ──
 
-def quantize_int4(tensor: np.ndarray) -> tuple:
+def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
     """Quantizza F32 [O, I] → (packed_uint8, scales_f32).
     
+    Se group_size > 0: scala ogni group_size valori (gs64 = +9pp qualità).
     Schema: value = (nibble - 8) * scale
     Range: [-8, 7], packed 2 per byte (lo nibble first).
     """
@@ -53,12 +54,28 @@ def quantize_int4(tensor: np.ndarray) -> tuple:
     
     O, I = tensor.shape
     
-    # Scala per riga
-    amax = np.max(np.abs(tensor), axis=1)
-    scales = np.where(amax > 1e-8, amax / 7.0, 1e-8).astype(np.float32)
-    
-    # Quantizza
-    quantized = np.clip(np.round(tensor / scales[:, None]), -8, 7).astype(np.int8)
+    if group_size <= 0 or group_size >= I:
+        # Per-row scaling (vecchio, meno preciso)
+        amax = np.max(np.abs(tensor), axis=1)
+        scales = np.where(amax > 1e-8, amax / 7.0, 1e-8).astype(np.float32)
+        quantized = np.clip(np.round(tensor / scales[:, None]), -8, 7).astype(np.int8)
+    else:
+        # Group-scaled: una scala ogni group_size valori
+        n_groups = (I + group_size - 1) // group_size
+        scales = np.empty((O, n_groups), dtype=np.float32)
+        quantized = np.empty((O, I), dtype=np.int8)
+        
+        for g in range(n_groups):
+            g_start = g * group_size
+            g_end = min(g_start + group_size, I)
+            group = tensor[:, g_start:g_end]
+            amax = np.max(np.abs(group), axis=1)
+            sc = np.where(amax > 1e-8, amax / 7.0, 1e-8).astype(np.float32)
+            scales[:, g] = sc
+            quantized[:, g_start:g_end] = np.clip(
+                np.round(group / sc[:, None]), -8, 7).astype(np.int8)
+        
+        scales = scales.reshape(-1)  # flatten [O * n_groups]
     
     # Pack 2 valori per byte
     rb = (I + 1) // 2
@@ -69,7 +86,6 @@ def quantize_int4(tensor: np.ndarray) -> tuple:
         hi = (quantized[:, i + 1].astype(np.int16) + 8).astype(np.uint8) & 0xF
         packed[:, i // 2] = lo | (hi << 4)
     
-    # Ultimo elemento se I è dispari
     if I % 2 == 1:
         lo = (quantized[:, -1].astype(np.int16) + 8).astype(np.uint8) & 0xF
         packed[:, rb - 1] = lo
