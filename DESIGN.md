@@ -298,7 +298,23 @@ domanda ha prodotto una risposta corretta. `chat.py` espone quindi `--temperatur
 
 Conversazione reale a due turni sul 20B: il secondo turno ha riusato 279 posizioni su
 294, cioè il 95%, elaborandone solo 15, e la risposta era corretta. La cache hit sale con
-l'uso grazie all'hot-store, dal 67,1% al 79,2% nella stessa sessione. Con 768 expert totali, circa 9,5 GB, la residenza
+l'uso grazie all'hot-store, dal 67,1% al 79,2% nella stessa sessione.
+
+**Posizione del modello.** La copia del container dall'SSD esterno ha misurato 52,7 MB/s
+sequenziali, valore compatibile con un collegamento USB 2.0 e non con le prestazioni del
+supporto. Spostando il 20B sull'NVMe interno, a parità di tutto il resto (stessi 120
+forward, 43 token e 67,1% di cache hit):
+
+| Metrica | SSD USB | NVMe interno |
+|---|---|---|
+| disco | 71,14 s | 37,22 s |
+| `t_moe` | 88,49 s | 55,35 s |
+| totale fasi | ~104 s | ~73,5 s |
+| caricamento | 8,4 s | 4,3 s |
+
+Il MoE al netto del disco resta invariato, circa 18 s, quindi il guadagno è interamente
+di I/O. Il disco scende dal 68% al 51% del tempo. Riepilogo del percorso sul 20B: da
+~208 s (senza SIMD, su USB) a ~73,5 s, quindi 2,8×. Con 768 expert totali, circa 9,5 GB, la residenza
 completa è raggiungibile con più RAM, condizione in cui il disco esce dal percorso
 critico. La risposta del 20B termina con `RETURN`, quindi il ciclo Harmony completo,
 terminatore incluso, è verificato sul modello reale.

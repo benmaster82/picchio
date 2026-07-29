@@ -79,8 +79,10 @@ occupare spazio inutilmente.
 - Parte densa residente misurata: ~4,46 GB
 - KV-cache iniziale configurabile con `CTX` (default 512 posizioni)
 - Cache expert configurabile con `PIN_GB` (default 6 GB; usare 1 GB con poco margine)
-- Prestazione misurata su Windows/6 core con OpenMP: ~0,14 token/s (era ~0,09 su un core)
-- La build **deve** usare `-fopenmp`, altrimenti i kernel matmul restano su un solo core
+- La build **deve** usare `-fopenmp` e `-mavx2 -mfma`: senza questi flag i kernel matmul
+  restano su un solo core e in versione scalare
+- Prestazione misurata sul 20B (6 core, `PIN_GB=4`, modello su NVMe): ~0,6 s per token
+- Tenere il modello su un disco interno: da un box USB 2.0 il tempo di I/O raddoppia
 - `PILOT=1` è sconsigliato con poca RAM libera: misurato ~11% più lento
 - Il modello convertito occupa circa 66,65 GB
 
