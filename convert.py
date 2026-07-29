@@ -234,7 +234,7 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                 
                 # Determina il tipo di tensore
                 is_norm = "layernorm" in key or "norm.weight" in key
-                is_bias = ".bias" in key
+                is_bias = ".bias" in key or key.endswith("_bias")
                 is_embed = "embed_tokens" in key or "lm_head" in key
                 is_expert = "experts" in key
                 is_router = "router" in key
@@ -254,6 +254,8 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                     
                 elif is_expert:
                     if is_bias:
+                        # I bias expert sono BF16/F16/F32 aggregati [E,...]:
+                        # non quantizzarli e non produrre .qs.
                         output_tensors[key] = tensor_np.astype(np.float32)
                         stats["bias"] += tensor_np.size * 4
                     elif "blocks" in key:

@@ -4,10 +4,172 @@
 > noi tamburelliamo 128 expert su un disco enorme.*
 
 **Obiettivo:** eseguire GPT-OSS-120B (117B parametri, MoE) su hardware consumer
-(16–32 GB RAM, SSD NVMe, GPU opzionale) in puro C, zero dipendenze runtime,
-con expert streamati da disco. Stessa filosofia di Colibri, modello diverso.
+(16 GB RAM, SSD NVMe, GPU opzionale) in puro C, con expert streamati da disco.
 
 Licenza: Apache 2.0.
+
+## 0. Stato e contratto normativo (revisione luglio 2026)
+
+Le sezioni storiche successive descrivono l'idea iniziale e possono contenere stime
+superate. In caso di conflitto, questa sezione ha precedenza. L'architettura reale
+usata da Picchio è: hidden size 2880, 36 layer tutti MoE, 64 query head, 8 KV head,
+head dimension 64, 128 expert per layer, top-4, intermediate size 2880, gate/up fuso
+5760, attention sliding-window 128 alternata con full attention, `rope_theta=150000`
+e vocabolario circa 201K. GPT-OSS usa inoltre attention sinks, YaRN e una variante
+clipped SwiGLU: nessuno di questi dettagli può essere sostituito da un'approssimazione
+senza una prova oracle.
+
+Lo stato corrente è **runtime end-to-end e forward numericamente validati** contro
+Transformers sul tiny model, sia in F32 sia in INT4 group-scaled. Il GPT-OSS-120B reale
+ha inoltre completato più passi autoregressivi con KV-cache e logits finiti. Questa
+validazione riguarda runtime e forward su ID token raw; tokenizer o200k e Harmony non
+sono ancora token-exact e restano una suite separata.
+
+### 0.1 Fixture ufficiale
+
+- Modello: `tiny-random/gpt-oss`
+- Revisione bloccata: `02ba5c61f879b5a38a8b1f7a8e0409b8e1bb8f38`
+- Scopo: debug architetturale; pesi casuali, non valutazione della qualità linguistica.
+- Input primario: ID token raw fissi. Tokenizer e Harmony sono una suite separata.
+- Riferimento: `transformers==4.57.1`, `torch==2.6.0`, `safetensors==0.6.2`.
+- Esecuzione: batch 1, `eval()`, nessun gradiente, nessun sampling, PILOT disattivato,
+  repetition penalty 1.0 e argmax deterministico.
+
+### 0.2 Tre livelli di validazione
+
+**L0 — Container-exact.** Il convertitore deve produrre un manifest con nome, dtype,
+shape, byte count, schema di quantizzazione, group size e hash. Ogni peso obbligatorio,
+inclusi bias expert e attention sinks, deve esistere. Packed INT4, scale e righe
+dequantizzate campione devono coincidere tra Python e C entro la tolleranza dichiarata.
+Short read, shape inattesa o fallback silenzioso sono errori fatali.
+
+**L1 — Implementation-exact.** Picchio C viene confrontato con un oracle Python che
+legge gli stessi file convertiti Picchio e riproduce la stessa dequantizzazione. Gli
+indici top-k e l'argmax devono essere identici; per tensori F32 si registrano max-abs,
+max-rel e cosine error. Questo livello separa i bug del runtime dagli effetti della
+quantizzazione lossy.
+
+**L2 — Transformers token-exact.** Con gli stessi ID di input, Picchio viene confrontato
+con Transformers sul checkpoint originale. Gli ID greedy devono coincidere. Poiché
+MXFP4/BF16 → INT4 gs64 è lossy, un mismatch L2 dopo il superamento di L0 e L1 deve
+riportare anche top-1/top-2 margin e differenza logits: non dimostra da solo un bug C.
+
+### 0.3 Checkpoint e ordine obbligatorio
+
+Per un token a posizione 0 e layer 0 confrontare, nell'ordine:
+
+1. embedding e RMSNorm pre-attention;
+2. Q/K/V prima e dopo bias;
+3. Q/K dopo RoPE/YaRN;
+4. KV scritto, intervallo della mask e attention scores;
+5. sink logit, massa softmax del sink, concat head e output projection;
+6. residual e RMSNorm pre-MoE;
+7. router logits, top-k ordinato e relativi pesi;
+8. gate/up con bias, split, clipped SwiGLU, down con bias e contributi pesati;
+9. residual di fine layer;
+10. final norm, logits, top-10, margine top-1/top-2 e argmax.
+
+Dopo il singolo token: sequenza corta sul layer 0; posizioni 127/128/129 per la sliding
+window; un token attraverso tutti i layer; prefill raw fisso; infine 8–32 token greedy.
+Si corregge esclusivamente il primo checkpoint divergente, poi si ripete dall'inizio.
+
+I dump sono F32 little-endian o `.npy`, accompagnati da JSON con versione, revisione,
+input IDs, posizione, layer, shape, dtype, hash e statistiche. Sul tiny si possono
+salvare tensori completi; sul 120B si usano hash e probe. OpenMP/SIMD, cache eviction,
+hot-store, PILOT, tokenizer e Harmony vengono riabilitati e verificati solo dopo L1.
+
+### 0.4 Criteri di accettazione della milestone “token corretto”
+
+- Fixture riproducibile dalla revisione bloccata e senza dipendere dal modello 120B.
+- Nessun peso obbligatorio mancante o sostituito con valori di default.
+- Test isolati superati per INT4 gs64, embedding, RMSNorm, RoPE/YaRN, softmax con sink,
+  routing e clipped SwiGLU.
+- Tutti i checkpoint L1 entro le tolleranze registrate e top-k/argmax identici.
+- Sequenza greedy L1 identica per almeno 32 token raw.
+- Risultato L2 documentato separatamente; solo dopo si applicano le correzioni validate
+  alla conversione e al runtime del GPT-OSS-120B.
+
+### 0.5 Risultati della validazione
+
+Validazione completata il 29 luglio 2026:
+
+- checkpoint F32 layer-by-layer entro `atol=rtol=1e-5`;
+- top-k, pesi router e argmax identici;
+- 32 token greedy identici tra Picchio e Transformers;
+- KV-cache e confine sliding verificati alla posizione 130;
+- container INT4 group-scaled confrontato con un riferimento dequantizzato identico;
+- tutti i 15 shard reali validati con il parser safetensors ufficiale;
+- shard 13, trovato troncato, ricostruito expert-per-expert con verifica bit-per-bit
+  delle scale già presenti;
+- GPT-OSS-120B eseguito per più passi autoregressivi senza NaN/Inf.
+
+La vecchia conversione aveva quantizzato per errore i bias expert. Il runtime supporta
+quel formato per retrocompatibilità, ma la modalità raccomandata usa il sidecar F32
+prodotto da `download_expert_biases.py`. Le conversioni future preservano direttamente
+i bias expert in F32.
+
+### 0.6 Milestone chat single-turn token-exact
+
+Il primo percorso chat non duplica o200k/Harmony in C. Un bridge Python, basato sulla
+libreria ufficiale `openai-harmony` a versione fissata, possiede rendering del prompt,
+tokenizzazione, parsing dei canali e decode. Picchio riceve e produce esclusivamente
+ID token raw; `tok.h` resta un fallback interattivo approssimato e non fa parte del
+contratto token-exact.
+
+Il protocollo runtime deve offrire:
+
+- input da file di ID decimali, per non dipendere dal limite delle variabili d'ambiente
+  Windows; `RAW=1` e `INPUT` restano compatibili;
+- output machine-readable contenente ogni ID generato, inclusi token Harmony e stop,
+  senza filtro o decode C;
+- stdout riservato agli ID in tale modalità e diagnostica su stderr;
+- stop esplicito su `<|return|>` e `<|call|>`, riportando anche il terminatore;
+  `<|end|>` chiude un messaggio ma non l'intera risposta assistant;
+- campionamento greedy riproducibile per la prima validazione.
+
+Criteri di accettazione: gli ID renderizzati dal bridge coincidono con Harmony
+ufficiale; il trasporto file→C è esatto; la sequenza di output completa è parsabile da
+Harmony; la modalità raw esistente e le suite tiny F32/INT4 non regrediscono.
+
+Risultato: milestone raggiunta il 29 luglio 2026. Il GPT-OSS-120B reale ha risposto
+"Ciao!" con prompt Harmony di 77 token, prefill 930,34 s, 23 token in 251,34 s, circa
+0,09 token/s e 20,3% di cache hit expert.
+
+### 0.7 Milestone chat multi-turn persistente
+
+Obiettivo: non ricaricare il modello e non ricalcolare il prefisso già elaborato.
+
+Vincolo misurato: il rendering Harmony **non** è prefix-preserving tra turni. Nel
+re-render canonico il canale `analysis` viene scartato e il `<|return|>` finale diventa
+`<|end|>`. Conservando l'analysis la divergenza si riduce al solo terminatore, con circa
+l'88% delle posizioni riusabili. Il protocollo non può quindi limitarsi ad accodare un
+delta: il bridge calcola il prefisso comune più lungo e il runtime riparte da quella
+posizione, sovrascrivendo la KV successiva.
+
+Invariante obbligatorio: ogni token trasmesso deve essere anche consumato dal forward,
+inclusi `<|return|>` e `<|call|>`, così che `pos` coincida sempre con il numero di
+posizioni valide in KV. Un token emesso ma non consumato renderebbe il turno successivo
+numericamente errato.
+
+Protocollo di servizio, righe di testo su pipe, stdout riservato al protocollo e stderr
+alla diagnostica:
+
+- `READY <ctx_capacity> <vocab> <stop_ids...>` all'avvio;
+- `TURN <max_new> <keep> <n_ids> <ids...>`: riusa `keep` posizioni e consuma i nuovi ID;
+- `TOKEN <id>` per ogni token generato, terminatore incluso;
+- `DONE <RETURN|CALL|MAX_TOKENS|CONTEXT_FULL> <n_output> <pos>`;
+- `ERROR <code> <fatal> <messaggio>` con validazione prima di mutare la KV;
+- `RESET` riporta `pos` a 0 conservando modello e cache expert; `SHUTDOWN` esce pulito.
+
+La capacità KV reale è `CTX`: nessun prompt può superarla, perché oltre quel limite le
+scritture verrebbero ignorate silenziosamente producendo risultati errati.
+
+Risultati del 29 luglio 2026, verificati sul tiny model:
+
+- il riuso del prefisso produce token identici al prefill completo, con `pos` coerente;
+- `keep` fuori range viene rifiutato senza corrompere la sessione;
+- due turni consecutivi hanno riusato 68 posizioni su 77;
+- le suite tiny F32 e INT4 non sono regredite.
 
 ---
 

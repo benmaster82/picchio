@@ -353,6 +353,26 @@ static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) 
 #endif
 }
 
+/* Leggi una porzione di un tensore a partire da byte_offset. */
+static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
+                              void *dst, int64_t nbytes) {
+    StFile *sf = &db->files[t->file_idx];
+    int64_t total = t->offset_end - t->offset_start;
+    if (byte_offset < 0 || byte_offset > total) return -1;
+    if (nbytes > total - byte_offset) nbytes = total - byte_offset;
+    int64_t abs_offset = sf->data_offset + t->offset_start + byte_offset;
+#ifdef _WIN32
+    OVERLAPPED ov = {0};
+    ov.Offset = (DWORD)(abs_offset & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)(abs_offset >> 32);
+    DWORD rd = 0;
+    if (!ReadFile(sf->hFile, dst, (DWORD)nbytes, &rd, &ov)) return -1;
+    return (int64_t)rd;
+#else
+    return pread(sf->fd, dst, nbytes, abs_offset);
+#endif
+}
+
 /* ── Leggi un tensore coalescente (offset_start di t1 fino a offset_end di t2) ── */
 /* Utile per leggere gate_up + down in una sola pread se contigui */
 

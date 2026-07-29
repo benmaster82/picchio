@@ -2,6 +2,7 @@
 REM build.bat — Compila Picchio su Windows con MSYS2/MinGW
 
 set GCC=C:\msys64\mingw64\bin\gcc.exe
+set PATH=C:\msys64\mingw64\bin;C:\msys64\usr\bin;%PATH%
 
 if not exist "%GCC%" (
     echo GCC non trovato in %GCC%

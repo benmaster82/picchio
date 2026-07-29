@@ -34,7 +34,7 @@ picchio.exe --self-test
 ./picchio test_model
 ```
 
-### 4. Modello reale (57 GB)
+### 4. Modello reale (~66,65 GB nel formato convertito corrente)
 
 ```bash
 python convert.py --model openai/gpt-oss-120b --output /nvme/gptoss_i4
@@ -53,20 +53,66 @@ MODEL=/nvme/gptoss_i4 ./picchio
 | Expert/layer | 128 |
 | Expert attivi/token | 4 (top-4) |
 | Expert size (INT4) | ~12.4 MB |
-| Modello totale (INT4) | ~57 GB |
+| Modello convertito corrente (INT4 gs64 + parte densa F32) | ~66,65 GB |
 | Context | 131K (sliding window 128 + full, alternati) |
 
 ## Requisiti hardware (16 GB RAM)
 
-- Parte densa residente: ~1.5 GB
-- KV-cache (4K token): ~75 MB
-- Cache expert LRU: ~10 GB (~800 expert)
-- Performance stimata: 2-4 tok/s (warm)
+- Parte densa residente misurata: ~4,46 GB
+- KV-cache iniziale configurabile con `CTX` (default 512 posizioni)
+- Cache expert configurabile con `PIN_GB` (default 6 GB; usare 1 GB con poco margine)
+- Prestazione misurata su Windows/6 thread: ~0,07–0,1 token/s
+- Il modello convertito occupa circa 66,65 GB
+
+Con uno shard su C: e gli altri su D:, usare PowerShell:
+
+```powershell
+$env:MODEL_AUX='C:\picchio\expert_biases.safetensors;C:\picchio\model-00012.safetensors'
+$env:OMP_NUM_THREADS='6'
+$env:PIN_GB='1'
+.\picchio.exe D:\gptoss_i4
+```
+
+`expert_biases.safetensors` contiene i bias F32 originali. Si rigenera senza scaricare
+il modello completo con `python download_expert_biases.py`.
+
+## Chat token-exact
+
+Il bridge Python usa Harmony ufficiale e passa al runtime soltanto ID raw; non usa
+l'encode approssimato di `tok.h`:
+
+```powershell
+python -m pip install -r requirements-chat.txt
+python chat.py "Scrivi un saluto breve in italiano" --max-tokens 64
+```
+
+Chat multi-turn nello stesso processo, con modello e KV-cache mantenuti in memoria:
+
+```powershell
+python chat.py --ctx 1024 --max-tokens 64
+```
+
+Tra turni viene riusato il prefisso comune della KV-cache (tipicamente circa l'88%),
+perché il re-render Harmony scarta l'analysis e trasforma `<|return|>` in `<|end|>`.
+
+Per controllare prompt e ID senza caricare il modello da 66,65 GB:
+
+```powershell
+python chat.py "Ciao" --dry-run
+```
+
+Il bridge rileva automaticamente lo shard 12 e il sidecar bias nelle posizioni correnti.
+`--model-aux` sovrascrive esplicitamente `MODEL_AUX`. `tok.h` resta un fallback
+interattivo, ma non è dichiarato token-exact.
 
 ## File
 
 ```
-picchio.c        — motore principale
+picchio.c        — motore principale (include la modalità SERVICE persistente)
+chat.py           — chat Harmony ufficiale ↔ ID raw, multi-turn
+test_service.py   — equivalenza riuso prefisso vs prefill completo
+check_harmony_delta.py — verifica prefix-preserving del render Harmony
+requirements-chat.txt — dipendenza Harmony fissata
 quant.h          — kernel matmul (F32, INT8, INT4) + SIMD
 json.h           — parser config.json
 st.h             — reader safetensors
@@ -78,16 +124,20 @@ test_forward.py  — oracle Python per validazione
 ## Stato
 
 - [x] Forward pass completo (attention + MoE + routing)
-- [x] GQA con sliding window + full attention alternati
-- [x] Attention bias
-- [x] Cache LRU per expert con eviction
-- [x] Reader safetensors + config loader
-- [x] Self-test con mini-modello sintetico
-- [x] Oracle Python per validazione
-- [ ] Tokenizer o200k_harmony
-- [ ] PILOT prefetch (thread separato)
-- [ ] Sampling (temperature, top-p)
-- [ ] Hot-store appreso persistente
+- [x] GQA con sliding/full attention, attention sinks e YaRN
+- [x] Clipped SwiGLU GPT-OSS e gate/up interleaved
+- [x] Bias attention ed expert aggregati
+- [x] INT4 group-scaled, embedding e lm-head inclusi
+- [x] Cache LRU expert, hot-store e sampling
+- [x] Reader safetensors multi-shard e `MODEL_AUX` multi-disco
+- [x] Oracle Transformers sul checkpoint `tiny-random/gpt-oss`
+- [x] Equivalenza F32 e INT4 layer-by-layer, 32 token greedy e posizione 130
+- [x] Forward e generazione autoregressiva del GPT-OSS-120B senza NaN/Inf
+- [x] Bridge chat con rendering/parsing Harmony ufficiale e trasporto ID raw
+- [x] Sessione persistente multi-turn con riuso del prefisso KV
+- [ ] Tokenizer o200k_harmony nativo C token-exact (`tok.h` resta approssimato)
+- [ ] Prestazioni: prefill e I/O expert sono il collo di bottiglia (~0,09 token/s)
+- [ ] PILOT prefetch su Windows
 - [ ] Server API OpenAI-compatible
 
 ## Licenza

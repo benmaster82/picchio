@@ -4,13 +4,24 @@
 *.obj
 
 # Directory modello (60+ GB)
+/model-*.safetensors
+/expert_biases.safetensors
 test_model/
+test_tiny_hf/
+test_tiny_picchio/
+test_tiny_picchio_i4/
+test_tiny_hf_i4ref/
+oracle_hf/
+oracle_c/
+oracle_boundary_hf/
+oracle_boundary_c/
 gptoss_i4/
 gptoss_raw/
 
 # File temporanei
 *.log
 *.tmp
+__pycache__/
 do.sh
 
 # Hot-store (generato a runtime)

@@ -66,6 +66,14 @@ typedef struct {
     int n_stop;
     float eps;            /* RMSNorm epsilon (1e-5) */
     float theta;          /* RoPE base frequency */
+    float rope_factor;    /* YaRN context extension factor */
+    float rope_beta_fast;
+    float rope_beta_slow;
+    int rope_original_ctx;
+    int rope_truncate;
+    float rope_attn_factor;
+    float swiglu_limit;
+    float swiglu_alpha;
     float routed_scale;   /* scaling factor per expert routing */
     int has_shared;       /* 1 se ci sono shared expert */
     int n_shared;         /* numero di shared expert */
@@ -92,6 +100,7 @@ typedef struct {
     float *bk;            /* [n_kv_heads * head_dim] */
     float *bv;            /* [n_kv_heads * head_dim] */
     float *bo;            /* [D] */
+    float *sinks;         /* [n_heads] attention sink logits */
 
     int layer_type;       /* 0=sliding_attention, 1=full_attention */
 
@@ -180,6 +189,95 @@ typedef struct {
 } Model;
 
 /* ═══════════════════════════════════════════════════════════
+ *  ORACLE DUMP (.npy F32, attivo solo con ORACLE_DIR)
+ * ═══════════════════════════════════════════════════════════ */
+
+static const char *g_oracle_dir = NULL;
+
+static void oracle_dump(const char *name, const float *data,
+                        int ndim, const int64_t *shape) {
+    if (!g_oracle_dir || !*g_oracle_dir) return;
+#ifdef _WIN32
+    CreateDirectoryA(g_oracle_dir, NULL);
+#endif
+    char path[768];
+    snprintf(path, sizeof(path), "%s/%s.npy", g_oracle_dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+
+    char shape_str[256] = "";
+    size_t used = 0;
+    for (int i = 0; i < ndim; i++) {
+        int n = snprintf(shape_str + used, sizeof(shape_str) - used,
+                         "%s%lld%s", i ? ", " : "",
+                         (long long)shape[i], (ndim == 1) ? "," : "");
+        if (n > 0) used += (size_t)n;
+    }
+    char header[512];
+    int hlen = snprintf(header, sizeof(header),
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (%s), }",
+        shape_str);
+    int preamble = 10;
+    int padded = hlen + 1;
+    while ((preamble + padded) % 16) padded++;
+    memset(header + hlen, ' ', (size_t)(padded - hlen));
+    header[padded - 1] = '\n';
+
+    const uint8_t magic[8] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
+    uint16_t header_len = (uint16_t)padded;
+    fwrite(magic, 1, 8, f);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header, 1, (size_t)padded, f);
+    int64_t count = 1;
+    for (int i = 0; i < ndim; i++) count *= shape[i];
+    fwrite(data, sizeof(float), (size_t)count, f);
+    fclose(f);
+}
+
+static void oracle_dump_vec(const char *name, const float *data, int64_t n) {
+    int64_t shape[3] = {1, 1, n};
+    oracle_dump(name, data, 3, shape);
+}
+
+static int g_trace_numeric = 0;
+
+static int trace_vector(const char *stage, int layer, const float *x, int n) {
+    if (!g_trace_numeric) return 1;
+    int nonfinite = 0;
+    float min_v = INFINITY, max_v = -INFINITY;
+    double sum_sq = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(x[i])) { nonfinite++; continue; }
+        if (x[i] < min_v) min_v = x[i];
+        if (x[i] > max_v) max_v = x[i];
+        sum_sq += (double)x[i] * x[i];
+    }
+    fprintf(stderr, "  numeric L=%d %-18s min=% .6g max=% .6g rms=%.6g bad=%d\n",
+            layer, stage, min_v, max_v,
+            n > nonfinite ? sqrt(sum_sq / (n - nonfinite)) : NAN, nonfinite);
+    return nonfinite == 0;
+}
+
+static void trace_top_logits(const float *logits, int vocab) {
+    if (!g_trace_numeric) return;
+    int ids[10]; float values[10];
+    for (int k = 0; k < 10; k++) { ids[k] = -1; values[k] = -INFINITY; }
+    int nonfinite = 0;
+    for (int i = 0; i < vocab; i++) {
+        if (!isfinite(logits[i])) { nonfinite++; continue; }
+        if (logits[i] <= values[9]) continue;
+        values[9] = logits[i]; ids[9] = i;
+        for (int k = 8; k >= 0 && values[k + 1] > values[k]; k--) {
+            float fv = values[k]; values[k] = values[k + 1]; values[k + 1] = fv;
+            int iv = ids[k]; ids[k] = ids[k + 1]; ids[k + 1] = iv;
+        }
+    }
+    fprintf(stderr, "  numeric logits bad=%d top10:", nonfinite);
+    for (int k = 0; k < 10; k++) fprintf(stderr, " %d=%.6g", ids[k], values[k]);
+    fprintf(stderr, "\n");
+}
+
+/* ═══════════════════════════════════════════════════════════
  *  TIMING
  * ═══════════════════════════════════════════════════════════ */
 
@@ -240,6 +338,15 @@ static int cfg_load(Cfg *c, const char *model_path) {
     c->sliding_window = json_int(json, "sliding_window", 128);
     c->eps          = json_float(json, "rms_norm_eps", 1e-5f);
     c->theta        = json_float(json, "rope_theta", 150000.0f);
+    c->rope_factor  = json_float(json, "factor", 1.0f);
+    c->rope_beta_fast = json_float(json, "beta_fast", 32.0f);
+    c->rope_beta_slow = json_float(json, "beta_slow", 1.0f);
+    c->rope_original_ctx = json_int(json, "original_max_position_embeddings", c->ctx_len);
+    c->rope_truncate = json_bool(json, "truncate", 1);
+    c->rope_attn_factor = c->rope_factor > 1.0f
+        ? 0.1f * logf(c->rope_factor) + 1.0f : 1.0f;
+    c->swiglu_limit = json_float(json, "swiglu_limit", 7.0f);
+    c->swiglu_alpha = 1.702f;
     c->routed_scale = json_float(json, "routed_scaling_factor", 1.0f);
     c->has_shared   = json_int(json, "num_shared_experts", 0) > 0 ? 1 : 0;
     c->n_shared     = json_int(json, "num_shared_experts", 0);
@@ -287,33 +394,46 @@ static int cfg_load(Cfg *c, const char *model_path) {
  *  RoPE (standard, non interleaved)
  * ═══════════════════════════════════════════════════════════ */
 
+static float yarn_inv_freq(const Cfg *c, int j) {
+    int dim = c->head_dim;
+    float pos_freq = powf(c->theta, 2.0f * j / dim);
+    float extrap = 1.0f / pos_freq;
+    if (c->rope_factor <= 1.0f) return extrap;
+
+    float low = dim * logf(c->rope_original_ctx /
+                (c->rope_beta_fast * 2.0f * (float)M_PI)) /
+                (2.0f * logf(c->theta));
+    float high = dim * logf(c->rope_original_ctx /
+                 (c->rope_beta_slow * 2.0f * (float)M_PI)) /
+                 (2.0f * logf(c->theta));
+    if (c->rope_truncate) { low = floorf(low); high = ceilf(high); }
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = (float)(dim - 1);
+    if (low == high) high += 0.001f;
+    float ramp = (j - low) / (high - low);
+    if (ramp < 0) ramp = 0;
+    if (ramp > 1) ramp = 1;
+    float extrap_factor = 1.0f - ramp;
+    float interp = extrap / c->rope_factor;
+    return interp * (1.0f - extrap_factor) + extrap * extrap_factor;
+}
+
 static void rope_apply(float *q, float *k, int pos, int head_dim,
-                       int n_q_heads, int n_kv_heads, float theta) {
+                       int n_q_heads, int n_kv_heads, const Cfg *c) {
     int half = head_dim / 2;
-
-    /* Applica RoPE a Q (tutte le query heads) */
-    for (int h = 0; h < n_q_heads; h++) {
-        float *v = q + h * head_dim;
-        for (int j = 0; j < half; j++) {
-            float freq = 1.0f / powf(theta, 2.0f * j / head_dim);
-            float ang = pos * freq;
-            float cs = cosf(ang), sn = sinf(ang);
-            float a = v[j], b = v[j + half];
-            v[j]        = a * cs - b * sn;
-            v[j + half]  = a * sn + b * cs;
-        }
-    }
-
-    /* Applica RoPE a K (solo KV heads) */
-    for (int h = 0; h < n_kv_heads; h++) {
-        float *v = k + h * head_dim;
-        for (int j = 0; j < half; j++) {
-            float freq = 1.0f / powf(theta, 2.0f * j / head_dim);
-            float ang = pos * freq;
-            float cs = cosf(ang), sn = sinf(ang);
-            float a = v[j], b = v[j + half];
-            v[j]        = a * cs - b * sn;
-            v[j + half]  = a * sn + b * cs;
+    for (int kind = 0; kind < 2; kind++) {
+        float *base = kind == 0 ? q : k;
+        int heads = kind == 0 ? n_q_heads : n_kv_heads;
+        for (int h = 0; h < heads; h++) {
+            float *v = base + h * head_dim;
+            for (int j = 0; j < half; j++) {
+                float ang = pos * yarn_inv_freq(c, j);
+                float cs = cosf(ang) * c->rope_attn_factor;
+                float sn = sinf(ang) * c->rope_attn_factor;
+                float a = v[j], b = v[j + half];
+                v[j] = a * cs - b * sn;
+                v[j + half] = a * sn + b * cs;
+            }
         }
     }
 }
@@ -364,14 +484,36 @@ static void gqa_attention(float *out, const float *x, Layer *l,
     matmul_qt(q, x, &l->wq, 1);
     matmul_qt(k, x, &l->wk, 1);
     matmul_qt(v, x, &l->wv, 1);
+    if (g_oracle_dir) {
+        char n[128]; int64_t sq[3] = {1, 1, H * hd};
+        int64_t sk[3] = {1, 1, kv_dim};
+        snprintf(n, sizeof(n), "layer%d.q_nobias", layer); oracle_dump(n, q, 3, sq);
+        snprintf(n, sizeof(n), "layer%d.k_nobias", layer); oracle_dump(n, k, 3, sk);
+        snprintf(n, sizeof(n), "layer%d.v_nobias", layer); oracle_dump(n, v, 3, sk);
+    }
 
     /* Add bias se presente */
     if (l->bq) for (int i = 0; i < H * hd; i++) q[i] += l->bq[i];
     if (l->bk) for (int i = 0; i < kv_dim; i++) k[i] += l->bk[i];
     if (l->bv) for (int i = 0; i < kv_dim; i++) v[i] += l->bv[i];
+    if (g_oracle_dir) {
+        char n[128]; int64_t sq[3] = {1, 1, H * hd};
+        int64_t sk[3] = {1, 1, kv_dim};
+        snprintf(n, sizeof(n), "layer%d.q_bias", layer); oracle_dump(n, q, 3, sq);
+        snprintf(n, sizeof(n), "layer%d.k_bias", layer); oracle_dump(n, k, 3, sk);
+        snprintf(n, sizeof(n), "layer%d.v_bias", layer); oracle_dump(n, v, 3, sk);
+    }
 
-    /* RoPE */
-    rope_apply(q, k, pos, hd, H, KVH, c->theta);
+    /* RoPE / YaRN */
+    rope_apply(q, k, pos, hd, H, KVH, c);
+    if (g_oracle_dir) {
+        char n[128];
+        int64_t sq[4] = {1, H, 1, hd};
+        int64_t sk[4] = {1, KVH, 1, hd};
+        snprintf(n, sizeof(n), "layer%d.q_rope", layer); oracle_dump(n, q, 4, sq);
+        snprintf(n, sizeof(n), "layer%d.k_rope", layer); oracle_dump(n, k, 4, sk);
+        snprintf(n, sizeof(n), "layer%d.v_heads", layer); oracle_dump(n, v, 4, sk);
+    }
 
     /* Aggiorna KV-cache */
     if (pos < kv->max_pos)
@@ -384,8 +526,8 @@ static void gqa_attention(float *out, const float *x, Layer *l,
     int start_pos = 0;
     int end_pos = pos;
     if (end_pos >= kv->max_pos) end_pos = kv->max_pos - 1;
-    if (l->layer_type == 0) {  /* sliding_attention */
-        start_pos = end_pos - c->sliding_window;
+    if (l->layer_type == 0) {  /* sliding_attention: include al massimo window token */
+        start_pos = end_pos - c->sliding_window + 1;
         if (start_pos < 0) start_pos = 0;
     }
     /* layer_type == 1: full_attention → start_pos = 0 (vede tutto) */
@@ -407,8 +549,17 @@ static void gqa_attention(float *out, const float *x, Layer *l,
             scores[t - start_pos] = dot * scale;
         }
 
-        /* Softmax */
-        softmax(scores, n_pos);
+        /* Softmax con attention sink: il sink assorbe probabilità ma non
+         * contribuisce alla somma dei value, come Transformers eager. */
+        float max_score = l->sinks ? l->sinks[h] : -INFINITY;
+        for (int i = 0; i < n_pos; i++)
+            if (scores[i] > max_score) max_score = scores[i];
+        float sum = l->sinks ? expf(l->sinks[h] - max_score) : 0.0f;
+        for (int i = 0; i < n_pos; i++) {
+            scores[i] = expf(scores[i] - max_score);
+            sum += scores[i];
+        }
+        for (int i = 0; i < n_pos; i++) scores[i] /= sum;
 
         /* Weighted sum dei valori */
         float *oh = attn_out + h * hd;
@@ -422,8 +573,17 @@ static void gqa_attention(float *out, const float *x, Layer *l,
     }
 
     /* Output projection */
+    if (g_oracle_dir) {
+        char n[128]; int64_t sh[3] = {1, 1, H * hd};
+        snprintf(n, sizeof(n), "layer%d.attn_concat", layer);
+        oracle_dump(n, attn_out, 3, sh);
+    }
     matmul_qt(out, attn_out, &l->wo, 1);
     if (l->bo) for (int i = 0; i < D; i++) out[i] += l->bo[i];
+    if (g_oracle_dir) {
+        char n[128]; snprintf(n, sizeof(n), "layer%d.attn_out", layer);
+        oracle_dump_vec(n, out, D);
+    }
 
     free(q); free(k); free(v); free(attn_out);
 }
@@ -434,6 +594,72 @@ static void gqa_attention(float *out, const float *x, Layer *l,
 
 /* Puntatore globale al DB safetensors (per accesso da expert_load) */
 static StDB *g_db = NULL;
+
+/* Carica un bias expert dal formato corretto F32 oppure recupera il vecchio
+ * formato convertito: byte INT4 salvati per errore come F32 + scale gs64. */
+static float *load_expert_bias(int layer, int eid, const char *suffix,
+                               int n_experts, int n_values) {
+    char name[300];
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%d.%s",
+             layer, eid, suffix);
+    StTensor *t = st_find(g_db, name);
+    int aggregated = 0;
+    if (!t) {
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%s",
+                 layer, suffix);
+        t = st_find(g_db, name);
+        aggregated = t != NULL;
+    }
+    if (!t) return NULL;
+
+    float *out = falloc(n_values);
+    char scale_name[340];
+    snprintf(scale_name, sizeof(scale_name), "%s.qs", name);
+    StTensor *ts = st_find(g_db, scale_name);
+
+    int64_t tensor_numel = st_numel(t);
+    int is_full_f32 = t->dtype == ST_F32 &&
+                      tensor_numel == (int64_t)n_experts * n_values;
+
+    if (aggregated && ts && !is_full_f32) {
+        int packed_n = (n_values + 1) / 2;
+        int groups = (n_values + 63) / 64;
+        uint8_t *packed = (uint8_t *)malloc((size_t)packed_n);
+        float *scales = falloc(groups);
+        if (t->dtype == ST_F32) {
+            float *stored = falloc(packed_n);
+            st_read_raw_at(g_db, t, (int64_t)eid * packed_n * 4,
+                           stored, (int64_t)packed_n * 4);
+            for (int i = 0; i < packed_n; i++)
+                packed[i] = (uint8_t)lrintf(stored[i]);
+            free(stored);
+        } else if (t->dtype == ST_U8) {
+            st_read_raw_at(g_db, t, (int64_t)eid * packed_n,
+                           packed, packed_n);
+        } else {
+            free(packed); free(scales); free(out); return NULL;
+        }
+        st_read_raw_at(g_db, ts, (int64_t)eid * groups * 4,
+                       scales, (int64_t)groups * 4);
+        for (int i = 0; i < n_values; i++) {
+            uint8_t byte = packed[i >> 1];
+            int q = (i & 1) ? (int)(byte >> 4) - 8
+                            : (int)(byte & 0x0F) - 8;
+            out[i] = q * scales[i / 64];
+        }
+        free(packed); free(scales);
+        return out;
+    }
+
+    if (t->dtype != ST_F32) { free(out); return NULL; }
+    int64_t offset = aggregated ? (int64_t)eid * n_values * 4 : 0;
+    if (st_read_raw_at(g_db, t, offset, out, (int64_t)n_values * 4)
+            != (int64_t)n_values * 4) {
+        free(out); return NULL;
+    }
+    (void)n_experts;
+    return out;
+}
 
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     Cfg *c = &m->c;
@@ -479,6 +705,10 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
 
     if (t_gu->dtype == ST_F32) {
         st_read_raw(g_db, t_gu, gu_f32, gu_numel * 4);
+        memset(&s->gu, 0, sizeof(QT));
+        s->gu.fmt = 0; s->gu.O = I; s->gu.I = D; s->gu.qf = gu_f32;
+        gu_f32 = NULL;
+        goto gate_up_loaded;
     } else if (t_gu->dtype == ST_BF16) {
         uint16_t *tmp = (uint16_t *)malloc(gu_numel * 2);
         st_read_raw(g_db, t_gu, tmp, gu_numel * 2);
@@ -487,6 +717,10 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
             memcpy(&gu_f32[i], &bits, 4);
         }
         free(tmp);
+        memset(&s->gu, 0, sizeof(QT));
+        s->gu.fmt = 0; s->gu.O = I; s->gu.I = D; s->gu.qf = gu_f32;
+        gu_f32 = NULL;
+        goto gate_up_loaded;
     } else if (t_gu->dtype == ST_U8) {
         /* Già INT4 packed — carica direttamente */
         memset(&s->gu, 0, sizeof(QT));
@@ -505,31 +739,32 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
                      "model.layers.%d.mlp.experts.%d.gate_up_proj.qs", layer, eid);
             t_s = st_find(g_db, name);
         }
-        s->gu.s = falloc(I);
-        if (t_s) st_read_raw(g_db, t_s, s->gu.s, I * 4);
-        else for (int i = 0; i < I; i++) s->gu.s[i] = 1.0f;
+        if (t_s) {
+            int64_t n_scale = st_numel(t_s);
+            s->gu.s = (float *)malloc(n_scale * sizeof(float));
+            st_read_raw(g_db, t_s, s->gu.s, n_scale * sizeof(float));
+            /* Determina block_size: se n_scale > O → group-scaled */
+            if (n_scale > I) {
+                s->gu.block_size = (int)((int64_t)I * D / n_scale);
+                if (s->gu.block_size <= 0) s->gu.block_size = 64;
+            }
+        } else {
+            s->gu.s = falloc(I);
+            for (int i = 0; i < I; i++) s->gu.s[i] = 1.0f;
+        }
         free(gu_f32);
-        /* Skip la quantizzazione, vai a down_proj */
+        gu_f32 = NULL;
+        goto gate_up_loaded;
     } else {
-        /* F32/BF16: quantizza gate_up a INT4 */
-        memset(&s->gu, 0, sizeof(QT));
-        s->gu.fmt = 2;
-        s->gu.O = I;
-        s->gu.I = D;
-        s->gu.q4 = (uint8_t *)malloc((int64_t)I * ((D + 1) / 2));
-        s->gu.s = falloc(I);
-        quantize_rows_i4(gu_f32, s->gu.q4, s->gu.s, I, D);
         free(gu_f32);
+        s->eid = -1;
+        return;
     }
 
-    /* ── Carica gate_up bias ── */
-    snprintf(name, sizeof(name),
-             "model.layers.%d.mlp.experts.%d.gate_up_proj_bias", layer, eid);
-    StTensor *t_gub = st_find(g_db, name);
-    if (t_gub) {
-        s->gu_bias = falloc(I);
-        st_read_raw(g_db, t_gub, s->gu_bias, I * 4);
-    }
+gate_up_loaded:
+    /* ── Carica gate_up bias (supporta anche il vecchio bias INT4+qs) ── */
+    s->gu_bias = load_expert_bias(layer, eid, "gate_up_proj_bias",
+                                  c->n_experts, I);
 
     /* ── Carica down_proj: [D, D] ── */
     snprintf(name, sizeof(name),
@@ -553,6 +788,10 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
 
         if (t_d->dtype == ST_F32) {
             st_read_raw(g_db, t_d, d_f32, d_numel * 4);
+            memset(&s->d, 0, sizeof(QT));
+            s->d.fmt = 0; s->d.O = D; s->d.I = down_I; s->d.qf = d_f32;
+            d_f32 = NULL;
+            goto down_loaded;
         } else if (t_d->dtype == ST_BF16) {
             uint16_t *tmp = (uint16_t *)malloc(d_numel * 2);
             st_read_raw(g_db, t_d, tmp, d_numel * 2);
@@ -561,6 +800,10 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
                 memcpy(&d_f32[i], &bits, 4);
             }
             free(tmp);
+            memset(&s->d, 0, sizeof(QT));
+            s->d.fmt = 0; s->d.O = D; s->d.I = down_I; s->d.qf = d_f32;
+            d_f32 = NULL;
+            goto down_loaded;
         } else if (t_d->dtype == ST_U8) {
             /* Già INT4 packed */
             memset(&s->d, 0, sizeof(QT));
@@ -571,38 +814,42 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
             s->d.q4 = (uint8_t *)malloc(rb);
             st_read_raw(g_db, t_d, s->d.q4, rb);
             snprintf(name, sizeof(name),
-                     "model.layers.%d.mlp.experts.%d.down_proj.qs", layer, eid);
+                     "model.layers.%d.mlp.experts.down_proj.%d.qs", layer, eid);
             StTensor *t_ds = st_find(g_db, name);
-            s->d.s = falloc(D);
-            if (t_ds) st_read_raw(g_db, t_ds, s->d.s, D * 4);
-            else for (int i = 0; i < D; i++) s->d.s[i] = 1.0f;
+            if (!t_ds) {
+                snprintf(name, sizeof(name),
+                         "model.layers.%d.mlp.experts.%d.down_proj.qs", layer, eid);
+                t_ds = st_find(g_db, name);
+            }
+            if (t_ds) {
+                int64_t n_scale = st_numel(t_ds);
+                s->d.s = (float *)malloc(n_scale * sizeof(float));
+                st_read_raw(g_db, t_ds, s->d.s, n_scale * sizeof(float));
+                if (n_scale > D) {
+                    s->d.block_size = (int)((int64_t)D * down_I / n_scale);
+                    if (s->d.block_size <= 0) s->d.block_size = 64;
+                }
+            } else {
+                s->d.s = falloc(D);
+                for (int i = 0; i < D; i++) s->d.s[i] = 1.0f;
+            }
             free(d_f32);
-            goto load_done;
+            d_f32 = NULL;
+            goto down_loaded;
+        } else {
+            free(d_f32);
+            s->eid = -1;
+            return;
         }
-
-        memset(&s->d, 0, sizeof(QT));
-        s->d.fmt = 2;
-        s->d.O = D;
-        s->d.I = down_I;
-        s->d.q4 = (uint8_t *)malloc((int64_t)D * ((down_I + 1) / 2));
-        s->d.s = falloc(D);
-        quantize_rows_i4(d_f32, s->d.q4, s->d.s, D, down_I);
-        free(d_f32);
     } else {
         s->eid = -1;  /* Expert incompleto */
         return;
     }
 
-    /* ── Down bias ── */
-    snprintf(name, sizeof(name),
-             "model.layers.%d.mlp.experts.%d.down_proj_bias", layer, eid);
-    StTensor *t_db_bias = st_find(g_db, name);
-    if (t_db_bias) {
-        s->d_bias = falloc(D);
-        st_read_raw(g_db, t_db_bias, s->d_bias, D * 4);
-    }
-
-load_done:
+down_loaded:
+    /* ── Down bias (supporta anche il vecchio bias INT4+qs) ── */
+    s->d_bias = load_expert_bias(layer, eid, "down_proj_bias",
+                                 c->n_experts, D);
     return;
 }
 
@@ -654,8 +901,10 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
     
     /* Free vecchi dati se lo slot era occupato (eviction) */
     if (victim->eid >= 0) {
+        free(victim->gu.qf); victim->gu.qf = NULL;
         free(victim->gu.q4); victim->gu.q4 = NULL;
         free(victim->gu.s);  victim->gu.s = NULL;
+        free(victim->d.qf);  victim->d.qf = NULL;
         free(victim->d.q4);  victim->d.q4 = NULL;
         free(victim->d.s);   victim->d.s = NULL;
         free(victim->gu_bias); victim->gu_bias = NULL;
@@ -825,6 +1074,24 @@ static void moe_forward(float *out, const float *x, Model *m,
 
     /* 3. Normalizza pesi (softmax sui top-k) */
     softmax(weights, K);
+    if (g_trace_numeric) {
+        fprintf(stderr, "  numeric route L=%d:", layer);
+        for (int k = 0; k < K; k++)
+            fprintf(stderr, " e%d=%.7g", sel[k], weights[k]);
+        fprintf(stderr, "\n");
+    }
+    if (g_oracle_dir) {
+        char n[128]; int64_t se[2] = {1, E}, sk[2] = {1, K};
+        float *sel_f = falloc(K);
+        for (int k = 0; k < K; k++) sel_f[k] = (float)sel[k];
+        snprintf(n, sizeof(n), "layer%d.router_logits", layer);
+        oracle_dump(n, scores, 2, se);
+        snprintf(n, sizeof(n), "layer%d.top_indices", layer);
+        oracle_dump(n, sel_f, 2, sk);
+        snprintf(n, sizeof(n), "layer%d.top_weights", layer);
+        oracle_dump(n, weights, 2, sk);
+        free(sel_f);
+    }
 
     /* 4. Aggiorna statistiche di routing */
     for (int k = 0; k < K; k++) {
@@ -850,14 +1117,30 @@ static void moe_forward(float *out, const float *x, Model *m,
         if (es->gu_bias) {
             for (int i = 0; i < I; i++) gu[i] += es->gu_bias[i];
         }
+        if (g_trace_numeric && layer == 0) {
+            char stage[64]; snprintf(stage, sizeof(stage), "expert%d_gate_up", sel[k]);
+            trace_vector(stage, layer, gu, I);
+        }
+        if (g_oracle_dir) {
+            char n[128]; snprintf(n, sizeof(n), "layer%d.expert%d.gate_up", layer, k);
+            int64_t sh[2] = {1, I}; oracle_dump(n, gu, 2, sh);
+        }
 
-        /* SwiGLU: clamp(SiLU(gate), -limit, limit) * up */
-        int half = I / 2;  /* = intermediate_size */
+        /* Clipped SwiGLU GPT-OSS:
+         * gate=min(gate,limit), up=clamp(up,+/-limit),
+         * (up+1)*gate*sigmoid(alpha*gate). */
+        int half = I / 2;
         for (int i = 0; i < half; i++) {
-            float g = siluf(gu[i]);
-            if (g > 7.0f) g = 7.0f;
-            if (g < -7.0f) g = -7.0f;
-            gu[i] = g * gu[i + half];
+            float gate = gu[2 * i];
+            float up = gu[2 * i + 1];
+            if (gate > c->swiglu_limit) gate = c->swiglu_limit;
+            if (up > c->swiglu_limit) up = c->swiglu_limit;
+            if (up < -c->swiglu_limit) up = -c->swiglu_limit;
+            gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+        }
+        if (g_oracle_dir) {
+            char n[128]; snprintf(n, sizeof(n), "layer%d.expert%d.activated", layer, k);
+            int64_t sh[2] = {1, half}; oracle_dump(n, gu, 2, sh);
         }
 
         /* down_proj: [D, half] × gu[:half] */
@@ -865,9 +1148,24 @@ static void moe_forward(float *out, const float *x, Model *m,
         if (es->d_bias) {
             for (int i = 0; i < D; i++) expert_out[i] += es->d_bias[i];
         }
+        if (g_trace_numeric && layer == 0) {
+            char stage[64]; snprintf(stage, sizeof(stage), "expert%d_output", sel[k]);
+            trace_vector(stage, layer, expert_out, D);
+        }
+        if (g_oracle_dir) {
+            char n[128]; snprintf(n, sizeof(n), "layer%d.expert%d.output", layer, k);
+            int64_t sh[2] = {1, D}; oracle_dump(n, expert_out, 2, sh);
+        }
 
         /* Accumula pesato */
         float w = weights[k] * c->routed_scale;
+        if (g_oracle_dir) {
+            float *contrib = falloc(D);
+            for (int i = 0; i < D; i++) contrib[i] = w * expert_out[i];
+            char n[128]; snprintf(n, sizeof(n), "layer%d.expert%d.contribution", layer, k);
+            int64_t sh[2] = {1, D}; oracle_dump(n, contrib, 2, sh);
+            free(contrib);
+        }
         for (int i = 0; i < D; i++)
             out[i] += w * expert_out[i];
 
@@ -875,6 +1173,10 @@ static void moe_forward(float *out, const float *x, Model *m,
     }
 
     /* 6. (GPT-OSS non ha shared expert — tutti i layer sono MoE puri) */
+    if (g_oracle_dir) {
+        char n[128]; snprintf(n, sizeof(n), "layer%d.moe_out", layer);
+        oracle_dump_vec(n, out, D);
+    }
 
     free(scores); free(expert_out);
 }
@@ -901,11 +1203,17 @@ static void embed_token(Model *m, int tok, float *x) {
         for (int i = 0; i < D; i++) x[i] = (float)q[i] * s;
     } else if (e->fmt == 2) {
         const uint8_t *q = e->q4 + (int64_t)tok * ((D + 1) / 2);
-        float s = e->s[tok];
+        int gs = e->block_size;
+        int ng = gs > 0 ? (D + gs - 1) / gs : 1;
+        const float *scales = e->s + (int64_t)tok * ng;
         for (int i = 0; i < D; i += 2) {
             uint8_t byte = q[i >> 1];
-            x[i] = (float)((int)(byte & 0xF) - 8) * s;
-            if (i + 1 < D) x[i + 1] = (float)((int)(byte >> 4) - 8) * s;
+            float s0 = scales[gs > 0 ? i / gs : 0];
+            x[i] = (float)((int)(byte & 0xF) - 8) * s0;
+            if (i + 1 < D) {
+                float s1 = scales[gs > 0 ? (i + 1) / gs : 0];
+                x[i + 1] = (float)((int)(byte >> 4) - 8) * s1;
+            }
         }
     }
 }
@@ -1082,13 +1390,24 @@ static int forward_token(Model *m, int tok, int pos) {
 
     /* Embedding */
     embed_token(m, tok, h);
+    trace_vector("embedding", -1, h, D);
+    if (g_oracle_dir) oracle_dump_vec("embedding", h, D);
 
     /* Transformer layers */
     for (int l = 0; l < c->n_layers; l++) {
         Layer *ly = &m->L[l];
+        char dump_name[128];
+        if (g_oracle_dir) {
+            snprintf(dump_name, sizeof(dump_name), "layer%d.input", l);
+            oracle_dump_vec(dump_name, h, D);
+        }
 
         /* Pre-attention norm */
         rmsnorm(hn, h, ly->in_ln, D, c->eps);
+        if (g_oracle_dir) {
+            snprintf(dump_name, sizeof(dump_name), "layer%d.pre_attn_norm", l);
+            oracle_dump_vec(dump_name, hn, D);
+        }
 
         /* GQA Attention */
         double ta = now_s();
@@ -1097,9 +1416,18 @@ static int forward_token(Model *m, int tok, int pos) {
 
         /* Residual */
         for (int i = 0; i < D; i++) h[i] += attn_out[i];
+        trace_vector("post_attention", l, h, D);
+        if (g_oracle_dir) {
+            snprintf(dump_name, sizeof(dump_name), "layer%d.post_attn_residual", l);
+            oracle_dump_vec(dump_name, h, D);
+        }
 
         /* Pre-FFN norm */
         rmsnorm(hn, h, ly->post_ln, D, c->eps);
+        if (g_oracle_dir) {
+            snprintf(dump_name, sizeof(dump_name), "layer%d.pre_moe_norm", l);
+            oracle_dump_vec(dump_name, hn, D);
+        }
 
         /* MoE (tutti i layer in GPT-OSS sono MoE) */
         double tm = now_s();
@@ -1114,15 +1442,23 @@ static int forward_token(Model *m, int tok, int pos) {
 
         /* Residual */
         for (int i = 0; i < D; i++) h[i] += ffn_out[i];
+        trace_vector("post_moe", l, h, D);
+        if (g_oracle_dir) {
+            snprintf(dump_name, sizeof(dump_name), "layer%d.output", l);
+            oracle_dump_vec(dump_name, h, D);
+        }
     }
 
     /* Final norm */
     rmsnorm(hn, h, m->final_norm, D, c->eps);
+    if (g_oracle_dir) oracle_dump_vec("final_norm", hn, D);
 
     /* LM head → logits */
     double th = now_s();
     float *logits = falloc(c->vocab);
     matmul_qt(logits, hn, &m->lm_head, 1);
+    trace_top_logits(logits, c->vocab);
+    if (g_oracle_dir) oracle_dump_vec("logits", logits, c->vocab);
     m->t_head += now_s() - th;
 
     /* Sampling */
@@ -1469,7 +1805,13 @@ static int self_test(void) {
         float q_orig[16], k_orig[8];
         memcpy(q_orig, q, sizeof(q));
         memcpy(k_orig, k, sizeof(k));
-        rope_apply(q, k, 0, 8, 2, 1, 10000.0f);
+        Cfg rope_cfg;
+        memset(&rope_cfg, 0, sizeof(rope_cfg));
+        rope_cfg.head_dim = 8;
+        rope_cfg.theta = 10000.0f;
+        rope_cfg.rope_factor = 1.0f;
+        rope_cfg.rope_attn_factor = 1.0f;
+        rope_apply(q, k, 0, 8, 2, 1, &rope_cfg);
         /* A pos=0: ang=0 per tutti → cos=1, sin=0 → nessun cambiamento */
         int ok = 1;
         for (int i = 0; i < 16; i++)
@@ -1733,6 +2075,15 @@ static int load_dense_weights(Model *m, StDB *db) {
             loaded += (H*hd + KVH*hd + KVH*hd + D) * 4;
         }
 
+        /* Attention sink logits (uno per query head) */
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.sinks", l);
+        ly->sinks = load_f32_tensor(db, name, H);
+        if (!ly->sinks) {
+            fprintf(stderr, "  errore: attention sinks mancanti al layer %d\n", l);
+            return -1;
+        }
+        loaded += H * 4;
+
         /* Router weights + bias */
         snprintf(name, sizeof(name), "model.layers.%d.mlp.router.weight", l);
         ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
@@ -1753,6 +2104,143 @@ static int load_dense_weights(Model *m, StDB *db) {
 
     m->resident_bytes = loaded;
     fprintf(stderr, "  ✓ pesi densi caricati: %.2f GB\n", loaded / 1e9);
+    return 0;
+}
+
+/* Legge ID decimali separati da whitespace. Il chiamante libera *out_ids. */
+static int read_token_ids_file(const char *path, int max_tokens, int **out_ids) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "errore: impossibile aprire INPUT_FILE=%s\n", path);
+        return -1;
+    }
+
+    int cap = max_tokens < 256 ? max_tokens : 256;
+    if (cap < 1) cap = 1;
+    int *ids = (int *)malloc((size_t)cap * sizeof(int));
+    if (!ids) { fclose(f); return -1; }
+
+    int n = 0;
+    long value;
+    int rc;
+    while ((rc = fscanf(f, "%ld", &value)) == 1) {
+        if (value < 0 || value > INT_MAX || n >= max_tokens) {
+            fprintf(stderr, "errore: ID non valido o prompt oltre %d token in %s\n",
+                    max_tokens, path);
+            free(ids); fclose(f); return -1;
+        }
+        if (n == cap) {
+            int next = cap < max_tokens / 2 ? cap * 2 : max_tokens;
+            int *grown = (int *)realloc(ids, (size_t)next * sizeof(int));
+            if (!grown) { free(ids); fclose(f); return -1; }
+            ids = grown;
+            cap = next;
+        }
+        ids[n++] = (int)value;
+    }
+    if (rc != EOF) {
+        fprintf(stderr, "errore: contenuto non numerico in INPUT_FILE=%s\n", path);
+        free(ids); fclose(f); return -1;
+    }
+    fclose(f);
+    if (n == 0) {
+        fprintf(stderr, "errore: INPUT_FILE vuoto: %s\n", path);
+        free(ids); return -1;
+    }
+    *out_ids = ids;
+    return n;
+}
+
+/* ── Modalità servizio: sessione multi-turn persistente su pipe ──
+ * stdout contiene solo il protocollo, stderr solo diagnostica.
+ * Invariante: ogni TOKEN emesso viene anche consumato dal forward, quindi
+ * `pos` equivale sempre al numero di posizioni valide nella KV-cache. */
+static int service_loop(Model *m, int cap) {
+    Cfg *c = &m->c;
+    int pos = 0;
+
+    printf("READY %d %d %d %d\n", cap, c->vocab, c->stop_ids[0], c->stop_ids[1]);
+    fflush(stdout);
+
+    char cmd[32];
+    while (scanf("%31s", cmd) == 1) {
+        if (strcmp(cmd, "SHUTDOWN") == 0) break;
+
+        if (strcmp(cmd, "RESET") == 0) {
+            pos = 0;
+            g_history_len = 0;
+            m->kv.cur_pos = 0;
+            printf("DONE RESET 0 0\n");
+            fflush(stdout);
+            continue;
+        }
+
+        if (strcmp(cmd, "TURN") != 0) {
+            printf("ERROR BAD_COMMAND 1 comando sconosciuto\n");
+            fflush(stdout);
+            return 1;
+        }
+
+        long max_new = 0, keep = 0, n_ids = 0;
+        if (scanf("%ld %ld %ld", &max_new, &keep, &n_ids) != 3) {
+            printf("ERROR BAD_HEADER 1 header TURN illeggibile\n");
+            fflush(stdout);
+            return 1;
+        }
+        if (max_new < 0 || keep < 0 || keep > pos || n_ids <= 0 ||
+            keep + n_ids > cap || n_ids > cap) {
+            printf("ERROR BAD_RANGE 0 keep/n_ids fuori limiti (pos=%d cap=%d)\n", pos, cap);
+            fflush(stdout);
+            /* Nessuna mutazione: la sessione resta usabile. Scarta gli ID pendenti. */
+            for (long i = 0; i < n_ids; i++) { long skip; if (scanf("%ld", &skip) != 1) return 1; }
+            continue;
+        }
+
+        int *ids = (int *)malloc((size_t)n_ids * sizeof(int));
+        if (!ids) return 1;
+        int valid = 1;
+        for (long i = 0; i < n_ids; i++) {
+            long value;
+            if (scanf("%ld", &value) != 1) { free(ids); return 1; }
+            if (value < 0 || value >= c->vocab) valid = 0;
+            ids[i] = (int)value;
+        }
+        if (!valid) {
+            free(ids);
+            printf("ERROR BAD_TOKEN 0 ID fuori vocabolario\n");
+            fflush(stdout);
+            continue;
+        }
+
+        /* Riusa il prefisso: le posizioni successive verranno sovrascritte. */
+        pos = (int)keep;
+        int next = ids[0];
+        for (long i = 0; i < n_ids; i++) {
+            next = forward_token(m, ids[i], pos);
+            pos++;
+            if (next < 0 || next >= c->vocab) next = 0;
+        }
+        free(ids);
+
+        const char *reason = "MAX_TOKENS";
+        int produced = 0;
+        int tok = next;
+        while (1) {
+            if (produced >= max_new) { reason = "MAX_TOKENS"; break; }
+            if (pos >= cap) { reason = "CONTEXT_FULL"; break; }
+            printf("TOKEN %d\n", tok);
+            fflush(stdout);
+            produced++;
+            int following = forward_token(m, tok, pos);
+            pos++;
+            m->n_emit++;
+            if (tok == c->stop_ids[0]) { reason = "RETURN"; break; }
+            if (tok == c->stop_ids[1]) { reason = "CALL"; break; }
+            tok = (following < 0 || following >= c->vocab) ? 0 : following;
+        }
+        printf("DONE %s %d %d\n", reason, produced, pos);
+        fflush(stdout);
+    }
     return 0;
 }
 
@@ -1784,6 +2272,9 @@ int main(int argc, char **argv) {
     const char *mt = getenv("MAX");
     if (mt) max_tokens = atoi(mt);
     else if (argc > 2) max_tokens = atoi(argv[2]);
+    g_oracle_dir = getenv("ORACLE_DIR");
+    { const char *trace = getenv("TRACE_NUMERIC");
+      g_trace_numeric = trace && atoi(trace) != 0; }
 
     fprintf(stderr, "modello:    %s\n", model_path);
     fprintf(stderr, "max token:  %d\n\n", max_tokens);
@@ -1827,12 +2318,32 @@ int main(int argc, char **argv) {
             if (!found && i > 1) break;
         }
 
+        /* File shard aggiuntivi su altri dischi, separati da ';'.
+         * L'ordine è significativo: st_find usa il primo tensore omonimo. */
+        const char *aux_env = getenv("MODEL_AUX");
+        if (aux_env && *aux_env) {
+            char aux_list[2048];
+            strncpy(aux_list, aux_env, sizeof(aux_list) - 1);
+            aux_list[sizeof(aux_list) - 1] = '\0';
+            char *cursor = aux_list;
+            while (*cursor) {
+                char *sep = strchr(cursor, ';');
+                if (sep) *sep = '\0';
+                if (*cursor) {
+                    test = fopen(cursor, "rb");
+                    if (test) { fclose(test); st_open_file(&db, cursor); }
+                    else fprintf(stderr, "  ⚠ MODEL_AUX non trovato: %s\n", cursor);
+                }
+                if (!sep) break;
+                cursor = sep + 1;
+            }
+        }
+
         /* Shard: model-NNNNN.safetensors (formato Picchio convertito) */
         for (int i = 0; i < 200; i++) {
             snprintf(path, sizeof(path), "%s/model-%05d.safetensors", model_path, i);
             test = fopen(path, "rb");
             if (test) { fclose(test); st_open_file(&db, path); }
-            else if (i > 0) break;
         }
 
         /* experts-NN.safetensors */
@@ -1953,6 +2464,20 @@ int main(int argc, char **argv) {
     /* ── 6. Generazione ── */
     fprintf(stderr, "\n");
 
+    /* Modalità servizio: sessione persistente, nessun prompt/decode nel C. */
+    { const char *v = getenv("SERVICE");
+      if (v && atoi(v)) {
+        fprintf(stderr, "servizio: sessione persistente, capacità KV %d posizioni\n",
+                initial_ctx);
+        int rc = service_loop(&m, initial_ctx);
+        stats_dump(&m);
+        hotstore_save(&m);
+        pilot_shutdown();
+        if (has_tokenizer) tok_free(&tok);
+        st_close(&db);
+        return rc;
+      } }
+
     /* Harmony special token IDs */
     #define TOK_START   200006
     #define TOK_END     200007
@@ -1961,97 +2486,103 @@ int main(int argc, char **argv) {
     #define TOK_RETURN  200002
     #define TOK_CALL    200012
 
-    /* Leggi prompt da stdin o variabile d'ambiente */
-    char prompt[4096] = "";
-    const char *user_prompt = getenv("INPUT");
-    if (!user_prompt || strlen(user_prompt) == 0) {
-        user_prompt = getenv("PROMPT");
-        /* Ignora il PROMPT di Windows ($P$G) */
-        if (user_prompt && (strstr(user_prompt, "$P$G") || strlen(user_prompt) == 0))
-            user_prompt = NULL;
-    }
-    
-    if (user_prompt) {
-        strncpy(prompt, user_prompt, sizeof(prompt) - 1);
-    } else {
-        /* Chiedi all'utente */
-        fprintf(stderr, "› ");
-        if (fgets(prompt, sizeof(prompt), stdin)) {
-            int plen = (int)strlen(prompt);
-            if (plen > 0 && prompt[plen-1] == '\n') prompt[--plen] = '\0';
-            if (plen > 0 && prompt[plen-1] == '\r') prompt[--plen] = '\0';
-        }
-    }
-
-    if (prompt[0] == '\0') {
-        fprintf(stderr, "errore: prompt vuoto\n");
-        if (has_tokenizer) tok_free(&tok);
-        st_close(&db);
-        return 1;
-    }
-
-    /* Costruisci prompt con template harmony */
-    int prompt_tokens[8192];
+    /* Costruisci prompt con template Harmony legacy oppure usa ID ufficiali da file. */
+    int prompt_tokens_stack[8192];
+    int *prompt_tokens = prompt_tokens_stack;
+    int prompt_tokens_owned = 0;
     int n_prompt = 0;
+    const char *input_file = getenv("INPUT_FILE");
 
-    if (has_tokenizer) {
-        /* Se RAW=1, forza modo token ID diretti */
-        const char *raw_env = getenv("RAW");
-        int raw_mode = (raw_env && atoi(raw_env));
-        
-        if (raw_mode) {
+    if (input_file && *input_file) {
+        n_prompt = read_token_ids_file(input_file, c->ctx_len, &prompt_tokens);
+        if (n_prompt < 0) {
+            if (has_tokenizer) tok_free(&tok);
+            st_close(&db);
+            return 1;
+        }
+        prompt_tokens_owned = 1;
+        fprintf(stderr, "prompt (INPUT_FILE raw ID, %d token)\n", n_prompt);
+    } else {
+        /* Leggi prompt da stdin o variabile d'ambiente. */
+        char prompt[4096] = "";
+        const char *user_prompt = getenv("INPUT");
+        if (!user_prompt || strlen(user_prompt) == 0) {
+            user_prompt = getenv("PROMPT");
+            /* Ignora il PROMPT di Windows ($P$G). */
+            if (user_prompt && (strstr(user_prompt, "$P$G") || strlen(user_prompt) == 0))
+                user_prompt = NULL;
+        }
+        if (user_prompt) {
+            strncpy(prompt, user_prompt, sizeof(prompt) - 1);
+        } else {
+            fprintf(stderr, "› ");
+            if (fgets(prompt, sizeof(prompt), stdin)) {
+                int plen = (int)strlen(prompt);
+                if (plen > 0 && prompt[plen-1] == '\n') prompt[--plen] = '\0';
+                if (plen > 0 && prompt[plen-1] == '\r') prompt[--plen] = '\0';
+            }
+        }
+
+        if (prompt[0] != '\0' && has_tokenizer) {
+            const char *raw_env = getenv("RAW");
+            int raw_mode = raw_env && atoi(raw_env);
+            if (raw_mode) {
+                const char *p = prompt;
+                while (*p && n_prompt < 8192) {
+                    while (*p == ' ' || *p == '\n') p++;
+                    if (*p == '\0') break;
+                    prompt_tokens[n_prompt++] = (int)strtol(p, (char **)&p, 10);
+                }
+                fprintf(stderr, "prompt (raw ID, %d token)\n", n_prompt);
+            } else {
+                const char *sys_msg = "You are ChatGPT, a large language model trained by OpenAI.\n"
+                                      "Knowledge cutoff: 2024-06\n"
+                                      "Current date: 2026-07-27\n\n"
+                                      "Reasoning: medium\n\n"
+                                      "# Valid channels: analysis, commentary, final. "
+                                      "Channel must be included for every message.";
+                prompt_tokens[n_prompt++] = TOK_START;
+                n_prompt += tok_encode(&tok, "system", prompt_tokens + n_prompt, 16);
+                prompt_tokens[n_prompt++] = TOK_MESSAGE;
+                n_prompt += tok_encode(&tok, sys_msg, prompt_tokens + n_prompt, 2048);
+                prompt_tokens[n_prompt++] = TOK_END;
+                prompt_tokens[n_prompt++] = TOK_START;
+                n_prompt += tok_encode(&tok, "user", prompt_tokens + n_prompt, 16);
+                prompt_tokens[n_prompt++] = TOK_MESSAGE;
+                n_prompt += tok_encode(&tok, prompt, prompt_tokens + n_prompt, 4096);
+                prompt_tokens[n_prompt++] = TOK_END;
+                prompt_tokens[n_prompt++] = TOK_START;
+                n_prompt += tok_encode(&tok, "assistant", prompt_tokens + n_prompt, 16);
+                fprintf(stderr, "prompt: \"%s\" → %d token (Harmony legacy)\n",
+                        prompt, n_prompt);
+            }
+        } else if (prompt[0] != '\0') {
             const char *p = prompt;
             while (*p && n_prompt < 8192) {
                 while (*p == ' ' || *p == '\n') p++;
                 if (*p == '\0') break;
                 prompt_tokens[n_prompt++] = (int)strtol(p, (char **)&p, 10);
             }
-            fprintf(stderr, "prompt (raw ID, %d token)\n", n_prompt);
-        } else {
-        /* Sistema message */
-        const char *sys_msg = "You are ChatGPT, a large language model trained by OpenAI.\n"
-                              "Knowledge cutoff: 2024-06\n"
-                              "Current date: 2026-07-27\n\n"
-                              "Reasoning: medium\n\n"
-                              "# Valid channels: analysis, commentary, final. "
-                              "Channel must be included for every message.";
-
-        /* <|start|>system<|message|>{sys}<|end|> */
-        prompt_tokens[n_prompt++] = TOK_START;
-        n_prompt += tok_encode(&tok, "system", prompt_tokens + n_prompt, 16);
-        prompt_tokens[n_prompt++] = TOK_MESSAGE;
-        n_prompt += tok_encode(&tok, sys_msg, prompt_tokens + n_prompt, 2048);
-        prompt_tokens[n_prompt++] = TOK_END;
-
-        /* <|start|>user<|message|>{prompt}<|end|> */
-        prompt_tokens[n_prompt++] = TOK_START;
-        n_prompt += tok_encode(&tok, "user", prompt_tokens + n_prompt, 16);
-        prompt_tokens[n_prompt++] = TOK_MESSAGE;
-        n_prompt += tok_encode(&tok, prompt, prompt_tokens + n_prompt, 4096);
-        prompt_tokens[n_prompt++] = TOK_END;
-
-        /* <|start|>assistant */
-        prompt_tokens[n_prompt++] = TOK_START;
-        n_prompt += tok_encode(&tok, "assistant", prompt_tokens + n_prompt, 16);
-
-        fprintf(stderr, "prompt: \"%s\" → %d token (harmony format)\n", prompt, n_prompt);
-        } /* end else (harmony mode) */
-    } else {
-        /* Modo raw: interpreta come token ID separati da spazi */
-        const char *p = prompt;
-        while (*p && n_prompt < 8192) {
-            while (*p == ' ' || *p == '\n') p++;
-            if (*p == '\0') break;
-            prompt_tokens[n_prompt++] = (int)strtol(p, (char **)&p, 10);
+            fprintf(stderr, "prompt (raw ID): %d token\n", n_prompt);
         }
-        fprintf(stderr, "prompt (raw ID): %d token\n", n_prompt);
     }
 
     if (n_prompt == 0) {
         fprintf(stderr, "errore: prompt vuoto\n");
+        if (prompt_tokens_owned) free(prompt_tokens);
         if (has_tokenizer) tok_free(&tok);
         st_close(&db);
         return 1;
+    }
+    for (int i = 0; i < n_prompt; i++) {
+        if (prompt_tokens[i] < 0 || prompt_tokens[i] >= c->vocab) {
+            fprintf(stderr, "errore: token ID fuori vocabolario alla posizione %d: %d\n",
+                    i, prompt_tokens[i]);
+            if (prompt_tokens_owned) free(prompt_tokens);
+            if (has_tokenizer) tok_free(&tok);
+            st_close(&db);
+            return 1;
+        }
     }
 
     /* Prefill: processa tutti i token del prompt */
@@ -2077,18 +2608,29 @@ int main(int argc, char **argv) {
     /* Debug: mostra anche analysis se VERBOSE=1 */
     int show_all = 0;
     { const char *v = getenv("VERBOSE"); if (v && atoi(v)) show_all = 1; }
+    int output_ids = 0;
+    { const char *v = getenv("OUTPUT"); if (v && strcmp(v, "ids") == 0) output_ids = 1; }
 
     for (int i = 0; i < max_tokens; i++) {
-        /* Check stop tokens */
+        /* Il protocollo machine-readable include sempre il terminatore. */
+        if (output_ids) {
+            printf("%d\n", tok_id);
+            fflush(stdout);
+        }
+
+        /* Stop della risposta assistant: return o call. TOK_END chiude solo un messaggio. */
         if (tok_id == TOK_RETURN || tok_id == TOK_CALL) break;
         if (tok_id == c->stop_ids[0]) break;  /* EOS generico */
 
+        if (output_ids) {
+            /* Nessun decode o filtro C: il bridge Harmony possiede il rendering. */
+        }
         /* Gestione canali harmony:
          * - Dopo <|channel|>, leggi il nome del canale
          * - Se "final", mostra il contenuto
          * - Se "analysis", non mostrare (chain of thought interna)
          */
-        if (tok_id == TOK_CHANNEL) {
+        else if (tok_id == TOK_CHANNEL) {
             skip_header = 1;  /* prossimi token sono header di canale */
         } else if (tok_id == TOK_MESSAGE) {
             skip_header = 0;  /* dopo <|message|> inizia il contenuto */
@@ -2163,6 +2705,7 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     pilot_shutdown();
+    if (prompt_tokens_owned) free(prompt_tokens);
     if (has_tokenizer) tok_free(&tok);
     st_close(&db);
     return 0;
