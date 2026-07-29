@@ -17,6 +17,8 @@ oracle_boundary_hf/
 oracle_boundary_c/
 gptoss_i4/
 gptoss_raw/
+gptoss20b_i4/
+gptoss120b_meta/
 
 # File temporanei
 *.log
