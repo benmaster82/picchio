@@ -263,11 +263,32 @@ libera misurata:
 | 3 | 10 | 3,0 GB | 56,7% | 97,83 s | ~208 s |
 | 4 | 14 | 4,2 GB | 67,1% | 76,75 s | ~190 s |
 
-Oltre `PIN_GB=4` il totale residente supererebbe la RAM libera e causerebbe paging. A
-`PIN_GB=4` il collo di bottiglia si sposta sul calcolo: circa 113 s di compute contro
-77 s di I/O, quindi il disco passa dal 76% osservato sul 120B a circa il 40%. Le
-ottimizzazioni successive utili sono quindi i kernel INT4 con SIMD e più RAM, non
-ulteriori interventi sull'I/O. Con 768 expert totali, circa 9,5 GB, la residenza
+Oltre `PIN_GB=4` il totale residente supererebbe la RAM libera e causerebbe paging.
+
+**SIMD.** Come per OpenMP, i percorsi AVX2 di `quant.h` sono protetti da `#ifdef __AVX2__`
+e la build non passava flag di architettura, quindi i kernel usavano solo lo scalare.
+Aggiunti `-mavx2 -mfma`; il binario richiede una CPU con AVX2. FMA cambia l'ordine di
+arrotondamento, ma le suite tiny F32 e INT4 restano entro tolleranza con errore massimo
+`3,73e-08`.
+
+Effetto sul 20B a `PIN_GB=4`, stesso prompt e stesso output di 43 token:
+
+| Metrica | Senza SIMD | Con SIMD |
+|---|---|---|
+| `t_moe` | 162,70 s | 88,49 s |
+| `t_attn` | 20,55 s | 13,93 s |
+| `t_head` | 6,91 s | 1,33 s |
+| disco | 76,75 s | 71,14 s |
+| totale fasi | ~190 s | ~104 s |
+
+Il calcolo al netto del disco scende da circa 113 s a circa 32,6 s, e il MoE puro da
+circa 85,9 s a circa 17,4 s. Il collo di bottiglia torna quindi l'I/O, che pesa 71 s su
+104, cioè il 68%: i prossimi interventi utili sono più RAM per la cache expert, il
+modello su NVMe interno e un prefetch che popoli direttamente la cache LRU.
+
+**Lezione di metodo.** Due dei guadagni maggiori non sono venuti da nuovo codice ma da
+flag di compilazione mancanti, `-fopenmp` e `-mavx2 -mfma`, con gli avvisi silenziati.
+Prima di ottimizzare, verificare che il codice esistente sia realmente compilato. Con 768 expert totali, circa 9,5 GB, la residenza
 completa è raggiungibile con più RAM, condizione in cui il disco esce dal percorso
 critico. La risposta del 20B termina con `RETURN`, quindi il ciclo Harmony completo,
 terminatore incluso, è verificato sul modello reale.
