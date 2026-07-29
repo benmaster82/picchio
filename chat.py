@@ -122,11 +122,21 @@ class HarmonyChat:
 
         parser = StreamableParser(self.encoding, Role.ASSISTANT, strict=False)
 
+        state = {"n": 0, "shown": False}
+
         def on_token(token):
             parser.process(token)
+            state["n"] += 1
             chunk = parser.last_content_delta
             if chunk and parser.current_channel == show_channel:
+                if not state["shown"]:
+                    print("", file=sys.stderr)  # chiude la riga di avanzamento
+                    state["shown"] = True
                 print(chunk, end="", flush=True)
+            elif not state["shown"]:
+                # Il canale final non è ancora iniziato: mostra che sta lavorando.
+                print(f"\r[{parser.current_channel or 'header'}: {state['n']} token]",
+                      end="", file=sys.stderr, flush=True)
 
         print(f"[riuso {keep}/{len(full)} posizioni, {len(delta)} da elaborare]",
               file=sys.stderr)

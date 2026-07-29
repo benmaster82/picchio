@@ -15,6 +15,8 @@ oracle_hf/
 oracle_c/
 oracle_boundary_hf/
 oracle_boundary_c/
+oracle_long_hf/
+oracle_long_c/
 gptoss_i4/
 gptoss_raw/
 gptoss20b_i4/
