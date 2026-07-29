@@ -223,6 +223,55 @@ con sincronizzazione, eliminando la seconda lettura, e misurare quanti expert pr
 vengono realmente usati, dato che il routing del layer successivo è stimato dallo stato
 nascosto del layer corrente ed è quindi approssimato.
 
+**Prefill batched (batch-union).** Con cache da 4 slot per layer e top-4, il percorso
+token-per-token sfratta l'intera cache a ogni posizione, quindi il prompt rilegge gli
+stessi expert molte volte. Il prefill elabora ora le posizioni a blocchi: per ogni layer
+si esegue l'attention in ordine di posizione, poi si calcola il routing di tutte le
+posizioni e si legge **una sola volta** ogni expert dell'unione, riusandolo per tutte le
+posizioni che lo hanno selezionato. La matematica non cambia: cambia solo l'ordine delle
+letture. Il percorso sequenziale resta attivo con dump oracle, tracing o repetition
+penalty, così le suite di validazione non sono influenzate. `test_prefill_batch.py`
+verifica che le due strade producano token identici.
+
+### 0.9 GPT-OSS-20B
+
+Stesso codice, nessuna modifica: dimensioni, layer, expert e pattern di attention sono
+letti da `config.json`. Il 20B ha 24 layer e 32 expert per layer, top-4, hidden 2880.
+La conversione ha prodotto 14,0 GB in 856 s, con 3,20 GB densi, 10,75 GB di expert e i
+bias expert già in F32, quindi senza sidecar.
+
+Confronto sullo stesso prompt Harmony e sullo stesso hardware:
+
+| Metrica | 120B | 20B |
+|---|---|---|
+| Cache hit | 20,5% | 56,7% |
+| Attesa disco | 534,69 s | 97,83 s |
+| `t_moe` | 649,91 s | 181,88 s |
+| `t_attn` | 30,98 s | 19,63 s |
+| `t_head` | 19,93 s | 6,94 s |
+| Totale fasi | ~701 s | ~208 s |
+
+Circa 1,7 s per token contro circa 7 s, quindi un fattore 4. La ragione strutturale è la
+copertura della cache: 4 slot per layer valgono il 3% di 128 expert nel 120B ma una quota
+molto maggiore dei 32 expert del 20B.
+
+Effetto della dimensione della cache sul 20B, con parte densa 3,14 GB e 8,37 GB di RAM
+libera misurata:
+
+| `PIN_GB` | slot/layer | cache | hit | disco | totale fasi |
+|---|---|---|---|---|---|
+| 3 | 10 | 3,0 GB | 56,7% | 97,83 s | ~208 s |
+| 4 | 14 | 4,2 GB | 67,1% | 76,75 s | ~190 s |
+
+Oltre `PIN_GB=4` il totale residente supererebbe la RAM libera e causerebbe paging. A
+`PIN_GB=4` il collo di bottiglia si sposta sul calcolo: circa 113 s di compute contro
+77 s di I/O, quindi il disco passa dal 76% osservato sul 120B a circa il 40%. Le
+ottimizzazioni successive utili sono quindi i kernel INT4 con SIMD e più RAM, non
+ulteriori interventi sull'I/O. Con 768 expert totali, circa 9,5 GB, la residenza
+completa è raggiungibile con più RAM, condizione in cui il disco esce dal percorso
+critico. La risposta del 20B termina con `RETURN`, quindi il ciclo Harmony completo,
+terminatore incluso, è verificato sul modello reale.
+
 ---
 
 ## 1. Analisi dell'architettura GPT-OSS-120B

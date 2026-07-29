@@ -1642,6 +1642,174 @@ static int forward_token(Model *m, int tok, int pos) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+ *  PREFILL BATCHED (batch-union degli expert)
+ *
+ *  Elaborando più posizioni insieme, ogni expert unico del layer viene letto
+ *  una sola volta invece di una volta per token. Con cache da 4 slot per layer
+ *  e top-4, il percorso token-per-token sfratta l'intera cache a ogni token.
+ *  La matematica è identica al percorso sequenziale: cambia solo l'ordine
+ *  delle letture, mai il routing o la precisione.
+ * ═══════════════════════════════════════════════════════════ */
+
+/* Applica un expert a x e accumula w * output in dst. */
+static void expert_apply(ESlot *es, const float *x, float *dst, float w,
+                         const Cfg *c) {
+    int D = c->hidden, I = c->moe_inter, half = I / 2;
+    float *gu = falloc(I);
+    float *eo = falloc(D);
+
+    matmul_qt(gu, x, &es->gu, 1);
+    if (es->gu_bias) for (int i = 0; i < I; i++) gu[i] += es->gu_bias[i];
+
+    for (int i = 0; i < half; i++) {
+        float gate = gu[2 * i], up = gu[2 * i + 1];
+        if (gate > c->swiglu_limit) gate = c->swiglu_limit;
+        if (up > c->swiglu_limit) up = c->swiglu_limit;
+        if (up < -c->swiglu_limit) up = -c->swiglu_limit;
+        gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+    }
+
+    matmul_qt(eo, gu, &es->d, 1);
+    if (es->d_bias) for (int i = 0; i < D; i++) eo[i] += es->d_bias[i];
+    for (int i = 0; i < D; i++) dst[i] += w * eo[i];
+
+    free(gu); free(eo);
+}
+
+/* Prefill di n token a partire da pos_base. Ritorna il token campionato
+ * dall'ultima posizione, come farebbe l'ultimo forward_token sequenziale. */
+static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts, K = c->topk;
+
+    float *H = (float *)falloc((int64_t)n * D);
+    float *XN = (float *)falloc((int64_t)n * D);
+    float *hn = falloc(D);
+    float *attn_out = falloc(D);
+    int *sel_all = (int *)malloc((size_t)n * K * sizeof(int));
+    float *w_all = (float *)malloc((size_t)n * K * sizeof(float));
+    float *scores = falloc(E);
+    int *uniq = (int *)malloc((size_t)E * sizeof(int));
+    unsigned char *seen = (unsigned char *)malloc((size_t)E);
+    if (!H || !XN || !sel_all || !w_all || !uniq || !seen) {
+        fprintf(stderr, "errore: memoria insufficiente per il prefill batched\n");
+        exit(1);
+    }
+
+    for (int p = 0; p < n; p++) embed_token(m, ids[p], H + (int64_t)p * D);
+
+    for (int l = 0; l < c->n_layers; l++) {
+        Layer *ly = &m->L[l];
+
+        /* Attention: in ordine di posizione, così la KV precedente è pronta. */
+        double ta = now_s();
+        for (int p = 0; p < n; p++) {
+            float *h = H + (int64_t)p * D;
+            rmsnorm(hn, h, ly->in_ln, D, c->eps);
+            gqa_attention(attn_out, hn, ly, &m->kv, l, pos_base + p, c);
+            for (int i = 0; i < D; i++) h[i] += attn_out[i];
+        }
+        m->t_attn += now_s() - ta;
+
+        double tm = now_s();
+        /* Routing di tutte le posizioni, poi unione degli expert richiesti. */
+        memset(seen, 0, (size_t)E);
+        int n_uniq = 0;
+        for (int p = 0; p < n; p++) {
+            float *h = H + (int64_t)p * D;
+            float *xn = XN + (int64_t)p * D;
+            rmsnorm(xn, h, ly->post_ln, D, c->eps);
+
+            for (int e = 0; e < E; e++) {
+                float dot = ly->router_bias ? ly->router_bias[e] : 0.0f;
+                const float *rw = ly->router + (int64_t)e * D;
+                for (int i = 0; i < D; i++) dot += xn[i] * rw[i];
+                scores[e] = dot;
+            }
+            int *sel = sel_all + (size_t)p * K;
+            float *wgt = w_all + (size_t)p * K;
+            for (int k = 0; k < K; k++) {
+                int best = -1; float best_s = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    int already = 0;
+                    for (int j = 0; j < k; j++) if (sel[j] == e) { already = 1; break; }
+                    if (!already && scores[e] > best_s) { best_s = scores[e]; best = e; }
+                }
+                sel[k] = best; wgt[k] = best_s;
+            }
+            softmax(wgt, K);
+            for (int k = 0; k < K; k++) {
+                if (m->eusage[l]) m->eusage[l][sel[k]]++;
+                if (m->eheat[l]) m->eheat[l][sel[k]]++;
+                if (!seen[sel[k]]) { seen[sel[k]] = 1; uniq[n_uniq++] = sel[k]; }
+            }
+        }
+
+        /* Un expert unico → una sola lettura, riusata da tutte le posizioni.
+         * Il buffer va azzerato: expert_apply accumula. */
+        float *moe = (float *)calloc((size_t)n * D, sizeof(float));
+        if (!moe) { fprintf(stderr, "errore: memoria MoE\n"); exit(1); }
+        for (int u = 0; u < n_uniq; u++) {
+            ESlot *es = cache_lookup(m, l, uniq[u]);
+            if (es->eid < 0) continue;
+            for (int p = 0; p < n; p++) {
+                int *sel = sel_all + (size_t)p * K;
+                float *wgt = w_all + (size_t)p * K;
+                for (int k = 0; k < K; k++) {
+                    if (sel[k] != uniq[u]) continue;
+                    expert_apply(es, XN + (int64_t)p * D, moe + (int64_t)p * D,
+                                 wgt[k] * c->routed_scale, c);
+                }
+            }
+        }
+        for (int p = 0; p < n; p++) {
+            float *h = H + (int64_t)p * D;
+            const float *mo = moe + (int64_t)p * D;
+            for (int i = 0; i < D; i++) h[i] += mo[i];
+        }
+        free(moe);
+        m->t_moe += now_s() - tm;
+    }
+
+    /* Solo l'ultima posizione produce i logits utili. */
+    rmsnorm(hn, H + (int64_t)(n - 1) * D, m->final_norm, D, c->eps);
+    double th = now_s();
+    float *logits = falloc(c->vocab);
+    matmul_qt(logits, hn, &m->lm_head, 1);
+    m->t_head += now_s() - th;
+    int sampled = sample_logits(logits, c->vocab);
+
+    free(H); free(XN); free(hn); free(attn_out); free(sel_all); free(w_all);
+    free(scores); free(uniq); free(seen); free(logits);
+    m->n_fw += n;
+    return sampled;
+}
+
+/* Prefill a blocchi. Ricade sul percorso sequenziale quando servono i dump
+ * oracle, il tracing o una repetition penalty che dipende dallo storico. */
+static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
+    int batch = 64;
+    { const char *v = getenv("PREFILL_BATCH"); if (v) batch = atoi(v); }
+    int sequential = g_oracle_dir || g_trace_numeric || g_rep_penalty > 1.0f
+                     || batch <= 1 || n <= 1;
+
+    int last = ids[0];
+    if (sequential) {
+        for (int i = 0; i < n; i++) {
+            last = forward_token(m, ids[i], pos_base + i);
+            if (last < 0 || last >= m->c.vocab) last = 0;
+        }
+        return last;
+    }
+    for (int off = 0; off < n; off += batch) {
+        int len = n - off < batch ? n - off : batch;
+        last = forward_prefill(m, ids + off, len, pos_base + off);
+        if (last < 0 || last >= m->c.vocab) last = 0;
+    }
+    return last;
+}
+
+/* ═══════════════════════════════════════════════════════════
  *  STATISTICHE
  * ═══════════════════════════════════════════════════════════ */
 
@@ -2385,12 +2553,8 @@ static int service_loop(Model *m, int cap) {
 
         /* Riusa il prefisso: le posizioni successive verranno sovrascritte. */
         pos = (int)keep;
-        int next = ids[0];
-        for (long i = 0; i < n_ids; i++) {
-            next = forward_token(m, ids[i], pos);
-            pos++;
-            if (next < 0 || next >= c->vocab) next = 0;
-        }
+        int next = prefill_tokens(m, ids, (int)n_ids, pos);
+        pos += (int)n_ids;
         free(ids);
 
         const char *reason = "MAX_TOKENS";
@@ -2759,11 +2923,7 @@ int main(int argc, char **argv) {
     /* Prefill: processa tutti i token del prompt */
     fprintf(stderr, "prefill %d token...\n", n_prompt);
     double t_prefill = now_s();
-    int last_tok = prompt_tokens[0];
-    for (int i = 0; i < n_prompt; i++) {
-        last_tok = forward_token(&m, prompt_tokens[i], i);
-        if (last_tok < 0 || last_tok >= c->vocab) last_tok = 0;
-    }
+    int last_tok = prefill_tokens(&m, prompt_tokens, n_prompt, 0);
     fprintf(stderr, "✓ prefill in %.2f s (next=%d)\n\n", now_s() - t_prefill, last_tok);
 
     /* Decode: genera token autoregressivamente */

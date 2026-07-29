@@ -1,6 +1,10 @@
 # Picchio 🪶
 
-Motore MoE streaming per **GPT-OSS-120B** (117B parametri, 5.1B attivi/token) su hardware consumer.
+Motore MoE streaming per **GPT-OSS** (120B e 20B) su hardware consumer.
+
+Il 20B è la configurazione consigliata con 16 GB di RAM: modello convertito ~14 GB,
+cache hit ~57% e circa 4× più veloce del 120B sullo stesso hardware, senza modifiche
+al codice (layer, expert e attention sono letti da `config.json`).
 
 Ispirato a [Colibri](https://github.com/JustVugg/colibri) (GLM-5.2), adattato per GPT-OSS.
 
@@ -34,12 +38,26 @@ picchio.exe --self-test
 ./picchio test_model
 ```
 
-### 4. Modello reale (~66,65 GB nel formato convertito corrente)
+### 4. Modello reale
+
+GPT-OSS-20B, consigliato con 16 GB di RAM (~14 GB convertiti):
+
+```powershell
+python convert.py --model openai/gpt-oss-20b --output D:\gptoss20b_i4 --download
+python export_vocab.py D:\gptoss20b_i4\tokenizer.json D:\gptoss20b_i4\picchio_vocab.bin
+python chat.py "Ciao" --model D:\gptoss20b_i4 --pin-gb 4 --ctx 512
+```
+
+GPT-OSS-120B (~66,65 GB convertiti, richiede il sidecar dei bias):
 
 ```bash
 python convert.py --model openai/gpt-oss-120b --output /nvme/gptoss_i4
 MODEL=/nvme/gptoss_i4 ./picchio
 ```
+
+Nota: il download da Hugging Face include anche la cartella `original/`, che è lo stesso
+modello in formato alternativo e non serve. Conviene interromperla o rimuoverla per non
+occupare spazio inutilmente.
 
 ## Architettura GPT-OSS-120B
 

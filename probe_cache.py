@@ -43,10 +43,11 @@ def probe(pin_gb):
 
 
 def main():
-    print(f"{'PIN_GB':>7} {'slot/layer':>11} {'expert':>7} {'cache_GB':>9} {'totale_GB':>10}")
+    print(f"{'PIN_GB':>7} {'slot/layer':>11} {'expert':>7} {'cache_GB':>9}")
     for pin_gb in (1, 2, 3, 4, 6, 8):
         slots, experts, gb = probe(pin_gb)
-        print(f"{pin_gb:>7} {slots:>11} {experts:>7} {gb:>9.1f} {gb + 4.46:>10.1f}")
+        print(f"{pin_gb:>7} {slots:>11} {experts:>7} {gb:>9.1f}")
+    print("Sommare la parte densa riportata dal runtime per il totale residente.")
 
 
 if __name__ == "__main__":
