@@ -11,7 +11,9 @@ if not exist "%GCC%" (
 )
 
 echo Compilo picchio.exe...
-"%GCC%" -O2 -Wall -Wno-unknown-pragmas -Wno-misleading-indentation -Wno-unused-function -Wl,--stack,8388608 -o picchio.exe picchio.c -lm
+REM -fopenmp e' necessario: senza di esso i #pragma omp dei kernel matmul in quant.h
+REM vengono ignorati e tutto il calcolo resta su un solo core.
+"%GCC%" -O2 -Wall -fopenmp -Wno-misleading-indentation -Wno-unused-function -Wl,--stack,8388608 -o picchio.exe picchio.c -lm
 if %ERRORLEVEL% NEQ 0 (
     echo Errore di compilazione.
     exit /b 1

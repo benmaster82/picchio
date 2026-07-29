@@ -61,7 +61,9 @@ MODEL=/nvme/gptoss_i4 ./picchio
 - Parte densa residente misurata: ~4,46 GB
 - KV-cache iniziale configurabile con `CTX` (default 512 posizioni)
 - Cache expert configurabile con `PIN_GB` (default 6 GB; usare 1 GB con poco margine)
-- Prestazione misurata su Windows/6 thread: ~0,07–0,1 token/s
+- Prestazione misurata su Windows/6 core con OpenMP: ~0,14 token/s (era ~0,09 su un core)
+- La build **deve** usare `-fopenmp`, altrimenti i kernel matmul restano su un solo core
+- `PILOT=1` è sconsigliato con poca RAM libera: misurato ~11% più lento
 - Il modello convertito occupa circa 66,65 GB
 
 Con uno shard su C: e gli altri su D:, usare PowerShell:
@@ -137,7 +139,8 @@ test_forward.py  — oracle Python per validazione
 - [x] Sessione persistente multi-turn con riuso del prefisso KV
 - [ ] Tokenizer o200k_harmony nativo C token-exact (`tok.h` resta approssimato)
 - [ ] Prestazioni: prefill e I/O expert sono il collo di bottiglia (~0,09 token/s)
-- [ ] PILOT prefetch su Windows
+- [x] Kernel matmul realmente paralleli (OpenMP abilitato): ~1,7× sul turno completo
+- [ ] PILOT prefetch utile: va riscritto per popolare direttamente la cache LRU
 - [ ] Server API OpenAI-compatible
 
 ## Licenza

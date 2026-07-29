@@ -1029,10 +1029,181 @@ static void pilot_shutdown(void) {
 }
 
 #else
-/* Windows: PILOT disabilitato per ora (serve CreateThread/SRWLock) */
-static void pilot_init(Model *m) { (void)m; }
-static void pilot_prefetch(int layer, const float *x) { (void)layer; (void)x; }
-static void pilot_shutdown(void) {}
+/* Windows: PILOT di warming.
+ *
+ * Il thread NON modifica la cache LRU né usa gli handle del thread principale:
+ * apre handle propri e legge i byte degli expert previsti per il layer successivo,
+ * portandoli nella cache del sistema operativo. La lettura successiva del thread
+ * principale viene così servita dalla RAM invece che dal disco.
+ *
+ * Questo evita qualsiasi corsa critica sulle strutture condivise: `st_find` e
+ * `l->router` sono in sola lettura, e l'input di routing viene copiato. */
+
+#define PILOT_SCRATCH (4 * 1024 * 1024)
+
+typedef struct {
+    Model *m;
+    float *x;                        /* copia privata dell'input di routing */
+    int layer;
+    int has_job;
+    int shutdown;
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+    HANDLE thread;
+    HANDLE handles[ST_MAX_FILES];    /* handle indipendenti per file */
+    uint8_t *scratch;
+    uint64_t warmed;
+} Pilot;
+
+static Pilot g_pilot;
+static int g_pilot_enabled = 0;
+
+static HANDLE pilot_handle(int file_idx) {
+    if (!g_db || file_idx < 0 || file_idx >= g_db->n_files) return NULL;
+    if (!g_pilot.handles[file_idx]) {
+        HANDLE h = CreateFileA(g_db->files[file_idx].path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        g_pilot.handles[file_idx] = (h == INVALID_HANDLE_VALUE) ? NULL : h;
+    }
+    return g_pilot.handles[file_idx];
+}
+
+/* Porta nella cache del sistema operativo l'intervallo di un tensore. */
+static void pilot_warm(StTensor *t) {
+    if (!t) return;
+    HANDLE h = pilot_handle(t->file_idx);
+    if (!h) return;
+    int64_t base = g_db->files[t->file_idx].data_offset + t->offset_start;
+    int64_t remaining = t->offset_end - t->offset_start;
+    while (remaining > 0 && !g_pilot.shutdown) {
+        DWORD chunk = (DWORD)(remaining < PILOT_SCRATCH ? remaining : PILOT_SCRATCH);
+        OVERLAPPED ov = {0};
+        ov.Offset = (DWORD)(base & 0xFFFFFFFF);
+        ov.OffsetHigh = (DWORD)(base >> 32);
+        DWORD got = 0;
+        if (!ReadFile(h, g_pilot.scratch, chunk, &got, &ov) || got == 0) return;
+        base += got;
+        remaining -= got;
+    }
+    g_pilot.warmed++;
+}
+
+/* Cerca un tensore expert provando le varianti di nome usate dal loader. */
+static StTensor *pilot_find_expert(int layer, int eid, const char *proj) {
+    char name[256];
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%s.%d", layer, proj, eid);
+    StTensor *t = st_find(g_db, name);
+    if (!t) {
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%d.%s", layer, eid, proj);
+        t = st_find(g_db, name);
+    }
+    if (!t) {
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%d.%s.weight",
+                 layer, eid, proj);
+        t = st_find(g_db, name);
+    }
+    return t;
+}
+
+/* Peek senza lock: legge solo interi. Un esito impreciso costa al massimo
+ * una lettura inutile o mancata, mai la correttezza del forward. */
+static int pilot_probably_cached(Model *m, int layer, int eid) {
+    for (int i = 0; i < m->npin[layer]; i++)
+        if (m->pin[layer] && m->pin[layer][i].eid == eid) return 1;
+    for (int i = 0; i < m->ecap; i++)
+        if (m->ecache[layer][i].eid == eid) return 1;
+    return 0;
+}
+
+static DWORD WINAPI pilot_worker(LPVOID arg) {
+    Pilot *p = (Pilot *)arg;
+    Model *m = p->m;
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts, K = c->topk;
+    float *scores = (float *)malloc((size_t)E * sizeof(float));
+    if (!scores) return 0;
+
+    for (;;) {
+        EnterCriticalSection(&p->cs);
+        while (!p->has_job && !p->shutdown)
+            SleepConditionVariableCS(&p->cv, &p->cs, INFINITE);
+        if (p->shutdown) { LeaveCriticalSection(&p->cs); break; }
+        int layer = p->layer;
+        p->has_job = 0;
+        LeaveCriticalSection(&p->cs);
+
+        Layer *l = &m->L[layer];
+        if (!l->router || !g_db) continue;
+
+        for (int e = 0; e < E; e++) {
+            const float *rw = l->router + (int64_t)e * D;
+            float dot = l->router_bias ? l->router_bias[e] : 0.0f;
+            for (int i = 0; i < D; i++) dot += p->x[i] * rw[i];
+            scores[e] = dot;
+        }
+        for (int k = 0; k < K && !p->shutdown; k++) {
+            int best = 0;
+            for (int e = 1; e < E; e++) if (scores[e] > scores[best]) best = e;
+            scores[best] = -1e30f;
+            if (pilot_probably_cached(m, layer, best)) continue;
+            pilot_warm(pilot_find_expert(layer, best, "gate_up_proj"));
+            pilot_warm(pilot_find_expert(layer, best, "down_proj"));
+        }
+    }
+    free(scores);
+    return 0;
+}
+
+static void pilot_init(Model *m) {
+    memset(&g_pilot, 0, sizeof(g_pilot));
+    g_pilot.m = m;
+    g_pilot.x = (float *)calloc((size_t)m->c.hidden, sizeof(float));
+    g_pilot.scratch = (uint8_t *)malloc(PILOT_SCRATCH);
+    if (!g_pilot.x || !g_pilot.scratch) {
+        free(g_pilot.x); free(g_pilot.scratch);
+        fprintf(stderr, "  ⚠ PILOT: memoria insufficiente, prefetch disattivato\n");
+        return;
+    }
+    InitializeCriticalSection(&g_pilot.cs);
+    InitializeConditionVariable(&g_pilot.cv);
+    g_pilot.thread = CreateThread(NULL, 0, pilot_worker, &g_pilot, 0, NULL);
+    if (!g_pilot.thread) {
+        DeleteCriticalSection(&g_pilot.cs);
+        free(g_pilot.x); free(g_pilot.scratch);
+        fprintf(stderr, "  ⚠ PILOT: creazione thread fallita\n");
+        return;
+    }
+    g_pilot_enabled = 1;
+}
+
+static void pilot_prefetch(int layer, const float *x) {
+    if (!g_pilot_enabled) return;
+    if (!TryEnterCriticalSection(&g_pilot.cs)) return;  /* thread occupato: salta */
+    memcpy(g_pilot.x, x, (size_t)g_pilot.m->c.hidden * sizeof(float));
+    g_pilot.layer = layer;
+    g_pilot.has_job = 1;
+    WakeConditionVariable(&g_pilot.cv);
+    LeaveCriticalSection(&g_pilot.cs);
+}
+
+static void pilot_shutdown(void) {
+    if (!g_pilot_enabled) return;
+    EnterCriticalSection(&g_pilot.cs);
+    g_pilot.shutdown = 1;
+    WakeConditionVariable(&g_pilot.cv);
+    LeaveCriticalSection(&g_pilot.cs);
+    WaitForSingleObject(g_pilot.thread, 10000);
+    CloseHandle(g_pilot.thread);
+    for (int i = 0; i < ST_MAX_FILES; i++)
+        if (g_pilot.handles[i]) CloseHandle(g_pilot.handles[i]);
+    DeleteCriticalSection(&g_pilot.cs);
+    fprintf(stderr, "PILOT: %llu tensori pre-caricati\n",
+            (unsigned long long)g_pilot.warmed);
+    free(g_pilot.x);
+    free(g_pilot.scratch);
+    g_pilot_enabled = 0;
+}
 #endif
 
 /* ═══════════════════════════════════════════════════════════

@@ -171,6 +171,58 @@ Risultati del 29 luglio 2026, verificati sul tiny model:
 - due turni consecutivi hanno riusato 68 posizioni su 77;
 - le suite tiny F32 e INT4 non sono regredite.
 
+Sul GPT-OSS-120B reale la sessione persistente ha risposto correttamente, con canale
+`analysis` e `final` separati dal parser ufficiale.
+
+### 0.8 Prestazioni: misure e vincoli hardware
+
+Profilo di un turno reale da 77 token di prompt e 24 generati:
+
+- `t_moe` 983,70 s, di cui **565,73 s di attesa disco** su 11.569 letture;
+- `t_attn` 134,20 s, `t_head` 71,29 s;
+- cache hit expert 20,5% su 14.544 richieste;
+- circa 0,09 token/s.
+
+Vincolo di memoria misurato: 15,83 GB totali con circa 6,86 GB liberi. La parte densa
+occupa 4,46 GB, quindi la cache expert non può superare circa 2,4 GB. `PIN_GB` 1 e 2
+producono entrambi il minimo di 4 slot per layer; `PIN_GB=3` porterebbe il totale a
+7,6 GB, oltre la memoria libera, causando paging. L'aumento della cache richiede
+quindi più RAM, non solo un parametro diverso.
+
+Vincolo di I/O: il modello risiede su un SSD esterno **USB** con bridge JMicron, non
+sull'NVMe interno, coerente con i circa 253 MB/s osservati.
+
+Prefetch su Windows: il thread PILOT non modifica la cache LRU e non condivide gli
+handle del thread principale. Apre handle propri, copia l'input di routing, calcola il
+top-k del layer successivo e legge gli intervalli degli expert previsti per portarli
+nella cache del sistema operativo. Le strutture condivise vengono solo lette, quindi
+non esiste corsa critica che possa alterare il risultato numerico; il controllo di
+presenza in cache è volutamente senza lock e un esito impreciso costa al massimo una
+lettura inutile. La correttezza con prefetch attivo è verificata dalle suite tiny.
+
+**OpenMP.** Il binario veniva compilato senza `-fopenmp`, quindi i `#pragma omp` dei
+kernel matmul in `quant.h` erano ignorati e tutto il calcolo restava su un core, su una
+CPU con 6 core fisici. L'opzione `-Wno-unknown-pragmas` nascondeva l'avviso. Entrambe le
+cose sono state corrette: `-fopenmp` è obbligatorio e l'avviso deve restare visibile.
+
+Misure comparate sullo stesso turno, 77 token di prompt e 24 generati:
+
+| Configurazione | `t_attn` | `t_moe` | `t_head` | disco | totale fasi |
+|---|---|---|---|---|---|
+| Base, un core | 134,20 s | 983,70 s | 71,29 s | 565,73 s | ~1.189 s |
+| OpenMP | 30,98 s | 649,91 s | 19,93 s | 534,69 s | ~701 s |
+| OpenMP + PILOT | 30,64 s | 730,05 s | 19,30 s | 614,21 s | ~780 s |
+
+Conclusioni: OpenMP vale circa 1,7× e il MoE al netto del disco scende da circa 418 s a
+circa 115 s. Il PILOT così concepito **peggiora di circa l'11%**, perché scalda la cache
+del sistema operativo che qui non ha spazio: le pagine vengono espulse e il disco viene
+letto due volte. Per questo il prefetch resta opzionale e disattivato per default.
+
+Riprogettazione necessaria del prefetch: inserire l'expert direttamente nella cache LRU
+con sincronizzazione, eliminando la seconda lettura, e misurare quanti expert previsti
+vengono realmente usati, dato che il routing del layer successivo è stimato dallo stato
+nascosto del layer corrente ed è quindi approssimato.
+
 ---
 
 ## 1. Analisi dell'architettura GPT-OSS-120B
