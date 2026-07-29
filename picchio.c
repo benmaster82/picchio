@@ -2584,8 +2584,8 @@ static int service_loop(Model *m, int cap) {
  * ═══════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
-    fprintf(stderr, "🪶 picchio v0.2.0 — GPT-OSS-120B MoE streaming engine\n");
-    fprintf(stderr, "   117B params · top-4 · GQA · INT4 · streaming CPU\n\n");
+    fprintf(stderr, "🪶 picchio v0.5.0 — GPT-OSS MoE streaming engine\n");
+    fprintf(stderr, "   GQA · INT4 · streaming CPU (architettura letta da config.json)\n\n");
 
     /* ── Self-test mode ── */
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
@@ -2612,7 +2612,11 @@ int main(int argc, char **argv) {
       g_trace_numeric = trace && atoi(trace) != 0; }
 
     fprintf(stderr, "modello:    %s\n", model_path);
-    fprintf(stderr, "max token:  %d\n\n", max_tokens);
+    { const char *svc = getenv("SERVICE");
+      if (svc && atoi(svc))
+          fprintf(stderr, "modalità:   servizio (il limite di token arriva con ogni TURN)\n\n");
+      else
+          fprintf(stderr, "max token:  %d\n\n", max_tokens); }
 
     /* ── 1. Carica configurazione ── */
     static Model m;
