@@ -851,10 +851,14 @@ static void moe_forward(float *out, const float *x, Model *m,
             for (int i = 0; i < I; i++) gu[i] += es->gu_bias[i];
         }
 
-        /* SwiGLU: SiLU(gate) * up — le due metà sono [0..half) e [half..I) */
+        /* SwiGLU: clamp(SiLU(gate), -limit, limit) * up */
         int half = I / 2;  /* = intermediate_size */
-        for (int i = 0; i < half; i++)
-            gu[i] = siluf(gu[i]) * gu[i + half];
+        for (int i = 0; i < half; i++) {
+            float g = siluf(gu[i]);
+            if (g > 7.0f) g = 7.0f;
+            if (g < -7.0f) g = -7.0f;
+            gu[i] = g * gu[i + half];
+        }
 
         /* down_proj: [D, half] × gu[:half] */
         matmul_qt(expert_out, gu, &es->d, 1);
@@ -1991,6 +1995,19 @@ int main(int argc, char **argv) {
     int n_prompt = 0;
 
     if (has_tokenizer) {
+        /* Se RAW=1, forza modo token ID diretti */
+        const char *raw_env = getenv("RAW");
+        int raw_mode = (raw_env && atoi(raw_env));
+        
+        if (raw_mode) {
+            const char *p = prompt;
+            while (*p && n_prompt < 8192) {
+                while (*p == ' ' || *p == '\n') p++;
+                if (*p == '\0') break;
+                prompt_tokens[n_prompt++] = (int)strtol(p, (char **)&p, 10);
+            }
+            fprintf(stderr, "prompt (raw ID, %d token)\n", n_prompt);
+        } else {
         /* Sistema message */
         const char *sys_msg = "You are ChatGPT, a large language model trained by OpenAI.\n"
                               "Knowledge cutoff: 2024-06\n"
@@ -2018,6 +2035,7 @@ int main(int argc, char **argv) {
         n_prompt += tok_encode(&tok, "assistant", prompt_tokens + n_prompt, 16);
 
         fprintf(stderr, "prompt: \"%s\" → %d token (harmony format)\n", prompt, n_prompt);
+        } /* end else (harmony mode) */
     } else {
         /* Modo raw: interpreta come token ID separati da spazi */
         const char *p = prompt;
