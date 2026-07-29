@@ -288,7 +288,17 @@ modello su NVMe interno e un prefetch che popoli direttamente la cache LRU.
 
 **Lezione di metodo.** Due dei guadagni maggiori non sono venuti da nuovo codice ma da
 flag di compilazione mancanti, `-fopenmp` e `-mavx2 -mfma`, con gli avvisi silenziati.
-Prima di ottimizzare, verificare che il codice esistente sia realmente compilato. Con 768 expert totali, circa 9,5 GB, la residenza
+Prima di ottimizzare, verificare che il codice esistente sia realmente compilato.
+
+**Campionamento e uso conversazionale.** La decodifica greedy, usata per il determinismo
+delle validazioni, può entrare in cicli: su una domanda aperta il 20B ha consumato 200
+token nel canale `analysis` senza raggiungere `final`. Con `--temperature 0.7` la stessa
+domanda ha prodotto una risposta corretta. `chat.py` espone quindi `--temperature`,
+`--top-p`, `--top-k` e `--seed`, mantenendo il default greedy per non alterare i test.
+
+Conversazione reale a due turni sul 20B: il secondo turno ha riusato 279 posizioni su
+294, cioè il 95%, elaborandone solo 15, e la risposta era corretta. La cache hit sale con
+l'uso grazie all'hot-store, dal 67,1% al 79,2% nella stessa sessione. Con 768 expert totali, circa 9,5 GB, la residenza
 completa è raggiungibile con più RAM, condizione in cui il disco esce dal percorso
 critico. La risposta del 20B termina con `RETURN`, quindi il ciclo Harmony completo,
 terminatore incluso, è verificato sul modello reale.

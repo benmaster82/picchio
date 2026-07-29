@@ -26,7 +26,7 @@ KEEP_ANALYSIS = RenderConversationConfig(auto_drop_analysis=False)
 class PicchioSession:
     """Processo Picchio persistente in modalità SERVICE."""
 
-    def __init__(self, exe, model, ctx, pin_gb, threads, model_aux):
+    def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None):
         env = os.environ.copy()
         for name in ("INPUT", "PROMPT", "INPUT_FILE", "OUTPUT", "MODEL_AUX",
                      "TRACE_NUMERIC", "ORACLE_DIR"):
@@ -34,6 +34,8 @@ class PicchioSession:
         env.update({"SERVICE": "1", "TEMPERATURE": "0", "REP": "1",
                     "CTX": str(ctx), "PIN_GB": str(pin_gb),
                     "OMP_NUM_THREADS": str(threads)})
+        if sampling:
+            env.update({k: str(v) for k, v in sampling.items() if v is not None})
         if model_aux:
             env["MODEL_AUX"] = model_aux
         self.proc = subprocess.Popen(
@@ -165,6 +167,11 @@ def main():
     parser.add_argument("--pin-gb", type=int, default=1)
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--model-aux")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="0 = greedy deterministico; valori ~0.7-1.0 evitano i cicli")
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--show-analysis", action="store_true",
                         help="mostra il canale analysis invece di final")
     parser.add_argument("--dry-run", action="store_true",
@@ -190,8 +197,10 @@ def main():
     if not model.is_dir():
         parser.error(f"modello non trovato: {model}")
 
+    sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p,
+                "TOPK": args.top_k, "SEED": args.seed}
     session = PicchioSession(exe, model, args.ctx, args.pin_gb, args.threads,
-                             resolve_aux(model, args.model_aux))
+                             resolve_aux(model, args.model_aux), sampling)
     chat = HarmonyChat(session, args.reasoning, args.date)
     channel = "analysis" if args.show_analysis else "final"
     single = args.prompt is not None

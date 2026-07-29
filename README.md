@@ -109,8 +109,13 @@ python chat.py "Scrivi un saluto breve in italiano" --max-tokens 64
 Chat multi-turn nello stesso processo, con modello e KV-cache mantenuti in memoria:
 
 ```powershell
-python chat.py --ctx 1024 --max-tokens 64
+python chat.py --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
 ```
+
+Usare `--temperature 0.7` per l'uso conversazionale: in modalità greedy (`0`, il default,
+utile per i confronti riproducibili) il modello può ciclare nel canale `analysis` senza
+emettere la risposta finale. Altre opzioni: `--top-p`, `--top-k`, `--seed`,
+`--show-analysis`, `--json`.
 
 Tra turni viene riusato il prefisso comune della KV-cache (tipicamente circa l'88%),
 perché il re-render Harmony scarta l'analysis e trasforma `<|return|>` in `<|end|>`.
