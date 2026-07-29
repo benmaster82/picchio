@@ -233,6 +233,38 @@ letture. Il percorso sequenziale resta attivo con dump oracle, tracing o repetit
 penalty, così le suite di validazione non sono influenzate. `test_prefill_batch.py`
 verifica che le due strade producano token identici.
 
+### 0.10 Precisione di embedding e lm_head
+
+Il container iniziale quantizzava `embed_tokens` e `lm_head` a INT4 gs64, mentre la
+configurazione ufficiale GPT-OSS li esclude esplicitamente dalla quantizzazione insieme a
+`self_attn` e `router` (`modules_to_not_convert`). Con generazioni brevi il difetto resta
+invisibile; su testi lunghi la risposta collassava in un misto di lingue e ripetizioni.
+
+Misure su un campione di 16.384 righe dei pesi originali:
+
+| Tensore | INT4 gs64 | INT8 per riga |
+|---|---|---|
+| `lm_head` | 11,04% di errore relativo | 0,99% |
+| `embed_tokens` | 15,67% | 3,35% |
+
+Con `lm_head` a INT4 l'argmax coincide solo nel 76,6% dei casi e il rumore sui logit è
+l'8,7% della loro deviazione standard: il token più probabile cambia in circa un caso su
+quattro. A INT8 l'argmax coincide al 100% e il rumore scende allo 0,77%.
+
+Correzione adottata: INT8 con scala per riga per entrambi i tensori, verificata da
+`check_head_quality.py`. Costa circa 0,5 GB di parte densa, da 3,20 a 3,71 GB, contro i
+circa 4,6 GB che servirebbero mantenendoli in F32. Il loader riconosce i tensori `I8` con
+le relative scale; i kernel INT8 erano già presenti.
+
+Conferma sperimentale: la richiesta che prima degenerava produce ora un elenco corretto e
+ben formattato in italiano con `--temperature 0.7`, e il ragionamento interno scende da 94
+a 14 token. Il difetto non era nel campionamento né nel runtime, che nel frattempo era
+stato verificato con oracle fino a 300 posizioni.
+
+**Regola.** Rispettare la lista di esclusione della quantizzazione del modello. La testa
+di uscita proietta su 201.088 voci: comprimerla a 4 bit sposta la distribuzione dei token
+molto più di quanto suggerisca l'errore medio sui pesi.
+
 ### 0.9 GPT-OSS-20B
 
 Stesso codice, nessuna modifica: dimensioni, layer, expert e pattern di attention sono

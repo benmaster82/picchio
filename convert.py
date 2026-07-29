@@ -103,6 +103,29 @@ FP4_LUT = np.array([
 ], dtype=np.float32)
 
 
+def quantize_int8(tensor: np.ndarray) -> tuple:
+    """INT8 simmetrico con scala per riga.
+
+    Usato per embedding e lm_head, che la configurazione ufficiale GPT-OSS esclude
+    dalla quantizzazione MXFP4 (`modules_to_not_convert`). A INT4 il rumore finisce
+    direttamente sui logit di un vocabolario da 201k voci; INT8 costa il doppio in
+    spazio ma riduce l'errore di circa 16 volte.
+    """
+    rows, cols = tensor.shape
+    q = np.empty((rows, cols), dtype=np.int8)
+    scales = np.empty(rows, dtype=np.float32)
+    # A blocchi: su [201088, 2880] una copia intera costerebbe oltre 2 GB.
+    block = max(1, 8_000_000 // max(cols, 1))
+    for start in range(0, rows, block):
+        end = min(start + block, rows)
+        chunk = tensor[start:end].astype(np.float32, copy=False)
+        amax = np.abs(chunk).max(axis=1)
+        s = np.where(amax > 0, amax / 127.0, 1.0).astype(np.float32)
+        q[start:end] = np.clip(np.rint(chunk / s[:, None]), -127, 127).astype(np.int8)
+        scales[start:end] = s
+    return q, scales
+
+
 def decode_e8m0(raw: np.ndarray) -> np.ndarray:
     """Decode E8M0 scale bytes to float32.
     E8M0: 8-bit exponent, no mantissa. value = 2^(raw - 127)
@@ -290,12 +313,14 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                         output_tensors[key] = t_f32
                         stats["dense_i4"] += t_f32.nbytes
                     else:
-                        # Embedding/lm_head: quantizza a INT4 gs64
+                        # Embedding/lm_head: INT8 per riga, non INT4.
+                        # Sono esclusi dalla quantizzazione ufficiale: a INT4 il
+                        # rumore sui logit degrada le generazioni lunghe.
                         t_2d = t_f32.reshape(-1, t_f32.shape[-1])
-                        packed, scales = quantize_int4(t_2d)
-                        output_tensors[key] = packed
+                        q8, scales = quantize_int8(t_2d)
+                        output_tensors[key] = q8
                         output_tensors[key + ".qs"] = scales
-                        stats["dense_i4"] += packed.nbytes + scales.nbytes
+                        stats["dense_i4"] += q8.nbytes + scales.nbytes
                 else:
                     output_tensors[key] = tensor_np.astype(np.float32)
                     stats["other"] += tensor_np.size * 4

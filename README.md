@@ -119,6 +119,11 @@ utile per i confronti riproducibili) il modello può ciclare nel canale `analysi
 emettere la risposta finale. Altre opzioni: `--top-p`, `--top-k`, `--seed`,
 `--show-analysis`, `--json`.
 
+Importante: la conversione mantiene `embed_tokens` e `lm_head` a **INT8**, non INT4, come
+richiede la lista di esclusione ufficiale del modello. A INT4 la testa di uscita ha un
+errore dell'11% e cambia il token più probabile in un caso su quattro, con generazioni
+lunghe che degenerano. I container prodotti prima di questa correzione vanno riconvertiti.
+
 Tra turni viene riusato il prefisso comune della KV-cache (tipicamente circa l'88%),
 perché il re-render Harmony scarta l'analysis e trasforma `<|return|>` in `<|end|>`.
 

@@ -2308,6 +2308,35 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
         return 0;
     }
 
+    if (t->dtype == ST_I8) {
+        /* INT8 per riga: usato per embedding e lm_head, che a INT4 degradano
+         * la distribuzione dei logit. */
+        int64_t n = (int64_t)O * I;
+        qt->fmt = 1;
+        qt->q8 = (int8_t *)malloc(n);
+        if (!qt->q8) return -1;
+        st_read_raw(db, t, qt->q8, n);
+
+        char sn[300];
+        snprintf(sn, sizeof(sn), "%s.qs", name);
+        StTensor *ts = st_find(db, sn);
+        if (!ts) {
+            fprintf(stderr, "  ⚠ scale INT8 mancanti: %s\n", sn);
+            free(qt->q8); qt->q8 = NULL;
+            return -1;
+        }
+        int64_t n_scale = st_numel(ts);
+        if (n_scale != O) {
+            fprintf(stderr, "  ⚠ %s: %lld scale per %d righe\n", sn,
+                    (long long)n_scale, O);
+            free(qt->q8); qt->q8 = NULL;
+            return -1;
+        }
+        qt->s = (float *)malloc((size_t)O * sizeof(float));
+        st_read_raw(db, ts, qt->s, (int64_t)O * (int64_t)sizeof(float));
+        return 0;
+    }
+
     /* F32/BF16/F16: carica */
     float *f = load_f32_tensor(db, name, (int64_t)O * I);
     if (!f) return -1;
