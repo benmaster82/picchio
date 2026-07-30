@@ -315,6 +315,24 @@ static double rss_gb(void) {
 #endif
 }
 
+/* RAM fisica totale in byte (0 se non determinabile). Usata per dimensionare il
+ * budget della cache expert quando PIN_GB non è specificato. */
+static int64_t physical_ram_bytes(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) return (int64_t)ms.ullTotalPhys;
+    return 0;
+#elif defined(__linux__)
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psize > 0) return (int64_t)pages * (int64_t)psize;
+    return 0;
+#else
+    return 0;  /* altre piattaforme: fallback al default fisso */
+#endif
+}
+
 /* ═══════════════════════════════════════════════════════════
  *  CONFIG LOADER (da config.json)
  * ═══════════════════════════════════════════════════════════ */
@@ -2857,12 +2875,35 @@ int main(int argc, char **argv) {
      * slot/layer e 91.2%, con RSS ~8.5 GB (largo margine sui 15.8 GB fisici). La
      * residenza piena del 20B (32 expert/layer) si raggiunge intorno a PIN_GB=9,
      * oltre il quale non c'è guadagno perché gli expert per layer sono solo 32.
-     * Default alzato a 8: la vecchia stima che PIN_GB basso saturasse la RAM era
-     * basata su una misura RSS rotta su Windows (vedi rss_gb). Con RSS ora reale,
-     * alzare PIN_GB finché resta margine è la leva più efficace su questo hardware. */
+     * Il default è ora adattivo: senza PIN_GB si rileva la RAM fisica e si assegna
+     * agli expert tutto tranne una riserva per densa/KV/OS. Su 16 GB questo dà ~10 GB
+     * di budget (residenza piena del 20B); scala su macchine più grandi e si autolimita
+     * su quelle piccole. La vecchia stima che PIN_GB basso saturasse la RAM era basata
+     * su una misura RSS rotta su Windows (vedi rss_gb), ora corretta. */
     int pin_gb_env = 0;
     { const char *v = getenv("PIN_GB"); if (v) pin_gb_env = atoi(v); }
-    int64_t avail_bytes = (pin_gb_env > 0 ? (int64_t)pin_gb_env : 8LL) * 1024*1024*1024;
+    int64_t GB = 1024LL * 1024 * 1024;
+    int64_t avail_bytes;
+    if (pin_gb_env > 0) {
+        avail_bytes = (int64_t)pin_gb_env * GB;   /* override esplicito */
+        fprintf(stderr, "  PIN_GB=%d (esplicito)\n", pin_gb_env);
+    } else {
+        int64_t phys = physical_ram_bytes();
+        if (phys > 0) {
+            /* Riserva per densa (~3–4,5 GB) + KV + overhead OS. Il resto va agli
+             * expert. La cache si autolimita comunque a n_experts×n_layers. */
+            int64_t reserve = 6LL * GB;
+            avail_bytes = phys - reserve;
+            if (avail_bytes < 2 * GB) avail_bytes = 2 * GB;  /* floor RAM scarsa */
+            fprintf(stderr, "  RAM fisica %.1f GB → budget expert %.1f GB "
+                    "(riserva %.0f GB per densa/KV/OS; override con PIN_GB)\n",
+                    (double)phys / 1e9, (double)avail_bytes / 1e9,
+                    (double)reserve / 1e9);
+        } else {
+            avail_bytes = 8LL * GB;  /* RAM non rilevabile: default fisso */
+            fprintf(stderr, "  RAM non rilevabile → budget expert 8 GB\n");
+        }
+    }
     int64_t expert_bytes = (int64_t)c->moe_inter * ((c->hidden + 1) / 2)  /* gate_up */
                          + (int64_t)c->hidden * ((c->hidden + 1) / 2)     /* down */
                          + (int64_t)(c->moe_inter + c->hidden) * 4;       /* scales+bias */
@@ -2872,6 +2913,7 @@ int main(int argc, char **argv) {
     if (m.ecap > 128) m.ecap = 128;
     { const char *v = getenv("ECAP");   /* override manuale per tuning/test */
       if (v) { int e = atoi(v); if (e > 0) m.ecap = e > 128 ? 128 : e; } }
+    if (m.ecap > c->n_experts) m.ecap = c->n_experts;  /* mai più slot che expert */
     if (m.ecap < c->topk) m.ecap = c->topk;  /* cache_load_batch richiede ecap>=topk */
     fprintf(stderr, "  expert cache: %d slot/layer × %d layer (%d expert totali, ~%.1f GB)\n",
             m.ecap, c->n_layers, m.ecap * c->n_layers,

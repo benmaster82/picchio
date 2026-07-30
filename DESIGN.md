@@ -409,9 +409,13 @@ expert per layer sono solo 32. Il pavimento a 634 read è il costo incomprimibil
 cold-load di ogni expert instradato una volta; si ammortizza solo mantenendo il processo
 vivo (modalità SERVICE multi-turn), dove i turni successivi vanno verso il 100% di hit.
 
-Correzioni adottate: default `PIN_GB` alzato da 6 a **8** (28 slot/layer, RSS ~8,5 GB,
-margine largo su 16 GB); per il 20B su ≥16 GB si consiglia `PIN_GB=9` (residenza piena).
-La RSS reale va usata per spingere `PIN_GB` finché resta ~2 GB di margine.
+Correzioni adottate: il default di `PIN_GB` è ora **adattivo alla RAM fisica**
+(`GlobalMemoryStatusEx` su Windows, `sysconf` su Linux). Senza override si assegna agli
+expert tutta la RAM tranne una riserva di 6 GB per densa/KV/OS; la cache si autolimita a
+`n_experts` slot per layer (mai più slot che expert). Su questa macchina (15,83 GiB) il
+budget risulta ~10,6 GB → 32 slot/layer, cioè **residenza piena del 20B automaticamente**,
+con RSS ~6,6 GB. Scala su macchine più grandi e si abbassa da solo su quelle piccole;
+`PIN_GB` esplicito resta rispettato per il tuning.
 
 **Scaling.** Lo streaming esiste perché il modello non entra in RAM; è quindi il *caso
 difficile*, non un limite dell'architettura. Su hardware migliore ogni asse migliora in

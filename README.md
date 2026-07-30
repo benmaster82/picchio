@@ -78,10 +78,11 @@ occupare spazio inutilmente.
 
 - Parte densa residente misurata: ~4,46 GB
 - KV-cache iniziale configurabile con `CTX` (default 512 posizioni)
-- Cache expert configurabile con `PIN_GB` (default 8 GB). Più cache = più hit = meno
-  I/O, il collo di bottiglia reale. Sweep sul 20B: da `PIN_GB=4` a `9` i miss calano del
-  53% e la RSS resta ~8 GB su 16 (vedi DESIGN §0.12). Per il 20B su ≥16 GB usare
-  `PIN_GB=9` (residenza piena dei 32 expert/layer). La RSS ora è misurata anche su Windows
+- Cache expert: `PIN_GB` ha default **adattivo alla RAM fisica** (assegna agli expert la
+  RAM meno una riserva di ~6 GB per densa/KV/OS). Più cache = più hit = meno I/O, il collo
+  di bottiglia reale. Su 16 GB il 20B raggiunge la residenza piena (32 expert/layer)
+  automaticamente. Sweep: da `PIN_GB=4` a pieno i miss calano del 53% (vedi DESIGN §0.12).
+  Un valore esplicito `PIN_GB=N` resta rispettato. La RSS è ora misurata anche su Windows
 - La build **deve** usare `-fopenmp` e `-mavx2 -mfma`: senza questi flag i kernel matmul
   restano su un solo core e in versione scalare
 - Prestazione misurata sul 20B (6 core, `PIN_GB=4`, modello su NVMe): ~0,6 s per token
