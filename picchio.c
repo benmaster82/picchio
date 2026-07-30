@@ -922,6 +922,88 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
     return victim;
 }
 
+/* Numero di thread per i read paralleli degli expert (1 = seriale). */
+static int g_io_threads = 1;
+
+/* Carica in batch gli expert `eids[0..n)` del layer, restituendo gli slot in
+ * `out`. Gli hit vengono risolti e "toccati" (LRU) per primi, così i victim
+ * scelti per i miss non possono sfrattare né un hit né un miss già riservato;
+ * i miss vengono poi letti da disco in parallelo (queue depth > 1). La
+ * matematica non cambia: si leggono gli stessi byte negli stessi slot, solo in
+ * ordine concorrente. Contratto: n <= ecap (garantito da chi chiama). */
+static void cache_load_batch(Model *m, int layer, const int *eids, int n,
+                             ESlot **out) {
+    ESlot *pool = m->ecache[layer];
+    int miss_i[128];
+    int nmiss = 0;
+
+    /* Pass 1: risolvi gli hit (pinned o LRU) e marcali come appena usati. */
+    for (int i = 0; i < n; i++) {
+        ESlot *found = NULL;
+        for (int j = 0; j < m->npin[layer]; j++)
+            if (m->pin[layer][j].eid == eids[i]) { found = &m->pin[layer][j]; break; }
+        if (!found)
+            for (int j = 0; j < m->ecn[layer]; j++)
+                if (pool[j].eid == eids[i]) { found = &pool[j]; break; }
+        if (found) {
+            found->last_used = ++m->eclock;
+            m->hits++;
+            out[i] = found;
+        } else {
+            out[i] = NULL;
+            if (nmiss < 128) miss_i[nmiss++] = i;
+        }
+    }
+
+    /* Pass 2: riserva un victim per ogni miss (seriale: nessuna race su LRU). */
+    for (int mi = 0; mi < nmiss; mi++) {
+        int i = miss_i[mi];
+        ESlot *victim = NULL;
+        if (m->ecn[layer] < m->ecap) {
+            victim = &pool[m->ecn[layer]++];
+        } else {
+            uint64_t oldest = UINT64_MAX;
+            for (int j = 0; j < m->ecn[layer]; j++)
+                if (pool[j].last_used < oldest) { oldest = pool[j].last_used; victim = &pool[j]; }
+        }
+        if (victim->eid >= 0) {
+            free(victim->gu.qf); victim->gu.qf = NULL;
+            free(victim->gu.q4); victim->gu.q4 = NULL;
+            free(victim->gu.s);  victim->gu.s = NULL;
+            free(victim->d.qf);  victim->d.qf = NULL;
+            free(victim->d.q4);  victim->d.q4 = NULL;
+            free(victim->d.s);   victim->d.s = NULL;
+            free(victim->gu_bias); victim->gu_bias = NULL;
+            free(victim->d_bias);  victim->d_bias = NULL;
+            free(victim->slab);    victim->slab = NULL;
+            free(victim->fslab);   victim->fslab = NULL;
+        }
+        victim->eid = eids[i];   /* riservato: verrà popolato in pass 3 */
+        victim->layer = layer;
+        victim->last_used = ++m->eclock;
+        m->miss++;
+        m->ereq++;
+        out[i] = victim;
+    }
+
+    /* Pass 3: leggi i miss da disco, in parallelo se abilitato. Gli slot sono
+     * distinti, expert_load scrive solo nel proprio slot e legge g_db in sola
+     * lettura → nessuna sincronizzazione necessaria oltre agli handle per-thread
+     * di st.h. */
+    if (nmiss > 0) {
+        double t0 = now_s();
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(g_io_threads) \
+                if(g_io_threads > 1 && nmiss > 1)
+#endif
+        for (int mi = 0; mi < nmiss; mi++) {
+            int i = miss_i[mi];
+            expert_load(m, layer, eids[i], out[i]);
+        }
+        m->t_edisk += now_s() - t0;
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════
  *  PILOT PREFETCH (thread separato per pre-caricamento expert)
  *
@@ -1272,12 +1354,17 @@ static void moe_forward(float *out, const float *x, Model *m,
             m->eheat[layer][sel[k]]++;
     }
 
-    /* 5. Carica e computa ogni expert */
+    /* 5. Carica e computa ogni expert.
+     * I K expert selezionati (unici, K <= ecap) vengono precaricati in un solo
+     * batch: i miss sono letti da disco in parallelo prima del calcolo. */
     float *expert_out = calloc(D, sizeof(float));
     memset(out, 0, D * sizeof(float));
 
+    ESlot *slots[64];
+    cache_load_batch(m, layer, sel, K, slots);
+
     for (int k = 0; k < K; k++) {
-        ESlot *es = cache_lookup(m, layer, sel[k]);
+        ESlot *es = slots[k];
         if (es->eid < 0) continue;  /* errore di caricamento */
 
         int I = c->moe_inter;  /* 5760 = gate_up fused */
@@ -1746,19 +1833,29 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
         }
 
         /* Un expert unico → una sola lettura, riusata da tutte le posizioni.
-         * Il buffer va azzerato: expert_apply accumula. */
+         * Il buffer va azzerato: expert_apply accumula. Gli expert unici del
+         * batch superano spesso la capacità della cache, quindi si procede a
+         * blocchi di al più `ecap`: ogni blocco viene letto da disco in
+         * parallelo (queue depth > 1) e poi applicato a tutte le posizioni. */
         float *moe = (float *)calloc((size_t)n * D, sizeof(float));
         if (!moe) { fprintf(stderr, "errore: memoria MoE\n"); exit(1); }
-        for (int u = 0; u < n_uniq; u++) {
-            ESlot *es = cache_lookup(m, l, uniq[u]);
-            if (es->eid < 0) continue;
-            for (int p = 0; p < n; p++) {
-                int *sel = sel_all + (size_t)p * K;
-                float *wgt = w_all + (size_t)p * K;
-                for (int k = 0; k < K; k++) {
-                    if (sel[k] != uniq[u]) continue;
-                    expert_apply(es, XN + (int64_t)p * D, moe + (int64_t)p * D,
-                                 wgt[k] * c->routed_scale, c);
+        int chunk = m->ecap < 128 ? m->ecap : 128;
+        ESlot *slots[128];
+        for (int base = 0; base < n_uniq; base += chunk) {
+            int cnt = n_uniq - base < chunk ? n_uniq - base : chunk;
+            cache_load_batch(m, l, uniq + base, cnt, slots);
+            for (int u = 0; u < cnt; u++) {
+                ESlot *es = slots[u];
+                if (es->eid < 0) continue;
+                int eid = uniq[base + u];
+                for (int p = 0; p < n; p++) {
+                    int *sel = sel_all + (size_t)p * K;
+                    float *wgt = w_all + (size_t)p * K;
+                    for (int k = 0; k < K; k++) {
+                        if (sel[k] != eid) continue;
+                        expert_apply(es, XN + (int64_t)p * D, moe + (int64_t)p * D,
+                                     wgt[k] * c->routed_scale, c);
+                    }
                 }
             }
         }
@@ -2763,6 +2860,9 @@ int main(int argc, char **argv) {
     m.ecap = total_slots / c->n_layers;
     if (m.ecap < 4) m.ecap = 4;
     if (m.ecap > 128) m.ecap = 128;
+    { const char *v = getenv("ECAP");   /* override manuale per tuning/test */
+      if (v) { int e = atoi(v); if (e > 0) m.ecap = e > 128 ? 128 : e; } }
+    if (m.ecap < c->topk) m.ecap = c->topk;  /* cache_load_batch richiede ecap>=topk */
     fprintf(stderr, "  expert cache: %d slot/layer × %d layer (%d expert totali, ~%.1f GB)\n",
             m.ecap, c->n_layers, m.ecap * c->n_layers,
             (double)m.ecap * c->n_layers * expert_bytes / 1e9);
@@ -2819,6 +2919,18 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "sampling: temp=%.2f top_p=%.2f top_k=%d rep=%.2f\n",
             g_temperature, g_top_p, g_top_k, g_rep_penalty);
+
+    /* Read paralleli degli expert (queue depth > 1). IO_THREADS controlla il
+     * numero di thread; PIPE=0 forza il percorso seriale per compatibilità. */
+    {
+        const char *v = getenv("IO_THREADS");
+        g_io_threads = v ? atoi(v) : 4;
+        const char *pipe = getenv("PIPE");
+        if (pipe && atoi(pipe) == 0) g_io_threads = 1;
+        if (g_io_threads < 1) g_io_threads = 1;
+        fprintf(stderr, "I/O expert: %d thread (%s)\n", g_io_threads,
+                g_io_threads > 1 ? "read paralleli" : "seriale");
+    }
 
     /* PILOT prefetch */
     {

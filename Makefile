@@ -51,7 +51,9 @@ info:
 	@echo "  PIN_GB    GB di RAM per hot-store expert (default: auto)"
 	@echo "  DIRECT    1=O_DIRECT per expert (default: 0)"
 	@echo "  PILOT     1=prefetch pilotato dal router (default: 0)"
-	@echo "  PIPE      1=I/O asincrono pool thread (default: 1)"
+	@echo "  IO_THREADS thread per i read paralleli degli expert (default: 4)"
+	@echo "  PIPE      0=forza read seriali (compat), altrimenti usa IO_THREADS"
+	@echo "  ECAP      override slot cache per layer (default: auto da PIN_GB)"
 
 # ── Clean ──
 

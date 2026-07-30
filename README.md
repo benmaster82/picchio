@@ -170,6 +170,10 @@ test_forward.py  — oracle Python per validazione
 - [ ] Tokenizer o200k_harmony nativo C token-exact (`tok.h` resta approssimato)
 - [ ] Prestazioni: prefill e I/O expert sono il collo di bottiglia (~0,09 token/s)
 - [x] Kernel matmul realmente paralleli (OpenMP abilitato): ~1,7× sul turno completo
+- [x] Read expert paralleli (queue depth > 1) su decode e prefill: slot LRU
+      riservati in modo seriale, poi letti in parallelo. Token-exact vs seriale
+      sulle suite tiny F32/INT4, anche sotto eviction. Controllo con `IO_THREADS`
+      (default 4, `PIPE=0` forza seriale); `ECAP` regola gli slot per layer
 - [ ] PILOT prefetch utile: va riscritto per popolare direttamente la cache LRU
 - [ ] Server API OpenAI-compatible
 

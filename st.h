@@ -115,6 +115,33 @@ typedef struct {
     int n_tensors;
 } StDB;
 
+/* ── Handle per-thread (TLS) per read paralleli sicuri ──
+ *
+ * Su Windows `st_read_raw` usa un handle sincrono con OVERLAPPED: due ReadFile
+ * concorrenti sullo stesso handle non sono sicure. Ogni thread apre quindi il
+ * proprio handle in modo lazy (FILE_FLAG_RANDOM_ACCESS, adatto ai read sparsi
+ * degli expert). Il thread principale registra in st_open_file l'handle
+ * SEQUENTIAL_SCAN già aperto, così il caricamento denso iniziale resta invariato.
+ * Su POSIX i read usano pread su fd condiviso, già thread-safe: nessun TLS. */
+#ifdef _WIN32
+static __thread HANDLE st_tls_h[ST_MAX_FILES];
+static __thread int    st_tls_ready = 0;
+
+static HANDLE st_win_handle(StFile *sf, int file_idx) {
+    if (!st_tls_ready) {
+        for (int i = 0; i < ST_MAX_FILES; i++) st_tls_h[i] = NULL;
+        st_tls_ready = 1;
+    }
+    if (!st_tls_h[file_idx]) {
+        HANDLE h = CreateFileA(sf->path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+        st_tls_h[file_idx] = (h == INVALID_HANDLE_VALUE) ? sf->hFile : h;
+    }
+    return st_tls_h[file_idx];
+}
+#endif
+
 /* ── Inizializzazione ── */
 
 static void st_init(StDB *db) {
@@ -309,6 +336,15 @@ static int st_open_file(StDB *db, const char *path) {
     int nt = st_parse_header(db, header, (int64_t)header_len, idx);
     free(header);
 
+#ifdef _WIN32
+    /* Registra l'handle sequenziale come handle TLS del thread principale. */
+    if (!st_tls_ready) {
+        for (int i = 0; i < ST_MAX_FILES; i++) st_tls_h[i] = NULL;
+        st_tls_ready = 1;
+    }
+    st_tls_h[idx] = sf->hFile;
+#endif
+
     db->n_files++;
     fprintf(stderr, "  st: %s — %d tensori, %.1f GB\n",
             path, nt, sf->file_size / 1e9);
@@ -346,7 +382,7 @@ static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) 
     ov.Offset = (DWORD)(abs_offset & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD)(abs_offset >> 32);
     DWORD rd;
-    ReadFile(sf->hFile, dst, (DWORD)nbytes, &rd, &ov);
+    ReadFile(st_win_handle(sf, t->file_idx), dst, (DWORD)nbytes, &rd, &ov);
     return (int64_t)rd;
 #else
     return pread(sf->fd, dst, nbytes, abs_offset);
@@ -366,7 +402,7 @@ static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
     ov.Offset = (DWORD)(abs_offset & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD)(abs_offset >> 32);
     DWORD rd = 0;
-    if (!ReadFile(sf->hFile, dst, (DWORD)nbytes, &rd, &ov)) return -1;
+    if (!ReadFile(st_win_handle(sf, t->file_idx), dst, (DWORD)nbytes, &rd, &ov)) return -1;
     return (int64_t)rd;
 #else
     return pread(sf->fd, dst, nbytes, abs_offset);
