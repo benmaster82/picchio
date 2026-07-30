@@ -90,7 +90,7 @@ class PicchioSession:
 class HarmonyChat:
     """Conversazione Harmony con riuso del prefisso già consumato dal modello."""
 
-    def __init__(self, session, reasoning, current_date):
+    def __init__(self, session, reasoning, current_date, no_reasoning=False):
         self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
         self.session = session
         system = (SystemContent.new()
@@ -98,6 +98,14 @@ class HarmonyChat:
                   .with_conversation_start_date(current_date))
         self.messages = [Message.from_role_and_content(Role.SYSTEM, system)]
         self.committed = []
+        # Modalità senza ragionamento: si pre-impegna il canale `final`, così il
+        # turno dell'assistant non può emettere un messaggio `analysis`. Il modello
+        # consuma questi token (non li rigenera), quindi vanno pre-alimentati al
+        # parser e inclusi nel parsing/committed.
+        self.no_reasoning = no_reasoning
+        self.final_prefill = (
+            self.encoding.encode("<|channel|>final<|message|>", allowed_special="all")
+            if no_reasoning else [])
         if session is not None and set(session.stop_ids) - set(self.encoding.stop_tokens()):
             raise RuntimeError(f"stop token del runtime incoerenti: {session.stop_ids}")
 
@@ -116,11 +124,15 @@ class HarmonyChat:
             if a != b:
                 break
             keep += 1
-        delta = full[keep:]
+        delta = full[keep:] + self.final_prefill
         if not delta:
             raise RuntimeError("delta vuoto: nulla da elaborare")
 
         parser = StreamableParser(self.encoding, Role.ASSISTANT, strict=False)
+        # Pre-alimenta il canale `final` così il parser è già nel canale giusto
+        # quando arrivano i token generati (che iniziano dal contenuto).
+        for tok in self.final_prefill:
+            parser.process(tok)
 
         state = {"n": 0, "shown": False}
 
@@ -142,11 +154,11 @@ class HarmonyChat:
               file=sys.stderr)
         produced, reason, pos = self.session.turn(delta, max_new, keep, on_token)
         print()
-        self.committed = full + produced
+        self.committed = full + self.final_prefill + produced
 
         try:
             replies = self.encoding.parse_messages_from_completion_tokens(
-                produced, Role.ASSISTANT)
+                self.final_prefill + produced, Role.ASSISTANT)
         except Exception as exc:
             replies = parser.messages
             print(f"[risposta incompleta ({reason}): {exc}]", file=sys.stderr)
@@ -173,6 +185,9 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--ctx", type=int, default=512)
     parser.add_argument("--reasoning", choices=("low", "medium", "high"), default="medium")
+    parser.add_argument("--no-reasoning", action="store_true",
+                        help="salta il canale analysis: pre-impegna il canale final, "
+                             "il modello risponde senza ragionare (più veloce)")
     parser.add_argument("--date", default=date.today().isoformat())
     parser.add_argument("--pin-gb", type=int, default=1)
     parser.add_argument("--threads", type=int, default=6)
@@ -190,9 +205,9 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
-        chat = HarmonyChat(None, args.reasoning, args.date)
+        chat = HarmonyChat(None, args.reasoning, args.date, args.no_reasoning)
         text = args.prompt if args.prompt is not None else input("Tu: ")
-        ids = chat.render(text)
+        ids = chat.render(text) + chat.final_prefill
         rendered = chat.encoding.decode_utf8(ids)
         if chat.encoding.encode(rendered, allowed_special="all") != ids:
             raise SystemExit("round-trip Harmony degli ID fallito")
@@ -211,7 +226,7 @@ def main():
                 "TOPK": args.top_k, "SEED": args.seed}
     session = PicchioSession(exe, model, args.ctx, args.pin_gb, args.threads,
                              resolve_aux(model, args.model_aux), sampling)
-    chat = HarmonyChat(session, args.reasoning, args.date)
+    chat = HarmonyChat(session, args.reasoning, args.date, args.no_reasoning)
     channel = "analysis" if args.show_analysis else "final"
     single = args.prompt is not None
 
