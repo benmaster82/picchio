@@ -26,6 +26,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>     /* GetProcessMemoryInfo per rss_gb */
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -303,8 +304,14 @@ static double rss_gb(void) {
 #else
     return r.ru_maxrss / (1024.0 * 1024.0);
 #endif
+#elif defined(_WIN32)
+    /* Working set corrente = RSS: pagine fisicamente residenti in RAM. */
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        return pmc.WorkingSetSize / (1024.0 * 1024.0 * 1024.0);
+    return 0.0;
 #else
-    return 0.0; /* Windows: TODO via GetProcessMemoryInfo */
+    return 0.0;
 #endif
 }
 

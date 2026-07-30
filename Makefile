@@ -5,6 +5,11 @@ CC      ?= gcc
 CFLAGS  := -O3 -march=native -fopenmp -Wall -Wextra -Wpedantic
 LDFLAGS := -lm -lpthread -fopenmp
 
+# Windows (MinGW): rss_gb usa GetProcessMemoryInfo → serve psapi
+ifeq ($(OS),Windows_NT)
+LDFLAGS += -lpsapi
+endif
+
 # Sorgenti (nella root, non in c/)
 SRC     := picchio.c
 HEADERS := quant.h json.h st.h
