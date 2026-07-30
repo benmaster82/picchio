@@ -2850,16 +2850,19 @@ int main(int argc, char **argv) {
     if (initial_ctx > c->ctx_len) initial_ctx = c->ctx_len;
     kv_init(&m.kv, c->n_layers, c->n_kv_heads, c->head_dim, initial_ctx);
 
-    /* Cache expert per-layer — limita per stare in RAM.
-     * Ogni expert = ~12.4 MB. Con 16 GB RAM:
-     * - Densa: 1.1 GB
-     * - KV-cache: ~40 MB (512 pos)
-     * - OS/overhead: ~2 GB
-     * - Disponibile per expert: ~12 GB → ~960 slot totali → ~26 per layer
-     */
+    /* Cache expert per-layer — budget di RAM per gli expert (ogni expert ~12.4 MB).
+     * Più cache = più hit = meno byte da disco, che è il collo di bottiglia reale.
+     * Sweep misurato sul 20B (16 GB RAM, RSS reale ora disponibile): il default
+     * storico di 6 GB dava 21 slot/layer e 88.9% di hit; a 8 GB si arriva a 28
+     * slot/layer e 91.2%, con RSS ~8.5 GB (largo margine sui 15.8 GB fisici). La
+     * residenza piena del 20B (32 expert/layer) si raggiunge intorno a PIN_GB=9,
+     * oltre il quale non c'è guadagno perché gli expert per layer sono solo 32.
+     * Default alzato a 8: la vecchia stima che PIN_GB basso saturasse la RAM era
+     * basata su una misura RSS rotta su Windows (vedi rss_gb). Con RSS ora reale,
+     * alzare PIN_GB finché resta margine è la leva più efficace su questo hardware. */
     int pin_gb_env = 0;
     { const char *v = getenv("PIN_GB"); if (v) pin_gb_env = atoi(v); }
-    int64_t avail_bytes = (pin_gb_env > 0 ? (int64_t)pin_gb_env : 6LL) * 1024*1024*1024;
+    int64_t avail_bytes = (pin_gb_env > 0 ? (int64_t)pin_gb_env : 8LL) * 1024*1024*1024;
     int64_t expert_bytes = (int64_t)c->moe_inter * ((c->hidden + 1) / 2)  /* gate_up */
                          + (int64_t)c->hidden * ((c->hidden + 1) / 2)     /* down */
                          + (int64_t)(c->moe_inter + c->hidden) * 4;       /* scales+bias */

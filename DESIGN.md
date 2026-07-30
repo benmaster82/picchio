@@ -351,6 +351,76 @@ completa è raggiungibile con più RAM, condizione in cui il disco esce dal perc
 critico. La risposta del 20B termina con `RETURN`, quindi il ciclo Harmony completo,
 terminatore incluso, è verificato sul modello reale.
 
+### 0.11 Read expert paralleli (queue depth > 1)
+
+Il caricamento degli expert da disco era interamente seriale: sia il decode
+(`moe_forward`) sia il prefill (`forward_prefill`) leggevano un expert alla volta,
+tenendo la coda del disco a profondità 1. Introdotto un percorso di lettura parallela:
+
+- `st.h` usa handle per-thread (TLS) su Windows, così più `ReadFile` concorrenti sono
+  sicuri; il thread principale conserva l'handle sequenziale per il caricamento denso.
+  Su POSIX `pread` su fd condiviso è già thread-safe.
+- `cache_load_batch` risolve prima gli hit (marcandoli come usati, così non vengono
+  sfrattati), riserva serialmente uno slot per ogni miss, poi legge i miss in parallelo
+  con OpenMP. Stessa matematica, stessi byte negli stessi slot: cambia solo l'ordine
+  concorrente delle letture. Controlli: `IO_THREADS` (default 4), `PIPE=0` forza il
+  seriale, `ECAP` override degli slot per layer.
+
+Validato token-exact sulle suite tiny F32/INT4 (anche sotto eviction con `ECAP=4`) e sul
+GPT-OSS-20B reale (stesso identico numero di read, 1355, in ogni configurazione).
+
+Benchmark warm-vs-warm, 3 coppie, prompt Harmony di 71 token, 6 generati, greedy:
+
+| Disco | Attesa disco seriale | Attesa disco parallela | t_moe seriale | t_moe parallela |
+|---|---|---|---|---|
+| SSD USB (JMicron) | ~54,7 s | ~49,3 s (−10%) | ~68,6 s | ~63,4 s |
+| NVMe (Kingston) | ~27,5 s | ~23,4 s (−15%) | ~41,7 s | ~38,2 s |
+
+Il parallelismo rende di più su NVMe (−15% vs −10%): il vero command queuing beneficia
+di QD>1, il bridge SATA-USB no. Il guadagno resta però limitato perché il workload è
+**bandwidth-bound**: ~1355 miss × ~13 MB ≈ 17,6 GB letti a ~320 MB/s (USB) o ~494 MB/s
+(NVMe), cioè al soffitto sequenziale dei rispettivi dischi. Ridurre i *byte* letti conta
+quindi più che parallelizzarli o coalescerli — vedi lo sweep di `PIN_GB` sotto.
+
+### 0.12 RSS reale su Windows e sweep di PIN_GB
+
+`rss_gb` restituiva 0 su Windows, la piattaforma primaria: la taratura di `PIN_GB` era
+cieca. Con `GetProcessMemoryInfo` (WorkingSetSize) la misura è ora reale, e ha rivelato
+che le stime storiche sovrastimavano di molto la residenza. In particolare l'affermazione
+in §0.8 secondo cui `PIN_GB=3` avrebbe causato paging era basata sulla misura rotta: sul
+20B la RSS resta ampiamente sotto i 15,83 GB fisici anche a cache molto più grandi.
+
+Sweep misurato sul 20B (D=2880, 24 layer, 32 expert/layer), stesso prompt greedy, la
+metrica pulita è il numero di miss (deterministico, indipendente dal page cache OS):
+
+| PIN_GB | slot/layer | RSS | hit % | disk reads |
+|---|---|---|---|---|
+| 4 (vecchio default) | 14 | 7,2 GB | 81,7% | 1355 |
+| 5 | 17 | 8,4 GB | 85,6% | 1065 |
+| 6 | 21 | 9,3 GB | 88,9% | 821 |
+| 7 | 25 | 9,2 GB | 90,7% | 684 |
+| 8 | 28 | 8,5 GB | 91,2% | 648 |
+| **9** | **32 (pieno)** | **7,7 GB** | **91,4%** | **634** |
+| 10–12 | 35–43 | ~7,5 GB | 91,4% | 634 |
+
+Da `PIN_GB=4` a `9` i miss crollano del 53% (1355→634). Il plateau è a `PIN_GB=9`, dove
+la cache tiene tutti i 32 expert/layer: oltre, gli slot in più restano vuoti perché gli
+expert per layer sono solo 32. Il pavimento a 634 read è il costo incomprimibile del
+cold-load di ogni expert instradato una volta; si ammortizza solo mantenendo il processo
+vivo (modalità SERVICE multi-turn), dove i turni successivi vanno verso il 100% di hit.
+
+Correzioni adottate: default `PIN_GB` alzato da 6 a **8** (28 slot/layer, RSS ~8,5 GB,
+margine largo su 16 GB); per il 20B su ≥16 GB si consiglia `PIN_GB=9` (residenza piena).
+La RSS reale va usata per spingere `PIN_GB` finché resta ~2 GB di margine.
+
+**Scaling.** Lo streaming esiste perché il modello non entra in RAM; è quindi il *caso
+difficile*, non un limite dell'architettura. Su hardware migliore ogni asse migliora in
+modo indipendente: più RAM alza l'hit (per il 120B, ~66 GB di expert, servono 64–128 GB
+per avvicinarsi al 95%+ stimato in §7.2); un NVMe Gen4/5 (5–7 GB/s vs ~320 MB/s dell'USB)
+abbatte i cold-load residui di 15–20×; più core scalano il calcolo; il tier GPU (§5) è
+previsto. Le dimensioni sono lette da `config.json`: 20B e 120B girano con lo stesso
+codice.
+
 ---
 
 ## 1. Analisi dell'architettura GPT-OSS-120B
