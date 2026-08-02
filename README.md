@@ -121,7 +121,14 @@ python chat.py --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --
 Usare `--temperature 0.7` per l'uso conversazionale: in modalità greedy (`0`, il default,
 utile per i confronti riproducibili) il modello può ciclare nel canale `analysis` senza
 emettere la risposta finale. Altre opzioni: `--top-p`, `--top-k`, `--seed`,
-`--show-analysis`, `--json`.
+`--show-analysis`, `--json`, `--no-reasoning` (salta il canale analysis, risposta diretta).
+
+`chat.py` imposta `REP=1`, quindi il **prefill batched** (batch-union degli expert, un
+expert letto una sola volta invece di una per token) è sempre attivo nel percorso chat.
+Con `PREFETCH=1` si abilita anche il pipeline a doppio buffer che sovrappone il caricamento
+del blocco successivo al calcolo del corrente: misurato −15% sul prefill del 20B con cache
+vincolata, su disco USB (vedi DESIGN §0.13). Il gate resta sul `picchio.exe` invocato a
+mano, dove il default `REP=1.1` forza il prefill sequenziale per coerenza con la penalty.
 
 Importante: la conversione mantiene `embed_tokens` e `lm_head` a **INT8**, non INT4, come
 richiede la lista di esclusione ufficiale del modello. A INT4 la testa di uscita ha un
