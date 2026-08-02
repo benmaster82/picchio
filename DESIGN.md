@@ -459,11 +459,35 @@ ostacolano (penalità), mentre su NVMe la coda reale la annulla (neutro/leggero 
 Il meccanismo è quindi corretto e sicuro, ma il suo valore sul decode è limitato dalle
 finestre di overlap corte, su entrambi i dischi.
 
-**Dove si sblocca il valore.** Il prefill elabora molte posizioni per layer → finestre di
-overlap grandi: è lì (il prefill del 120B è ~930 s, quasi tutto disco) che il prefetch
-può vincere anche su USB. Il percorso batched non è ancora agganciato al prefetch: è il
-prossimo passo. In alternativa, l'unica leva che aggira il muro della banda su qualsiasi
-disco resta **ridurre i byte letti** (cold-expert in formato più compresso).
+**Dove si sblocca il valore: il prefill.** Il prefill elabora molte posizioni per layer →
+finestre di overlap grandi. Inoltre l'insieme di expert del layer (`uniq[]`) è **noto
+prima** di caricarli: il prefetch è quindi ESATTO, senza predizione. `forward_prefill`
+usa ora un pipeline a doppio buffer: blocchi dimezzati (due in cache), e mentre si calcola
+il blocco corrente (matmul su n posizioni, disco idle) il blocco successivo viene caricato
+dal thread di prefetch (con parallelismo IO_THREADS interno). Token-exact vs prefetch
+spento sulle suite tiny (anche sotto eviction, blocchi multipli).
+
+Misura sul 20B, prompt di 108 token, `ECAP=8` (cache vincolata, proxy della pressione del
+120B), `REP=1`, **su disco USB**:
+
+| | t_moe (≈ prefill) | disk reads (main) |
+|---|---|---|
+| prefetch OFF | ~47,2 s | 1084 |
+| prefetch ON  | ~40,2 s (**−15%**) | ~535 |
+
+Guadagno consistente (entrambi i run ON sotto entrambi gli OFF) **anche su USB**, al
+contrario del decode: nel prefill la finestra di calcolo per blocco è grande abbastanza da
+nascondere il carico del blocco successivo. Il floor teorico è `max(disco, compute)`; il
+pipeline a un livello ne cattura una parte, con margine per approfondirlo.
+
+**Nota.** Il prefill batched (e quindi il pipeline) si attiva solo con `REP=1`: con la
+repetition penalty di default (1,1) il prefill ricade sul percorso sequenziale. La penalty
+non ha effetto sull'encoding di un prompt fisso, quindi abilitare il batched anche con
+penalty attiva è un'ottimizzazione futura. Sul 120B (128 expert, ecap piccolo → molti
+blocchi) questo pipeline è il candidato principale per abbattere il prefill da ~930 s.
+
+L'altra leva che aggira il muro della banda su qualsiasi disco resta **ridurre i byte
+letti** (cold-expert in formato più compresso).
 
 ---
 

@@ -1126,12 +1126,19 @@ static void pf_unlock(void)  { pthread_mutex_unlock(&g_pf.mutex); }
 static void pf_signal(void)  { pthread_cond_signal(&g_pf.cond); }
 #endif
 
-/* Corpo del worker: legge da disco ogni slot riservato e lo marca pronto. */
+/* Corpo del worker: legge da disco ogni slot riservato e lo marca pronto. Gli
+ * slot sono distinti ed expert_load è thread-safe (handle per-thread in st.h),
+ * quindi il caricamento di un blocco usa gli stessi IO_THREADS del percorso sync. */
 static void prefetch_run_job(void) {
     int n = g_pf.n, layer = g_pf.layer;
+    Model *m = g_pf.m;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(g_io_threads) \
+            if(g_io_threads > 1 && n > 1)
+#endif
     for (int i = 0; i < n; i++) {
         if (!g_pf.shutdown)
-            expert_load(g_pf.m, layer, g_pf.eids[i], g_pf.slots[i]);
+            expert_load(m, layer, g_pf.eids[i], g_pf.slots[i]);
         slot_set_loading(g_pf.slots[i], 0);  /* pronto (o abortito da shutdown) */
     }
 }
@@ -1867,15 +1874,37 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
         /* Un expert unico → una sola lettura, riusata da tutte le posizioni.
          * Il buffer va azzerato: expert_apply accumula. Gli expert unici del
          * batch superano spesso la capacità della cache, quindi si procede a
-         * blocchi di al più `ecap`: ogni blocco viene letto da disco in
-         * parallelo (queue depth > 1) e poi applicato a tutte le posizioni. */
+         * blocchi: ogni blocco viene letto da disco in parallelo (queue depth > 1)
+         * e poi applicato a tutte le posizioni.
+         *
+         * Con prefetch attivo (PREFETCH=1) i blocchi sono dimezzati (due entrano
+         * in cache) e si esegue un pipeline a doppio buffer: mentre si calcola il
+         * blocco corrente (matmul su n posizioni, disco idle), il blocco successivo
+         * — già noto in uniq[], quindi prefetch ESATTO senza predizione — viene
+         * caricato dal thread di prefetch. La matematica non cambia. */
         float *moe = (float *)calloc((size_t)n * D, sizeof(float));
         if (!moe) { fprintf(stderr, "errore: memoria MoE\n"); exit(1); }
         int chunk = m->ecap < 128 ? m->ecap : 128;
+        if (g_pilot_enabled) {
+            int half = m->ecap / 2;                 /* due blocchi in cache */
+            int cap  = m->ecap - c->topk;           /* invariante di prefetch_issue */
+            if (half < 1) half = 1;
+            if (cap >= 1 && half > cap) half = cap;
+            if (half >= 1) chunk = half;
+        }
         ESlot *slots[128];
         for (int base = 0; base < n_uniq; base += chunk) {
             int cnt = n_uniq - base < chunk ? n_uniq - base : chunk;
+            /* Rendi disponibile il blocco corrente: sincrono al primo giro,
+             * altrimenti servito (con attesa) dal prefetch del giro precedente. */
             cache_load_batch(m, l, uniq + base, cnt, slots);
+            /* Avvia il caricamento async del blocco successivo, che si sovrappone
+             * al calcolo di questo blocco. */
+            if (g_pilot_enabled && base + chunk < n_uniq) {
+                int nbase = base + chunk;
+                int ncnt = n_uniq - nbase < chunk ? n_uniq - nbase : chunk;
+                prefetch_issue(m, l, uniq + nbase, ncnt);
+            }
             for (int u = 0; u < cnt; u++) {
                 ESlot *es = slots[u];
                 if (es->eid < 0) continue;
