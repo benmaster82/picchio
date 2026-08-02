@@ -187,6 +187,13 @@ typedef struct {
     double t_head;        /* tempo totale lm_head */
 
     int64_t resident_bytes; /* byte della parte densa in RAM */
+
+    /* Probe accuratezza predizione prefetch (PREDICT_PROBE=1) */
+    int pred_next[64];    /* proxy A: predetto da hn pre-MoE del layer precedente */
+    int pred_next2[64];   /* proxy B: predetto da post-MoE norm del layer precedente */
+    int pred_layer;       /* layer a cui si riferiscono le predizioni (-1 = nessuna) */
+    uint64_t pred_hit, pred_total;    /* proxy A */
+    uint64_t pred_hit2;               /* proxy B (stesso pred_total) */
 } Model;
 
 /* ═══════════════════════════════════════════════════════════
@@ -241,6 +248,7 @@ static void oracle_dump_vec(const char *name, const float *data, int64_t n) {
 }
 
 static int g_trace_numeric = 0;
+static int g_predict_probe = 0;   /* misura accuratezza predizione prefetch */
 
 static int trace_vector(const char *stage, int layer, const float *x, int n) {
     if (!g_trace_numeric) return 1;
@@ -1317,6 +1325,31 @@ static void pilot_shutdown(void) {
  *  MOE FORWARD (single token)
  * ═══════════════════════════════════════════════════════════ */
 
+/* Probe: predice il top-k del router del layer `nl` applicato all'input `x` (già
+ * normalizzato) e lo scrive in `out`. Non altera la matematica: serve solo a
+ * misurare l'accuratezza di due proxy per il prefetch. */
+static void predict_topk_into(Model *m, int nl, const float *x,
+                              const Cfg *c, int *out) {
+    int D = c->hidden, E = c->n_experts, K = c->topk;
+    Layer *l = &m->L[nl];
+    float best_s[64];
+    for (int k = 0; k < K; k++) { out[k] = -1; best_s[k] = -1e30f; }
+    for (int e = 0; e < E; e++) {
+        float dot = l->router_bias ? l->router_bias[e] : 0.0f;
+        const float *rw = l->router + (int64_t)e * D;
+        for (int i = 0; i < D; i++) dot += x[i] * rw[i];
+        for (int k = 0; k < K; k++) {
+            if (dot > best_s[k]) {
+                for (int j = K - 1; j > k; j--) {
+                    best_s[j] = best_s[j-1]; out[j] = out[j-1];
+                }
+                best_s[k] = dot; out[k] = e;
+                break;
+            }
+        }
+    }
+}
+
 static void moe_forward(float *out, const float *x, Model *m,
                         int layer, const Cfg *c) {
     int D = c->hidden;
@@ -1348,6 +1381,18 @@ static void moe_forward(float *out, const float *x, Model *m,
         }
         sel[k] = best;
         weights[k] = best_s;
+    }
+
+    /* Probe: confronta il routing reale di questo layer con i due proxy predetti
+     * per esso durante il layer precedente. */
+    if (g_predict_probe && m->pred_layer == layer) {
+        for (int k = 0; k < K; k++) {
+            for (int j = 0; j < K; j++)
+                if (sel[k] == m->pred_next[j])  { m->pred_hit++;  break; }
+            for (int j = 0; j < K; j++)
+                if (sel[k] == m->pred_next2[j]) { m->pred_hit2++; break; }
+        }
+        m->pred_total += K;
     }
 
     /* 3. Normalizza pesi (softmax sui top-k) */
@@ -1719,12 +1764,26 @@ static int forward_token(Model *m, int tok, int pos) {
         if (l + 1 < c->n_layers) {
             pilot_prefetch(l + 1, hn);
         }
-        
+
         moe_forward(ffn_out, hn, m, l, c);
+
+        /* Probe proxy A: predici il top-k di l+1 da hn (norm pre-MoE di l), lo
+         * stesso segnale disponibile durante il calcolo di l. hn non è più
+         * necessario dopo moe_forward, quindi verrà riusato come scratch per B. */
+        if (g_predict_probe && l + 1 < c->n_layers)
+            predict_topk_into(m, l + 1, hn, c, m->pred_next);
         m->t_moe += now_s() - tm;
 
         /* Residual */
         for (int i = 0; i < D; i++) h[i] += ffn_out[i];
+
+        /* Probe proxy B: predici il top-k di l+1 dallo stato post-MoE di l,
+         * normalizzato col post_ln di l+1 (manca solo l'attention di l+1). */
+        if (g_predict_probe && l + 1 < c->n_layers) {
+            rmsnorm(hn, h, m->L[l + 1].post_ln, D, c->eps);
+            predict_topk_into(m, l + 1, hn, c, m->pred_next2);
+            m->pred_layer = l + 1;
+        }
         trace_vector("post_moe", l, h, D);
         if (g_oracle_dir) {
             snprintf(dump_name, sizeof(dump_name), "layer%d.output", l);
@@ -1912,8 +1971,8 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
 static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
     int batch = 64;
     { const char *v = getenv("PREFILL_BATCH"); if (v) batch = atoi(v); }
-    int sequential = g_oracle_dir || g_trace_numeric || g_rep_penalty > 1.0f
-                     || batch <= 1 || n <= 1;
+    int sequential = g_oracle_dir || g_trace_numeric || g_predict_probe
+                     || g_rep_penalty > 1.0f || batch <= 1 || n <= 1;
 
     int last = ids[0];
     if (sequential) {
@@ -1952,6 +2011,15 @@ static void stats_dump(Model *m) {
     fprintf(stderr, "RSS:        %.2f GB\n", rss_gb());
     fprintf(stderr, "resident:   %.2f GB (dense model)\n",
             m->resident_bytes / 1e9);
+    if (m->pred_total > 0) {
+        double accA = 100.0 * m->pred_hit  / m->pred_total;
+        double accB = 100.0 * m->pred_hit2 / m->pred_total;
+        double baseline = 100.0 * m->c.topk / m->c.n_experts;  /* overlap casuale atteso */
+        fprintf(stderr, "prefetch predict (%llu campioni, casuale ~%.1f%%):\n",
+                (unsigned long long)m->pred_total, baseline);
+        fprintf(stderr, "  proxy A (hn pre-MoE):   %.1f%% expert corretti\n", accA);
+        fprintf(stderr, "  proxy B (post-MoE norm): %.1f%% expert corretti\n", accB);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -2761,6 +2829,8 @@ int main(int argc, char **argv) {
     g_oracle_dir = getenv("ORACLE_DIR");
     { const char *trace = getenv("TRACE_NUMERIC");
       g_trace_numeric = trace && atoi(trace) != 0; }
+    { const char *p = getenv("PREDICT_PROBE");
+      g_predict_probe = p && atoi(p) != 0; }
 
     fprintf(stderr, "modello:    %s\n", model_path);
     { const char *svc = getenv("SERVICE");
@@ -2772,6 +2842,7 @@ int main(int argc, char **argv) {
     /* ── 1. Carica configurazione ── */
     static Model m;
     memset(&m, 0, sizeof(m));
+    m.pred_layer = -1;
 
     if (cfg_load(&m.c, model_path) != 0) {
         fprintf(stderr, "errore: impossibile caricare config.json\n");
