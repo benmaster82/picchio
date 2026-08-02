@@ -132,6 +132,7 @@ typedef struct {
     int64_t slab_cap;     /* capacità allocata */
     int64_t fslab_cap;
     uint64_t last_used;   /* timestamp per LRU eviction */
+    int loading;          /* 1 = prefetch in corso su questo slot (atomico) */
 } ESlot;
 
 /* ═══════════════════════════════════════════════════════════
@@ -890,6 +891,38 @@ down_loaded:
  *  EXPERT CACHE: lookup LRU + eviction
  * ═══════════════════════════════════════════════════════════ */
 
+/* Flag `loading` di uno slot: 1 mentre il thread di prefetch lo sta riempiendo.
+ * Release/acquire garantiscono che, quando il main osserva loading==0, veda anche
+ * i buffer scritti dal prefetch. */
+static inline int slot_loading(ESlot *s) {
+    return __atomic_load_n(&s->loading, __ATOMIC_ACQUIRE);
+}
+static inline void slot_set_loading(ESlot *s, int v) {
+    __atomic_store_n(&s->loading, v, __ATOMIC_RELEASE);
+}
+static void slot_wait_ready(ESlot *s) {
+    while (slot_loading(s)) {
+#ifdef _WIN32
+        Sleep(0);
+#else
+        usleep(50);
+#endif
+    }
+}
+
+static void free_slot_buffers(ESlot *s) {
+    free(s->gu.qf); s->gu.qf = NULL;
+    free(s->gu.q4); s->gu.q4 = NULL;
+    free(s->gu.s);  s->gu.s = NULL;
+    free(s->d.qf);  s->d.qf = NULL;
+    free(s->d.q4);  s->d.q4 = NULL;
+    free(s->d.s);   s->d.s = NULL;
+    free(s->gu_bias); s->gu_bias = NULL;
+    free(s->d_bias);  s->d_bias = NULL;
+    free(s->slab);    s->slab = NULL;
+    free(s->fslab);   s->fslab = NULL;
+}
+
 static ESlot *cache_lookup(Model *m, int layer, int eid) {
     ESlot *pool = m->ecache[layer];
     int n = m->ecn[layer];
@@ -979,6 +1012,7 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
             for (int j = 0; j < m->ecn[layer]; j++)
                 if (pool[j].eid == eids[i]) { found = &pool[j]; break; }
         if (found) {
+            slot_wait_ready(found);  /* se un prefetch sta caricando questo expert, attendi */
             found->last_used = ++m->eclock;
             m->hits++;
             out[i] = found;
@@ -988,7 +1022,10 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
         }
     }
 
-    /* Pass 2: riserva un victim per ogni miss (seriale: nessuna race su LRU). */
+    /* Pass 2: riserva un victim per ogni miss (seriale: nessuna race su LRU).
+     * Gli slot con prefetch in corso (loading) non vengono mai scelti come victim;
+     * l'invariante ecap-topk garantito da prefetch_issue assicura che restino
+     * abbastanza slot liberi. */
     for (int mi = 0; mi < nmiss; mi++) {
         int i = miss_i[mi];
         ESlot *victim = NULL;
@@ -996,21 +1033,15 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
             victim = &pool[m->ecn[layer]++];
         } else {
             uint64_t oldest = UINT64_MAX;
-            for (int j = 0; j < m->ecn[layer]; j++)
+            for (int j = 0; j < m->ecn[layer]; j++) {
+                if (slot_loading(&pool[j])) continue;
                 if (pool[j].last_used < oldest) { oldest = pool[j].last_used; victim = &pool[j]; }
+            }
+            if (!victim) {  /* estrema difesa: attendi il primo slot in prefetch */
+                victim = &pool[0]; slot_wait_ready(victim);
+            }
         }
-        if (victim->eid >= 0) {
-            free(victim->gu.qf); victim->gu.qf = NULL;
-            free(victim->gu.q4); victim->gu.q4 = NULL;
-            free(victim->gu.s);  victim->gu.s = NULL;
-            free(victim->d.qf);  victim->d.qf = NULL;
-            free(victim->d.q4);  victim->d.q4 = NULL;
-            free(victim->d.s);   victim->d.s = NULL;
-            free(victim->gu_bias); victim->gu_bias = NULL;
-            free(victim->d_bias);  victim->d_bias = NULL;
-            free(victim->slab);    victim->slab = NULL;
-            free(victim->fslab);   victim->fslab = NULL;
-        }
+        if (victim->eid >= 0) free_slot_buffers(victim);
         victim->eid = eids[i];   /* riservato: verrà popolato in pass 3 */
         victim->layer = layer;
         victim->last_used = ++m->eclock;
@@ -1038,288 +1069,207 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  PILOT PREFETCH (thread separato per pre-caricamento expert)
+ *  PREFETCH → LRU (thread separato, popola direttamente la cache)
  *
- *  Strategia: mentre il layer L computa, calcoliamo il routing
- *  del layer L+1 e pre-carichiamo gli expert che serviranno.
- *  Questo nasconde la latenza disco dietro la computazione.
+ *  Il thread principale, a fine layer L, predice il top-k del layer L+1
+ *  (proxy post-MoE, ~89% accurato sul 20B), RISERVA gli slot LRU per quegli
+ *  expert e li passa a un thread che li legge da disco. Durante l'attention
+ *  di L+1 il thread riempie gli slot; quando moe_forward(L+1) li richiede,
+ *  sono già in cache. A differenza del vecchio PILOT (che scaldava solo la
+ *  cache dell'OS → doppia lettura → −11%), qui non c'è seconda lettura.
+ *
+ *  Sicurezza: solo il main muta la LRU (riserva). Il thread scrive esclusiva-
+ *  mente nei buffer degli slot riservati e imposta loading=0 (release) a fine
+ *  lettura; il main attende loading==0 (acquire) prima di usare uno slot.
+ *  prefetch_issue riserva al più (ecap − topk) slot, così restano sempre
+ *  abbastanza slot non-loading per il routing reale.
  * ═══════════════════════════════════════════════════════════ */
 
 #ifndef _WIN32
 #include <pthread.h>
+#include <sched.h>
+#endif
 
 typedef struct {
     Model *m;
-    const float *x;      /* input per il routing (dopo norm) */
-    int layer;           /* layer per cui pre-caricare */
-    int active;          /* 1 se il thread sta lavorando */
-    pthread_t thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int shutdown;
-} Pilot;
-
-static void *pilot_worker(void *arg) {
-    Pilot *p = (Pilot *)arg;
-    
-    while (!p->shutdown) {
-        pthread_mutex_lock(&p->mutex);
-        while (!p->active && !p->shutdown)
-            pthread_cond_wait(&p->cond, &p->mutex);
-        if (p->shutdown) { pthread_mutex_unlock(&p->mutex); break; }
-        
-        /* Esegui routing e pre-carica */
-        int layer = p->layer;
-        Model *m = p->m;
-        Cfg *c = &m->c;
-        int D = c->hidden;
-        int E = c->n_experts;
-        int K = c->topk;
-        Layer *l = &m->L[layer];
-        const float *x = p->x;
-        
-        p->active = 0;
-        pthread_mutex_unlock(&p->mutex);
-        
-        if (!l->router || !x) continue;
-        
-        /* Calcola routing scores */
-        float scores[256];  /* max 256 expert */
-        for (int e = 0; e < E && e < 256; e++) {
-            float dot = 0;
-            const float *rw = l->router + (int64_t)e * D;
-            for (int i = 0; i < D; i++) dot += x[i] * rw[i];
-            if (l->router_bias) dot += l->router_bias[e];
-            scores[e] = dot;
-        }
-        
-        /* Trova top-K */
-        for (int k = 0; k < K; k++) {
-            int best = 0;
-            for (int e = 1; e < E; e++) {
-                if (scores[e] > scores[best]) best = e;
-            }
-            /* Pre-carica questo expert (se non in cache) */
-            cache_lookup(m, layer, best);
-            scores[best] = -1e30f;  /* escludilo dal prossimo round */
-        }
-    }
-    
-    return NULL;
-}
-
-static Pilot g_pilot = {0};
-static int g_pilot_enabled = 0;
-
-static void pilot_init(Model *m) {
-    g_pilot.m = m;
-    g_pilot.active = 0;
-    g_pilot.shutdown = 0;
-    pthread_mutex_init(&g_pilot.mutex, NULL);
-    pthread_cond_init(&g_pilot.cond, NULL);
-    pthread_create(&g_pilot.thread, NULL, pilot_worker, &g_pilot);
-    g_pilot_enabled = 1;
-}
-
-static void pilot_prefetch(int layer, const float *x) {
-    if (!g_pilot_enabled) return;
-    pthread_mutex_lock(&g_pilot.mutex);
-    g_pilot.layer = layer;
-    g_pilot.x = x;
-    g_pilot.active = 1;
-    pthread_cond_signal(&g_pilot.cond);
-    pthread_mutex_unlock(&g_pilot.mutex);
-}
-
-static void pilot_shutdown(void) {
-    if (!g_pilot_enabled) return;
-    pthread_mutex_lock(&g_pilot.mutex);
-    g_pilot.shutdown = 1;
-    pthread_cond_signal(&g_pilot.cond);
-    pthread_mutex_unlock(&g_pilot.mutex);
-    pthread_join(g_pilot.thread, NULL);
-    pthread_mutex_destroy(&g_pilot.mutex);
-    pthread_cond_destroy(&g_pilot.cond);
-    g_pilot_enabled = 0;
-}
-
-#else
-/* Windows: PILOT di warming.
- *
- * Il thread NON modifica la cache LRU né usa gli handle del thread principale:
- * apre handle propri e legge i byte degli expert previsti per il layer successivo,
- * portandoli nella cache del sistema operativo. La lettura successiva del thread
- * principale viene così servita dalla RAM invece che dal disco.
- *
- * Questo evita qualsiasi corsa critica sulle strutture condivise: `st_find` e
- * `l->router` sono in sola lettura, e l'input di routing viene copiato. */
-
-#define PILOT_SCRATCH (4 * 1024 * 1024)
-
-typedef struct {
-    Model *m;
-    float *x;                        /* copia privata dell'input di routing */
     int layer;
-    int has_job;
-    int shutdown;
+    int n;
+    ESlot *slots[64];
+    int    eids[64];
+    volatile int has_job;
+    volatile int shutdown;
+    uint64_t issued;      /* expert totali messi in prefetch */
+#ifdef _WIN32
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
     HANDLE thread;
-    HANDLE handles[ST_MAX_FILES];    /* handle indipendenti per file */
-    uint8_t *scratch;
-    uint64_t warmed;
-} Pilot;
+#else
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    pthread_t thread;
+#endif
+} Prefetch;
 
-static Pilot g_pilot;
-static int g_pilot_enabled = 0;
+static Prefetch g_pf;
+static int g_pilot_enabled = 0;   /* nome storico: usato da main() */
 
-static HANDLE pilot_handle(int file_idx) {
-    if (!g_db || file_idx < 0 || file_idx >= g_db->n_files) return NULL;
-    if (!g_pilot.handles[file_idx]) {
-        HANDLE h = CreateFileA(g_db->files[file_idx].path, GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-        g_pilot.handles[file_idx] = (h == INVALID_HANDLE_VALUE) ? NULL : h;
+/* ── Primitive di lock/segnale, 1 = successo per trylock su entrambe ── */
+#ifdef _WIN32
+static int  pf_trylock(void) { return TryEnterCriticalSection(&g_pf.cs) != 0; }
+static void pf_lock(void)    { EnterCriticalSection(&g_pf.cs); }
+static void pf_unlock(void)  { LeaveCriticalSection(&g_pf.cs); }
+static void pf_signal(void)  { WakeConditionVariable(&g_pf.cv); }
+#else
+static int  pf_trylock(void) { return pthread_mutex_trylock(&g_pf.mutex) == 0; }
+static void pf_lock(void)    { pthread_mutex_lock(&g_pf.mutex); }
+static void pf_unlock(void)  { pthread_mutex_unlock(&g_pf.mutex); }
+static void pf_signal(void)  { pthread_cond_signal(&g_pf.cond); }
+#endif
+
+/* Corpo del worker: legge da disco ogni slot riservato e lo marca pronto. */
+static void prefetch_run_job(void) {
+    int n = g_pf.n, layer = g_pf.layer;
+    for (int i = 0; i < n; i++) {
+        if (!g_pf.shutdown)
+            expert_load(g_pf.m, layer, g_pf.eids[i], g_pf.slots[i]);
+        slot_set_loading(g_pf.slots[i], 0);  /* pronto (o abortito da shutdown) */
     }
-    return g_pilot.handles[file_idx];
 }
 
-/* Porta nella cache del sistema operativo l'intervallo di un tensore. */
-static void pilot_warm(StTensor *t) {
-    if (!t) return;
-    HANDLE h = pilot_handle(t->file_idx);
-    if (!h) return;
-    int64_t base = g_db->files[t->file_idx].data_offset + t->offset_start;
-    int64_t remaining = t->offset_end - t->offset_start;
-    while (remaining > 0 && !g_pilot.shutdown) {
-        DWORD chunk = (DWORD)(remaining < PILOT_SCRATCH ? remaining : PILOT_SCRATCH);
-        OVERLAPPED ov = {0};
-        ov.Offset = (DWORD)(base & 0xFFFFFFFF);
-        ov.OffsetHigh = (DWORD)(base >> 32);
-        DWORD got = 0;
-        if (!ReadFile(h, g_pilot.scratch, chunk, &got, &ov) || got == 0) return;
-        base += got;
-        remaining -= got;
-    }
-    g_pilot.warmed++;
-}
-
-/* Cerca un tensore expert provando le varianti di nome usate dal loader. */
-static StTensor *pilot_find_expert(int layer, int eid, const char *proj) {
-    char name[256];
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%s.%d", layer, proj, eid);
-    StTensor *t = st_find(g_db, name);
-    if (!t) {
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%d.%s", layer, eid, proj);
-        t = st_find(g_db, name);
-    }
-    if (!t) {
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%d.%s.weight",
-                 layer, eid, proj);
-        t = st_find(g_db, name);
-    }
-    return t;
-}
-
-/* Peek senza lock: legge solo interi. Un esito impreciso costa al massimo
- * una lettura inutile o mancata, mai la correttezza del forward. */
-static int pilot_probably_cached(Model *m, int layer, int eid) {
-    for (int i = 0; i < m->npin[layer]; i++)
-        if (m->pin[layer] && m->pin[layer][i].eid == eid) return 1;
-    for (int i = 0; i < m->ecap; i++)
-        if (m->ecache[layer][i].eid == eid) return 1;
-    return 0;
-}
-
-static DWORD WINAPI pilot_worker(LPVOID arg) {
-    Pilot *p = (Pilot *)arg;
-    Model *m = p->m;
-    Cfg *c = &m->c;
-    int D = c->hidden, E = c->n_experts, K = c->topk;
-    float *scores = (float *)malloc((size_t)E * sizeof(float));
-    if (!scores) return 0;
-
+#ifdef _WIN32
+static DWORD WINAPI prefetch_thread(LPVOID arg) {
+    (void)arg;
     for (;;) {
-        EnterCriticalSection(&p->cs);
-        while (!p->has_job && !p->shutdown)
-            SleepConditionVariableCS(&p->cv, &p->cs, INFINITE);
-        if (p->shutdown) { LeaveCriticalSection(&p->cs); break; }
-        int layer = p->layer;
-        p->has_job = 0;
-        LeaveCriticalSection(&p->cs);
-
-        Layer *l = &m->L[layer];
-        if (!l->router || !g_db) continue;
-
-        for (int e = 0; e < E; e++) {
-            const float *rw = l->router + (int64_t)e * D;
-            float dot = l->router_bias ? l->router_bias[e] : 0.0f;
-            for (int i = 0; i < D; i++) dot += p->x[i] * rw[i];
-            scores[e] = dot;
-        }
-        for (int k = 0; k < K && !p->shutdown; k++) {
-            int best = 0;
-            for (int e = 1; e < E; e++) if (scores[e] > scores[best]) best = e;
-            scores[best] = -1e30f;
-            if (pilot_probably_cached(m, layer, best)) continue;
-            pilot_warm(pilot_find_expert(layer, best, "gate_up_proj"));
-            pilot_warm(pilot_find_expert(layer, best, "down_proj"));
-        }
+        EnterCriticalSection(&g_pf.cs);
+        while (!g_pf.has_job && !g_pf.shutdown)
+            SleepConditionVariableCS(&g_pf.cv, &g_pf.cs, INFINITE);
+        if (g_pf.shutdown) { LeaveCriticalSection(&g_pf.cs); break; }
+        LeaveCriticalSection(&g_pf.cs);
+        prefetch_run_job();
+        EnterCriticalSection(&g_pf.cs);
+        g_pf.has_job = 0;
+        LeaveCriticalSection(&g_pf.cs);
     }
-    free(scores);
     return 0;
 }
+#else
+static void *prefetch_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_pf.mutex);
+        while (!g_pf.has_job && !g_pf.shutdown)
+            pthread_cond_wait(&g_pf.cond, &g_pf.mutex);
+        if (g_pf.shutdown) { pthread_mutex_unlock(&g_pf.mutex); break; }
+        pthread_mutex_unlock(&g_pf.mutex);
+        prefetch_run_job();
+        pthread_mutex_lock(&g_pf.mutex);
+        g_pf.has_job = 0;
+        pthread_mutex_unlock(&g_pf.mutex);
+    }
+    return NULL;
+}
+#endif
 
 static void pilot_init(Model *m) {
-    memset(&g_pilot, 0, sizeof(g_pilot));
-    g_pilot.m = m;
-    g_pilot.x = (float *)calloc((size_t)m->c.hidden, sizeof(float));
-    g_pilot.scratch = (uint8_t *)malloc(PILOT_SCRATCH);
-    if (!g_pilot.x || !g_pilot.scratch) {
-        free(g_pilot.x); free(g_pilot.scratch);
-        fprintf(stderr, "  ⚠ PILOT: memoria insufficiente, prefetch disattivato\n");
+    memset(&g_pf, 0, sizeof(g_pf));
+    g_pf.m = m;
+#ifdef _WIN32
+    InitializeCriticalSection(&g_pf.cs);
+    InitializeConditionVariable(&g_pf.cv);
+    g_pf.thread = CreateThread(NULL, 0, prefetch_thread, NULL, 0, NULL);
+    if (!g_pf.thread) {
+        DeleteCriticalSection(&g_pf.cs);
+        fprintf(stderr, "  ⚠ prefetch: creazione thread fallita\n");
         return;
     }
-    InitializeCriticalSection(&g_pilot.cs);
-    InitializeConditionVariable(&g_pilot.cv);
-    g_pilot.thread = CreateThread(NULL, 0, pilot_worker, &g_pilot, 0, NULL);
-    if (!g_pilot.thread) {
-        DeleteCriticalSection(&g_pilot.cs);
-        free(g_pilot.x); free(g_pilot.scratch);
-        fprintf(stderr, "  ⚠ PILOT: creazione thread fallita\n");
+#else
+    pthread_mutex_init(&g_pf.mutex, NULL);
+    pthread_cond_init(&g_pf.cond, NULL);
+    if (pthread_create(&g_pf.thread, NULL, prefetch_thread, NULL) != 0) {
+        fprintf(stderr, "  ⚠ prefetch: creazione thread fallita\n");
         return;
     }
+#endif
     g_pilot_enabled = 1;
 }
 
-static void pilot_prefetch(int layer, const float *x) {
-    if (!g_pilot_enabled) return;
-    if (!TryEnterCriticalSection(&g_pilot.cs)) return;  /* thread occupato: salta */
-    memcpy(g_pilot.x, x, (size_t)g_pilot.m->c.hidden * sizeof(float));
-    g_pilot.layer = layer;
-    g_pilot.has_job = 1;
-    WakeConditionVariable(&g_pilot.cv);
-    LeaveCriticalSection(&g_pilot.cs);
+/* Main thread: riserva gli slot LRU per gli expert predetti `pred[0..k)` del
+ * `layer` e li affida al worker. Non attende: se il worker è ancora occupato o
+ * il lock è conteso, salta questo round (il prefetch è best-effort). */
+static void prefetch_issue(Model *m, int layer, const int *pred, int k) {
+    if (!g_pilot_enabled || layer < 0 || layer >= m->c.n_layers) return;
+    int max_reserve = m->ecap - m->c.topk;   /* lascia sempre topk slot al routing */
+    if (max_reserve <= 0) return;
+    if (!pf_trylock()) return;
+    if (g_pf.has_job) { pf_unlock(); return; }   /* job precedente ancora in corso */
+
+    ESlot *pool = m->ecache[layer];
+    int n = 0;
+    for (int a = 0; a < k && n < max_reserve; a++) {
+        int eid = pred[a];
+        if (eid < 0) continue;
+        int cached = 0;
+        for (int j = 0; j < m->npin[layer] && !cached; j++)
+            if (m->pin[layer][j].eid == eid) cached = 1;
+        for (int j = 0; j < m->ecn[layer] && !cached; j++)
+            if (pool[j].eid == eid) cached = 1;
+        if (cached) continue;
+        int dup = 0;
+        for (int b = 0; b < n; b++) if (g_pf.eids[b] == eid) dup = 1;
+        if (dup) continue;
+
+        ESlot *victim = NULL;
+        if (m->ecn[layer] < m->ecap) {
+            victim = &pool[m->ecn[layer]++];
+        } else {
+            uint64_t oldest = UINT64_MAX;
+            for (int j = 0; j < m->ecn[layer]; j++) {
+                if (slot_loading(&pool[j])) continue;
+                int reserved = 0;
+                for (int b = 0; b < n; b++) if (g_pf.slots[b] == &pool[j]) reserved = 1;
+                if (reserved) continue;
+                if (pool[j].last_used < oldest) { oldest = pool[j].last_used; victim = &pool[j]; }
+            }
+        }
+        if (!victim) break;
+        if (victim->eid >= 0) free_slot_buffers(victim);
+        victim->eid = eid;
+        victim->layer = layer;
+        victim->last_used = ++m->eclock;
+        slot_set_loading(victim, 1);
+        g_pf.slots[n] = victim;
+        g_pf.eids[n] = eid;
+        n++;
+    }
+    if (n > 0) {
+        g_pf.layer = layer;
+        g_pf.n = n;
+        g_pf.has_job = 1;
+        g_pf.issued += n;
+        pf_signal();
+    }
+    pf_unlock();
 }
 
 static void pilot_shutdown(void) {
     if (!g_pilot_enabled) return;
-    EnterCriticalSection(&g_pilot.cs);
-    g_pilot.shutdown = 1;
-    WakeConditionVariable(&g_pilot.cv);
-    LeaveCriticalSection(&g_pilot.cs);
-    WaitForSingleObject(g_pilot.thread, 10000);
-    CloseHandle(g_pilot.thread);
-    for (int i = 0; i < ST_MAX_FILES; i++)
-        if (g_pilot.handles[i]) CloseHandle(g_pilot.handles[i]);
-    DeleteCriticalSection(&g_pilot.cs);
-    fprintf(stderr, "PILOT: %llu tensori pre-caricati\n",
-            (unsigned long long)g_pilot.warmed);
-    free(g_pilot.x);
-    free(g_pilot.scratch);
+    pf_lock();
+    g_pf.shutdown = 1;
+    pf_signal();
+    pf_unlock();
+#ifdef _WIN32
+    WaitForSingleObject(g_pf.thread, 10000);
+    CloseHandle(g_pf.thread);
+    DeleteCriticalSection(&g_pf.cs);
+#else
+    pthread_join(g_pf.thread, NULL);
+    pthread_mutex_destroy(&g_pf.mutex);
+    pthread_cond_destroy(&g_pf.cond);
+#endif
+    fprintf(stderr, "prefetch: %llu expert messi in prefetch\n",
+            (unsigned long long)g_pf.issued);
     g_pilot_enabled = 0;
 }
-#endif
 
 /* ═══════════════════════════════════════════════════════════
  *  MOE FORWARD (single token)
@@ -1759,17 +1709,11 @@ static int forward_token(Model *m, int tok, int pos) {
 
         /* MoE (tutti i layer in GPT-OSS sono MoE) */
         double tm = now_s();
-        
-        /* PILOT: prefetch expert del layer successivo */
-        if (l + 1 < c->n_layers) {
-            pilot_prefetch(l + 1, hn);
-        }
 
         moe_forward(ffn_out, hn, m, l, c);
 
-        /* Probe proxy A: predici il top-k di l+1 da hn (norm pre-MoE di l), lo
-         * stesso segnale disponibile durante il calcolo di l. hn non è più
-         * necessario dopo moe_forward, quindi verrà riusato come scratch per B. */
+        /* Probe proxy A: predici il top-k di l+1 da hn (norm pre-MoE di l). hn
+         * non serve più dopo moe_forward, quindi verrà riusato come scratch. */
         if (g_predict_probe && l + 1 < c->n_layers)
             predict_topk_into(m, l + 1, hn, c, m->pred_next);
         m->t_moe += now_s() - tm;
@@ -1777,12 +1721,16 @@ static int forward_token(Model *m, int tok, int pos) {
         /* Residual */
         for (int i = 0; i < D; i++) h[i] += ffn_out[i];
 
-        /* Probe proxy B: predici il top-k di l+1 dallo stato post-MoE di l,
-         * normalizzato col post_ln di l+1 (manca solo l'attention di l+1). */
-        if (g_predict_probe && l + 1 < c->n_layers) {
+        /* Proxy B: predici il top-k di l+1 dallo stato post-MoE di l normalizzato
+         * col post_ln di l+1 (manca solo l'attention di l+1, ~89% accurato). È il
+         * segnale sia del probe sia del prefetch→LRU, che riserva quegli expert e
+         * li carica durante l'attention di l+1. */
+        if ((g_predict_probe || g_pilot_enabled) && l + 1 < c->n_layers) {
             rmsnorm(hn, h, m->L[l + 1].post_ln, D, c->eps);
             predict_topk_into(m, l + 1, hn, c, m->pred_next2);
             m->pred_layer = l + 1;
+            if (g_pilot_enabled)
+                prefetch_issue(m, l + 1, m->pred_next2, c->topk);
         }
         trace_vector("post_moe", l, h, D);
         if (g_oracle_dir) {
@@ -3055,12 +3003,14 @@ int main(int argc, char **argv) {
                 g_io_threads > 1 ? "read paralleli" : "seriale");
     }
 
-    /* PILOT prefetch */
+    /* Prefetch → LRU (PREFETCH=1, alias storico PILOT=1). Predice gli expert del
+     * layer successivo (proxy post-MoE) e li carica durante l'attention. */
     {
-        const char *v = getenv("PILOT");
+        const char *v = getenv("PREFETCH");
+        if (!v) v = getenv("PILOT");
         if (v && atoi(v)) {
             pilot_init(&m);
-            fprintf(stderr, "PILOT: prefetch abilitato\n");
+            fprintf(stderr, "prefetch → LRU abilitato (proxy post-MoE)\n");
         }
     }
 

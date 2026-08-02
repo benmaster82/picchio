@@ -55,10 +55,11 @@ info:
 	@echo "  TOPP      nucleus sampling top-p (default: 0.95)"
 	@echo "  PIN_GB    GB di RAM per hot-store expert (default: auto)"
 	@echo "  DIRECT    1=O_DIRECT per expert (default: 0)"
-	@echo "  PILOT     1=prefetch pilotato dal router (default: 0)"
+	@echo "  PREFETCH  1=prefetch→LRU del layer successivo (default: 0; alias PILOT)"
 	@echo "  IO_THREADS thread per i read paralleli degli expert (default: 4)"
 	@echo "  PIPE      0=forza read seriali (compat), altrimenti usa IO_THREADS"
 	@echo "  ECAP      override slot cache per layer (default: auto da PIN_GB)"
+	@echo "  PREDICT_PROBE 1=misura accuratezza predizione prefetch (diagnostica)"
 
 # ── Clean ──
 

@@ -425,6 +425,46 @@ abbatte i cold-load residui di 15–20×; più core scalano il calcolo; il tier 
 previsto. Le dimensioni sono lette da `config.json`: 20B e 120B girano con lo stesso
 codice.
 
+### 0.13 Prefetch → LRU: predizione, meccanismo e risultati
+
+Il vecchio PILOT scaldava solo la cache dell'OS (doppia lettura, −11% con poca RAM). È
+stato riscritto per **popolare direttamente la LRU**, con un design single-writer che
+evita ogni race: il thread principale (unico a mutare la LRU) predice gli expert del
+layer L+1, riserva gli slot e li affida a un thread che li legge da disco durante
+l'attention di L+1; `slot->loading` (release/acquire) sincronizza buffer e visibilità.
+`prefetch_issue` riserva al più `ecap − topk` slot, così restano sempre abbastanza slot
+non-loading per il routing reale. Attivo con `PREFETCH=1` (default off), token-exact
+verificato vs prefetch spento sulle suite tiny F32/INT4, anche sotto eviction.
+
+**Accuratezza della predizione** (`PREDICT_PROBE=1`, risponde alla domanda aperta §0.8).
+Predicendo il top-4 di L+1 dallo stato nascosto di L, misurato sul 20B (8372 campioni,
+casuale ~12,5%): proxy A (norm pre-MoE di L) **81,1%**, proxy B (stato post-MoE di L
+normalizzato col post_ln di L+1, manca solo l'attention di L+1) **89,4%**. Si usa il
+proxy B: ~3,58 expert su 4 corretti, ~10% di read sprecate.
+
+**Risultati sul decode** (20B, `PIN_GB=4`, cache vincolata, greedy). Le metriche di
+contabilità migliorano molto — hit 83→94%, `t_edisk` sul main da 50 a 19 s (USB) e da 26
+a 8 s (NVMe) — perché i read migrano sul thread di prefetch. Ma il **wall-clock `t_moe`
+non segue**:
+
+| Disco | `t_moe` OFF | `t_moe` ON |
+|---|---|---|
+| SSD USB | ~64 s | ~68 s (peggio, +6%) |
+| NVMe | ~42,9 s | ~37–43 s (0 a −14%) |
+
+Due cause strutturali: (1) nel **decode l'attention di un singolo token è troppo breve**
+per nascondere un load da ~13 MB, quindi il main attende comunque (`slot_wait_ready`) e
+l'attesa resta nel wall-clock; (2) su **USB single-queue** i due lettori concorrenti si
+ostacolano (penalità), mentre su NVMe la coda reale la annulla (neutro/leggero guadagno).
+Il meccanismo è quindi corretto e sicuro, ma il suo valore sul decode è limitato dalle
+finestre di overlap corte, su entrambi i dischi.
+
+**Dove si sblocca il valore.** Il prefill elabora molte posizioni per layer → finestre di
+overlap grandi: è lì (il prefill del 120B è ~930 s, quasi tutto disco) che il prefetch
+può vincere anche su USB. Il percorso batched non è ancora agganciato al prefetch: è il
+prossimo passo. In alternativa, l'unica leva che aggira il muro della banda su qualsiasi
+disco resta **ridurre i byte letti** (cold-expert in formato più compresso).
+
 ---
 
 ## 1. Analisi dell'architettura GPT-OSS-120B
