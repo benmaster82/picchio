@@ -51,5 +51,5 @@
   <text x="210" y="94" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
         font-size="19" fill="#808080" font-style="italic">it drums the model off the disk</text>
   <text x="210" y="122" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-        font-size="15" fill="#9a9a9a">GPT-OSS &#183; 120B MoE &#183; int4 &#183; streaming CPU</text>
+        font-size="15" fill="#9a9a9a">GPT-OSS &#183; 20B/120B &#183; int4 &#183; streaming CPU</text>
 </svg>
