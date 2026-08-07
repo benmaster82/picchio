@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/picchio.svg" alt="picchio — patient engine, immense model — GPT-OSS · 120B MoE · int4 · streaming CPU" width="560">
+  <img src="assets/picchio.svg" alt="picchio — patient engine — GPT-OSS · 120B MoE · int4 · streaming CPU" width="560">
 </p>
 
 > *The woodpecker drums a hundred times a second on a huge trunk —
