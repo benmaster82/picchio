@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Chat GPT-OSS token-exact: Harmony ufficiale + sessione Picchio persistente.
+"""Token-exact GPT-OSS chat: official Harmony + persistent Picchio session.
 
-Il rendering, la tokenizzazione e il parsing appartengono a `openai-harmony`.
-Picchio riceve e restituisce soltanto ID token raw. Tra turni viene riusato il
-prefisso comune della KV-cache, perché il re-render Harmony non è prefix-preserving
-(l'analysis viene scartato e `<|return|>` diventa `<|end|>`).
+Rendering, tokenization, and parsing belong to `openai-harmony`. Picchio only
+receives and returns raw token IDs. Between turns the common prefix of the
+KV-cache is reused, because the Harmony re-render is not prefix-preserving
+(the analysis is dropped and `<|return|>` becomes `<|end|>`).
 """
 import argparse
 import json
@@ -24,7 +24,7 @@ KEEP_ANALYSIS = RenderConversationConfig(auto_drop_analysis=False)
 
 
 class PicchioSession:
-    """Processo Picchio persistente in modalità SERVICE."""
+    """Persistent Picchio process in SERVICE mode."""
 
     def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None):
         env = os.environ.copy()
@@ -36,7 +36,7 @@ class PicchioSession:
                     "OMP_NUM_THREADS": str(threads)})
         if sampling:
             env.update({k: str(v) for k, v in sampling.items() if v is not None})
-        # Sampling di default inviato in ogni TURN (override per-turno possibile).
+        # Default sampling sent with every TURN (a per-turn override is possible).
         s = sampling or {}
         self.temperature = 1.0 if s.get("TEMPERATURE") is None else float(s["TEMPERATURE"])
         self.top_p = 0.95 if s.get("TOPP") is None else float(s["TOPP"])
@@ -49,7 +49,7 @@ class PicchioSession:
             errors="replace", bufsize=1)
         ready = self._line()
         if not ready.startswith("READY "):
-            raise RuntimeError(f"avvio servizio fallito: {ready}")
+            raise RuntimeError(f"service startup failed: {ready}")
         fields = ready.split()
         self.ctx = int(fields[1])
         self.vocab = int(fields[2])
@@ -58,7 +58,7 @@ class PicchioSession:
     def _line(self):
         line = self.proc.stdout.readline()
         if not line:
-            raise RuntimeError("il servizio Picchio si è chiuso inaspettatamente")
+            raise RuntimeError("the Picchio service closed unexpectedly")
         return line.strip()
 
     def turn(self, ids, max_new, keep, on_token,
@@ -83,7 +83,7 @@ class PicchioSession:
             elif line.startswith("ERROR "):
                 raise RuntimeError(line)
             else:
-                raise RuntimeError(f"frame di protocollo inatteso: {line}")
+                raise RuntimeError(f"unexpected protocol frame: {line}")
 
     def close(self):
         try:
@@ -98,7 +98,7 @@ class PicchioSession:
 
 
 class HarmonyChat:
-    """Conversazione Harmony con riuso del prefisso già consumato dal modello."""
+    """Harmony conversation with reuse of the prefix already consumed by the model."""
 
     def __init__(self, session, reasoning, current_date, no_reasoning=False):
         self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
@@ -108,16 +108,16 @@ class HarmonyChat:
                   .with_conversation_start_date(current_date))
         self.messages = [Message.from_role_and_content(Role.SYSTEM, system)]
         self.committed = []
-        # Modalità senza ragionamento: si pre-impegna il canale `final`, così il
-        # turno dell'assistant non può emettere un messaggio `analysis`. Il modello
-        # consuma questi token (non li rigenera), quindi vanno pre-alimentati al
-        # parser e inclusi nel parsing/committed.
+        # No-reasoning mode: pre-commit the `final` channel, so the assistant's
+        # turn cannot emit an `analysis` message. The model consumes these tokens
+        # (it does not regenerate them), so they must be pre-fed to the parser and
+        # included in the parsing/committed set.
         self.no_reasoning = no_reasoning
         self.final_prefill = (
             self.encoding.encode("<|channel|>final<|message|>", allowed_special="all")
             if no_reasoning else [])
         if session is not None and set(session.stop_ids) - set(self.encoding.stop_tokens()):
-            raise RuntimeError(f"stop token del runtime incoerenti: {session.stop_ids}")
+            raise RuntimeError(f"inconsistent runtime stop tokens: {session.stop_ids}")
 
     def render(self, user_text):
         messages = self.messages + [Message.from_role_and_content(Role.USER, user_text)]
@@ -128,7 +128,7 @@ class HarmonyChat:
         full = self.render(user_text)
         if len(full) > self.session.ctx:
             raise RuntimeError(
-                f"contesto insufficiente: servono {len(full)} posizioni su {self.session.ctx}")
+                f"insufficient context: {len(full)} positions needed out of {self.session.ctx}")
         keep = 0
         for a, b in zip(full, self.committed):
             if a != b:
@@ -136,11 +136,11 @@ class HarmonyChat:
             keep += 1
         delta = full[keep:] + self.final_prefill
         if not delta:
-            raise RuntimeError("delta vuoto: nulla da elaborare")
+            raise RuntimeError("empty delta: nothing to process")
 
         parser = StreamableParser(self.encoding, Role.ASSISTANT, strict=False)
-        # Pre-alimenta il canale `final` così il parser è già nel canale giusto
-        # quando arrivano i token generati (che iniziano dal contenuto).
+        # Pre-feed the `final` channel so the parser is already in the right channel
+        # when the generated tokens arrive (which start from the content).
         for tok in self.final_prefill:
             parser.process(tok)
 
@@ -152,15 +152,15 @@ class HarmonyChat:
             chunk = parser.last_content_delta
             if chunk and parser.current_channel == show_channel:
                 if not state["shown"]:
-                    print("", file=sys.stderr)  # chiude la riga di avanzamento
+                    print("", file=sys.stderr)  # end the progress line
                     state["shown"] = True
                 print(chunk, end="", flush=True)
             elif not state["shown"]:
-                # Il canale final non è ancora iniziato: mostra che sta lavorando.
-                print(f"\r[{parser.current_channel or 'header'}: {state['n']} token]",
+                # The final channel has not started yet: show that it is working.
+                print(f"\r[{parser.current_channel or 'header'}: {state['n']} tokens]",
                       end="", file=sys.stderr, flush=True)
 
-        print(f"[riuso {keep}/{len(full)} posizioni, {len(delta)} da elaborare]",
+        print(f"[reuse {keep}/{len(full)} positions, {len(delta)} to process]",
               file=sys.stderr)
         produced, reason, pos = self.session.turn(delta, max_new, keep, on_token)
         print()
@@ -171,7 +171,7 @@ class HarmonyChat:
                 self.final_prefill + produced, Role.ASSISTANT)
         except Exception as exc:
             replies = parser.messages
-            print(f"[risposta incompleta ({reason}): {exc}]", file=sys.stderr)
+            print(f"[incomplete response ({reason}): {exc}]", file=sys.stderr)
         self.messages.append(Message.from_role_and_content(Role.USER, user_text))
         self.messages.extend(replies)
         return replies, reason, pos
@@ -188,39 +188,39 @@ def resolve_aux(model, override):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chat GPT-OSS con Picchio")
-    parser.add_argument("prompt", nargs="?", help="domanda singola; omessa avvia la chat")
+    parser = argparse.ArgumentParser(description="GPT-OSS chat with Picchio")
+    parser.add_argument("prompt", nargs="?", help="single question; omit to start the chat")
     parser.add_argument("--model", default=r"D:\gptoss_i4")
     parser.add_argument("--exe", default="picchio.exe")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--ctx", type=int, default=512)
     parser.add_argument("--reasoning", choices=("low", "medium", "high"), default="medium")
     parser.add_argument("--no-reasoning", action="store_true",
-                        help="salta il canale analysis: pre-impegna il canale final, "
-                             "il modello risponde senza ragionare (più veloce)")
+                        help="skip the analysis channel: pre-commit the final channel, "
+                             "the model answers without reasoning (faster)")
     parser.add_argument("--date", default=date.today().isoformat())
     parser.add_argument("--pin-gb", type=int, default=1)
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--model-aux")
     parser.add_argument("--temperature", type=float, default=0.0,
-                        help="0 = greedy deterministico; valori ~0.7-1.0 evitano i cicli")
+                        help="0 = deterministic greedy; values ~0.7-1.0 avoid loops")
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--show-analysis", action="store_true",
-                        help="mostra il canale analysis invece di final")
+                        help="show the analysis channel instead of final")
     parser.add_argument("--dry-run", action="store_true",
-                        help="renderizza e verifica gli ID senza avviare Picchio")
+                        help="render and verify the IDs without starting Picchio")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     if args.dry_run:
         chat = HarmonyChat(None, args.reasoning, args.date, args.no_reasoning)
-        text = args.prompt if args.prompt is not None else input("Tu: ")
+        text = args.prompt if args.prompt is not None else input("You: ")
         ids = chat.render(text) + chat.final_prefill
         rendered = chat.encoding.decode_utf8(ids)
         if chat.encoding.encode(rendered, allowed_special="all") != ids:
-            raise SystemExit("round-trip Harmony degli ID fallito")
+            raise SystemExit("Harmony ID round-trip failed")
         print(json.dumps({"token_count": len(ids), "ids": ids, "rendered": rendered},
                          ensure_ascii=False, indent=2))
         return
@@ -228,9 +228,9 @@ def main():
     exe = Path(args.exe).resolve()
     model = Path(args.model).resolve()
     if not exe.is_file():
-        parser.error(f"eseguibile non trovato: {exe}")
+        parser.error(f"executable not found: {exe}")
     if not model.is_dir():
-        parser.error(f"modello non trovato: {model}")
+        parser.error(f"model not found: {model}")
 
     sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p,
                 "TOPK": args.top_k, "SEED": args.seed}
@@ -246,25 +246,25 @@ def main():
                 text = args.prompt
             else:
                 try:
-                    text = input("\nTu: ").strip()
+                    text = input("\nYou: ").strip()
                 except EOFError:
                     break
                 if not text:
                     continue
                 if text in ("/exit", "/quit"):
                     break
-            print("Assistente: ", end="", flush=True)
+            print("Assistant: ", end="", flush=True)
             replies, reason, pos = chat.ask(text, args.max_tokens, channel)
             if args.json:
                 print(json.dumps({"reason": reason, "pos": pos,
                                   "messages": [m.to_dict() for m in replies]},
                                  ensure_ascii=False, default=str, indent=2))
             elif reason not in ("RETURN", "CALL"):
-                print(f"[interrotto: {reason}]", file=sys.stderr)
+                print(f"[interrupted: {reason}]", file=sys.stderr)
             if single:
                 break
     except KeyboardInterrupt:
-        print("\nInterrotto.", file=sys.stderr)
+        print("\nInterrupted.", file=sys.stderr)
     finally:
         session.close()
 
