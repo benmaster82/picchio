@@ -1,16 +1,16 @@
-/* picchio.c — Motore MoE streaming per GPT-OSS-120B in C puro.
+/* picchio.c — Streaming MoE engine for GPT-OSS-120B in pure C.
  *
- * Architettura target: GPT-OSS-120B (117B MoE, 5.1B attivi/token)
- *   - 36 layer, 128 expert/layer, top-4
+ * Target architecture: GPT-OSS-120B (117B MoE, 5.1B active/token)
+ *   - 36 layers, 128 experts/layer, top-4
  *   - GQA (64 Q heads, 8 KV heads, group=8, head_dim=64)
- *   - RoPE standard, sliding window 128 alternato con full attention
- *   - MXFP4 quantizzazione nativa (convertita a INT4 per la v1)
+ *   - Standard RoPE, sliding window 128 alternated with full attention
+ *   - Native MXFP4 quantization (converted to INT4 for v1)
  *   - Hidden dim 2880, MoE intermediate 5760 (fused gate+up)
- *   - Expert: gate_up [5760, 2880] + down [2880, 2880] = ~12.4 MB a INT4
- *   - Vocabolario 201,088 (o200k_harmony)
+ *   - Expert: gate_up [5760, 2880] + down [2880, 2880] = ~12.4 MB at INT4
+ *   - Vocabulary 201,088 (o200k_harmony)
  *
- * Filosofia: placement decide SOLO la velocità, mai la precisione.
- * L'output è identico indipendentemente da dove risiedono gli expert.
+ * Philosophy: placement decides ONLY speed, never precision.
+ * The output is identical regardless of where the experts reside.
  *
  * Build: make picchio
  * Run:   MODEL=/path/to/gptoss_i4 ./picchio [max_tokens]
@@ -26,7 +26,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include <psapi.h>     /* GetProcessMemoryInfo per rss_gb */
+#include <psapi.h>     /* GetProcessMemoryInfo for rss_gb */
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -47,23 +47,23 @@
 #include "tok.h"
 
 /* ═══════════════════════════════════════════════════════════
- *  CONFIGURAZIONE (letta da config.json del modello)
+ *  CONFIGURATION (read from the model's config.json)
  * ═══════════════════════════════════════════════════════════ */
 
 typedef struct {
     int hidden;           /* D: hidden dimension (2880) */
-    int n_layers;         /* numero totale di layer (36) */
+    int n_layers;         /* total number of layers (36) */
     int n_heads;          /* query heads (64) */
     int n_kv_heads;       /* KV heads (8) — GQA group=8 */
-    int head_dim;         /* dimensione per testa (64) */
-    int n_experts;        /* expert per layer MoE (128) */
-    int topk;             /* expert attivi per token (4) */
-    int moe_inter;        /* intermediate dim expert: gate_up fused (5760) */
-    int dense_inter;      /* intermediate dim FFN densa (se layer densi) */
-    int vocab;            /* dimensione vocabolario (201088) */
-    int ctx_len;          /* contesto massimo (131072) */
-    int sliding_window;   /* finestra sliding attention (128) */
-    int stop_ids[8];      /* token di stop */
+    int head_dim;         /* dimension per head (64) */
+    int n_experts;        /* experts per MoE layer (128) */
+    int topk;             /* active experts per token (4) */
+    int moe_inter;        /* expert intermediate dim: gate_up fused (5760) */
+    int dense_inter;      /* dense FFN intermediate dim (if dense layers) */
+    int vocab;            /* vocabulary size (201088) */
+    int ctx_len;          /* maximum context (131072) */
+    int sliding_window;   /* sliding attention window (128) */
+    int stop_ids[8];      /* stop tokens */
     int n_stop;
     float eps;            /* RMSNorm epsilon (1e-5) */
     float theta;          /* RoPE base frequency */
@@ -75,10 +75,10 @@ typedef struct {
     float rope_attn_factor;
     float swiglu_limit;
     float swiglu_alpha;
-    float routed_scale;   /* scaling factor per expert routing */
-    int has_shared;       /* 1 se ci sono shared expert */
-    int n_shared;         /* numero di shared expert */
-    int has_attn_bias;    /* 1 se attention usa bias (sì in GPT-OSS) */
+    float routed_scale;   /* scaling factor for expert routing */
+    int has_shared;       /* 1 if there are shared experts */
+    int n_shared;         /* number of shared experts */
+    int has_attn_bias;    /* 1 if attention uses bias (yes in GPT-OSS) */
     int8_t layer_type[128]; /* per layer: 0=sliding_attention, 1=full_attention */
 } Cfg;
 
@@ -96,7 +96,7 @@ typedef struct {
     QT wv;                /* [n_kv_heads * head_dim, D] = [512, 2880] */
     QT wo;                /* [D, n_heads * head_dim] = [2880, 4096] */
 
-    /* Attention bias (GPT-OSS le ha) */
+    /* Attention bias (GPT-OSS has it) */
     float *bq;            /* [n_heads * head_dim] */
     float *bk;            /* [n_kv_heads * head_dim] */
     float *bv;            /* [n_kv_heads * head_dim] */
@@ -105,34 +105,34 @@ typedef struct {
 
     int layer_type;       /* 0=sliding_attention, 1=full_attention */
 
-    /* MoE (tutti i layer in GPT-OSS-120B sono MoE) */
-    float *router;        /* [n_experts, D] — pesi del router */
-    float *router_bias;   /* [n_experts] — bias di correzione */
+    /* MoE (all layers in GPT-OSS-120B are MoE) */
+    float *router;        /* [n_experts, D] — router weights */
+    float *router_bias;   /* [n_experts] — correction bias */
 
-    /* Expert gate_up_proj è fusa: [moe_inter, D] dove moe_inter = 5760 = 2*2880
+    /* Expert gate_up_proj is fused: [moe_inter, D] where moe_inter = 5760 = 2*2880
      * down_proj: [D, D] = [2880, 2880]
-     * I pesi degli expert NON sono nel Layer — sono caricati on-demand in ESlot */
+     * The expert weights are NOT in the Layer — they are loaded on-demand into ESlot */
 } Layer;
 
 /* ═══════════════════════════════════════════════════════════
- *  EXPERT SLOT (cache LRU, riusabile tra layer)
+ *  EXPERT SLOT (LRU cache, reusable across layers)
  * ═══════════════════════════════════════════════════════════ */
 
 typedef struct {
-    int eid;              /* expert ID (-1 = vuoto) */
-    int layer;            /* layer di appartenenza */
+    int eid;              /* expert ID (-1 = empty) */
+    int layer;            /* owning layer */
     /* GPT-OSS expert layout: gate_up fused [5760, 2880] + down [2880, 2880]
      * gate_up_proj_bias [5760], down_proj_bias [2880] */
     QT gu;                /* gate_up_proj fused [moe_inter, D] */
     QT d;                 /* down_proj [D, D] */
     float *gu_bias;       /* [moe_inter] */
     float *d_bias;        /* [D] */
-    uint8_t *slab;        /* buffer per pread coalescente */
-    float *fslab;         /* buffer scale */
-    int64_t slab_cap;     /* capacità allocata */
+    uint8_t *slab;        /* buffer for coalesced pread */
+    float *fslab;         /* scale buffer */
+    int64_t slab_cap;     /* allocated capacity */
     int64_t fslab_cap;
-    uint64_t last_used;   /* timestamp per LRU eviction */
-    int loading;          /* 1 = prefetch in corso su questo slot (atomico) */
+    uint64_t last_used;   /* timestamp for LRU eviction */
+    int loading;          /* 1 = prefetch in progress on this slot (atomic) */
 } ESlot;
 
 /* ═══════════════════════════════════════════════════════════
@@ -140,18 +140,18 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════ */
 
 typedef struct {
-    /* Per layer, per posizione: K e V di ogni KV head.
+    /* Per layer, per position: K and V of each KV head.
      * Layout: K[layer] = float[max_pos * n_kv_heads * head_dim]
      *         V[layer] = float[max_pos * n_kv_heads * head_dim]
      */
-    float **K;            /* [n_layers] puntatori a buffer K */
-    float **V;            /* [n_layers] puntatori a buffer V */
-    int max_pos;          /* posizioni allocate */
-    int cur_pos;          /* prossima posizione da scrivere */
+    float **K;            /* [n_layers] pointers to K buffers */
+    float **V;            /* [n_layers] pointers to V buffers */
+    int max_pos;          /* allocated positions */
+    int cur_pos;          /* next position to write */
 } KVCache;
 
 /* ═══════════════════════════════════════════════════════════
- *  MODELLO
+ *  MODEL
  * ═══════════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -159,46 +159,46 @@ typedef struct {
 
     QT embed;             /* embedding [vocab, D] */
     QT lm_head;           /* language model head [vocab, D] */
-    float *final_norm;    /* RMSNorm finale [D] */
+    float *final_norm;    /* final RMSNorm [D] */
 
     Layer *L;             /* [n_layers] */
     KVCache kv;
 
-    /* Cache expert per-layer */
-    ESlot **ecache;       /* [n_layers][ecap] — pool LRU */
-    int *ecn;             /* quanti expert cached per layer */
-    int ecap;             /* capacità per layer */
+    /* Per-layer expert cache */
+    ESlot **ecache;       /* [n_layers][ecap] — LRU pool */
+    int *ecn;             /* how many experts cached per layer */
+    int ecap;             /* capacity per layer */
 
-    /* Hot-store appreso */
-    ESlot **pin;          /* expert pinnati (mai evicted) */
+    /* Learned hot-store */
+    ESlot **pin;          /* pinned experts (never evicted) */
     int *npin;
-    uint32_t **eusage;    /* contatori persistenti per expert */
-    uint32_t **eheat;     /* calore recente (per promotion) */
+    uint32_t **eusage;    /* persistent per-expert counters */
+    uint32_t **eheat;     /* recent heat (for promotion) */
 
-    /* Working set del forward corrente */
-    ESlot ws[32];         /* expert in flight (max topk per batch) */
+    /* Working set of the current forward */
+    ESlot ws[32];         /* experts in flight (max topk per batch) */
 
     /* Profiling */
-    uint64_t eclock;      /* monotonic counter per LRU */
-    uint64_t hits, miss, ereq; /* statistiche cache */
-    uint64_t n_fw, n_emit;     /* forward / token emessi */
-    double t_edisk;       /* tempo totale letture expert da disco */
-    double t_attn;        /* tempo totale attention */
-    double t_moe;         /* tempo totale MoE compute */
-    double t_head;        /* tempo totale lm_head */
+    uint64_t eclock;      /* monotonic counter for LRU */
+    uint64_t hits, miss, ereq; /* cache statistics */
+    uint64_t n_fw, n_emit;     /* forwards / emitted tokens */
+    double t_edisk;       /* total time reading experts from disk */
+    double t_attn;        /* total attention time */
+    double t_moe;         /* total MoE compute time */
+    double t_head;        /* total lm_head time */
 
-    int64_t resident_bytes; /* byte della parte densa in RAM */
+    int64_t resident_bytes; /* bytes of the dense part in RAM */
 
-    /* Probe accuratezza predizione prefetch (PREDICT_PROBE=1) */
-    int pred_next[64];    /* proxy A: predetto da hn pre-MoE del layer precedente */
-    int pred_next2[64];   /* proxy B: predetto da post-MoE norm del layer precedente */
-    int pred_layer;       /* layer a cui si riferiscono le predizioni (-1 = nessuna) */
+    /* Prefetch prediction accuracy probe (PREDICT_PROBE=1) */
+    int pred_next[64];    /* proxy A: predicted from the previous layer's pre-MoE hn */
+    int pred_next2[64];   /* proxy B: predicted from the previous layer's post-MoE norm */
+    int pred_layer;       /* layer the predictions refer to (-1 = none) */
     uint64_t pred_hit, pred_total;    /* proxy A */
-    uint64_t pred_hit2;               /* proxy B (stesso pred_total) */
+    uint64_t pred_hit2;               /* proxy B (same pred_total) */
 } Model;
 
 /* ═══════════════════════════════════════════════════════════
- *  ORACLE DUMP (.npy F32, attivo solo con ORACLE_DIR)
+ *  ORACLE DUMP (.npy F32, active only with ORACLE_DIR)
  * ═══════════════════════════════════════════════════════════ */
 
 static const char *g_oracle_dir = NULL;
@@ -249,7 +249,7 @@ static void oracle_dump_vec(const char *name, const float *data, int64_t n) {
 }
 
 static int g_trace_numeric = 0;
-static int g_predict_probe = 0;   /* misura accuratezza predizione prefetch */
+static int g_predict_probe = 0;   /* measures prefetch prediction accuracy */
 
 static int trace_vector(const char *stage, int layer, const float *x, int n) {
     if (!g_trace_numeric) return 1;
@@ -314,7 +314,7 @@ static double rss_gb(void) {
     return r.ru_maxrss / (1024.0 * 1024.0);
 #endif
 #elif defined(_WIN32)
-    /* Working set corrente = RSS: pagine fisicamente residenti in RAM. */
+    /* Current working set = RSS: pages physically resident in RAM. */
     PROCESS_MEMORY_COUNTERS pmc;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
         return pmc.WorkingSetSize / (1024.0 * 1024.0 * 1024.0);
@@ -324,8 +324,8 @@ static double rss_gb(void) {
 #endif
 }
 
-/* RAM fisica totale in byte (0 se non determinabile). Usata per dimensionare il
- * budget della cache expert quando PIN_GB non è specificato. */
+/* Total physical RAM in bytes (0 if undeterminable). Used to size the expert
+ * cache budget when PIN_GB is not specified. */
 static int64_t physical_ram_bytes(void) {
 #ifdef _WIN32
     MEMORYSTATUSEX ms;
@@ -338,12 +338,12 @@ static int64_t physical_ram_bytes(void) {
     if (pages > 0 && psize > 0) return (int64_t)pages * (int64_t)psize;
     return 0;
 #else
-    return 0;  /* altre piattaforme: fallback al default fisso */
+    return 0;  /* other platforms: fall back to the fixed default */
 #endif
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  CONFIG LOADER (da config.json)
+ *  CONFIG LOADER (from config.json)
  * ═══════════════════════════════════════════════════════════ */
 
 static int cfg_load(Cfg *c, const char *model_path) {
@@ -352,7 +352,7 @@ static int cfg_load(Cfg *c, const char *model_path) {
 
     char *json = json_read_file(path);
     if (!json) {
-        fprintf(stderr, "errore: impossibile leggere %s\n", path);
+        fprintf(stderr, "error: cannot read %s\n", path);
         return -1;
     }
 
@@ -396,13 +396,13 @@ static int cfg_load(Cfg *c, const char *model_path) {
             else
                 c->layer_type[i] = 0; /* sliding */
         }
-        /* Se n_types < n_layers, cicla il pattern */
+        /* If n_types < n_layers, cycle the pattern */
         if (n_types < c->n_layers) {
             for (int i = n_types; i < c->n_layers; i++)
                 c->layer_type[i] = c->layer_type[i % n_types];
         }
     } else {
-        /* Default: alterna sliding/full */
+        /* Default: alternate sliding/full */
         for (int i = 0; i < c->n_layers; i++)
             c->layer_type[i] = (int8_t)(i % 2);
     }
@@ -414,7 +414,7 @@ static int cfg_load(Cfg *c, const char *model_path) {
 
     free(json);
 
-    /* Riepilogo */
+    /* Summary */
     fprintf(stderr, "  config: D=%d L=%d H=%d KV=%d hd=%d E=%d top%d\n",
             c->hidden, c->n_layers, c->n_heads, c->n_kv_heads,
             c->head_dim, c->n_experts, c->topk);
@@ -425,7 +425,7 @@ static int cfg_load(Cfg *c, const char *model_path) {
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  RoPE (standard, non interleaved)
+ *  RoPE (standard, not interleaved)
  * ═══════════════════════════════════════════════════════════ */
 
 static float yarn_inv_freq(const Cfg *c, int j) {
@@ -473,7 +473,7 @@ static void rope_apply(float *q, float *k, int pos, int head_dim,
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  KV-CACHE: allocazione e aggiornamento
+ *  KV-CACHE: allocation and update
  * ═══════════════════════════════════════════════════════════ */
 
 static void kv_init(KVCache *kv, int n_layers, int n_kv_heads,
@@ -514,7 +514,7 @@ static void gqa_attention(float *out, const float *x, Layer *l,
     float *k = falloc(kv_dim);
     float *v = falloc(kv_dim);
 
-    /* Proiezioni Q, K, V */
+    /* Q, K, V projections */
     matmul_qt(q, x, &l->wq, 1);
     matmul_qt(k, x, &l->wk, 1);
     matmul_qt(v, x, &l->wv, 1);
@@ -526,7 +526,7 @@ static void gqa_attention(float *out, const float *x, Layer *l,
         snprintf(n, sizeof(n), "layer%d.v_nobias", layer); oracle_dump(n, v, 3, sk);
     }
 
-    /* Add bias se presente */
+    /* Add bias if present */
     if (l->bq) for (int i = 0; i < H * hd; i++) q[i] += l->bq[i];
     if (l->bk) for (int i = 0; i < kv_dim; i++) k[i] += l->bk[i];
     if (l->bv) for (int i = 0; i < kv_dim; i++) v[i] += l->bv[i];
@@ -549,28 +549,28 @@ static void gqa_attention(float *out, const float *x, Layer *l,
         snprintf(n, sizeof(n), "layer%d.v_heads", layer); oracle_dump(n, v, 4, sk);
     }
 
-    /* Aggiorna KV-cache */
+    /* Update KV-cache */
     if (pos < kv->max_pos)
         kv_store(kv, layer, pos, k, v, kv_dim);
 
-    /* Attention: per ogni query head */
+    /* Attention: for each query head */
     float *attn_out = calloc(H * hd, sizeof(float));
 
-    /* Determina la finestra di attenzione */
+    /* Determine the attention window */
     int start_pos = 0;
     int end_pos = pos;
     if (end_pos >= kv->max_pos) end_pos = kv->max_pos - 1;
-    if (l->layer_type == 0) {  /* sliding_attention: include al massimo window token */
+    if (l->layer_type == 0) {  /* sliding_attention: include at most `window` tokens */
         start_pos = end_pos - c->sliding_window + 1;
         if (start_pos < 0) start_pos = 0;
     }
-    /* layer_type == 1: full_attention → start_pos = 0 (vede tutto) */
+    /* layer_type == 1: full_attention → start_pos = 0 (sees everything) */
 
     for (int h = 0; h < H; h++) {
-        int kv_h = h / group;  /* quale KV head */
+        int kv_h = h / group;  /* which KV head */
         float *qh = q + h * hd;
 
-        /* Score con posizioni nella finestra */
+        /* Score against positions in the window */
         int n_pos = end_pos - start_pos + 1;
         if (n_pos <= 0) n_pos = 1;
         float *scores = calloc(n_pos, sizeof(float));
@@ -583,8 +583,8 @@ static void gqa_attention(float *out, const float *x, Layer *l,
             scores[t - start_pos] = dot * scale;
         }
 
-        /* Softmax con attention sink: il sink assorbe probabilità ma non
-         * contribuisce alla somma dei value, come Transformers eager. */
+        /* Softmax with attention sink: the sink absorbs probability but does not
+         * contribute to the value sum, like Transformers eager. */
         float max_score = l->sinks ? l->sinks[h] : -INFINITY;
         for (int i = 0; i < n_pos; i++)
             if (scores[i] > max_score) max_score = scores[i];
@@ -595,7 +595,7 @@ static void gqa_attention(float *out, const float *x, Layer *l,
         }
         for (int i = 0; i < n_pos; i++) scores[i] /= sum;
 
-        /* Weighted sum dei valori */
+        /* Weighted sum of the values */
         float *oh = attn_out + h * hd;
         for (int t = start_pos; t <= end_pos; t++) {
             float *vt = kv->V[layer] + (int64_t)t * kv_dim + kv_h * hd;
@@ -623,14 +623,14 @@ static void gqa_attention(float *out, const float *x, Layer *l,
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  EXPERT LOADING (da disco, pread coalescente)
+ *  EXPERT LOADING (from disk, coalesced pread)
  * ═══════════════════════════════════════════════════════════ */
 
-/* Puntatore globale al DB safetensors (per accesso da expert_load) */
+/* Global pointer to the safetensors DB (for access from expert_load) */
 static StDB *g_db = NULL;
 
-/* Carica un bias expert dal formato corretto F32 oppure recupera il vecchio
- * formato convertito: byte INT4 salvati per errore come F32 + scale gs64. */
+/* Load an expert bias from the correct F32 format, or recover the old
+ * converted format: INT4 bytes mistakenly saved as F32 + gs64 scale. */
 static float *load_expert_bias(int layer, int eid, const char *suffix,
                                int n_experts, int n_values) {
     char name[300];
@@ -710,12 +710,12 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         return;
     }
 
-    /* ── Carica gate_up_proj: [moe_inter, D] ── */
+    /* ── Load gate_up_proj: [moe_inter, D] ── */
     snprintf(name, sizeof(name),
              "model.layers.%d.mlp.experts.gate_up_proj.%d", layer, eid);
     StTensor *t_gu = st_find(g_db, name);
 
-    /* Prova nomi alternativi */
+    /* Try alternative names */
     if (!t_gu) {
         snprintf(name, sizeof(name),
                  "model.layers.%d.mlp.experts.%d.gate_up_proj", layer, eid);
@@ -728,12 +728,12 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     }
 
     if (!t_gu) {
-        /* Expert non trovato nel DB (potrebbe essere in un shard non caricato) */
+        /* Expert not found in the DB (it may be in a shard that was not loaded) */
         s->eid = -1;
         return;
     }
 
-    /* Carica come F32 e quantizza a INT4 */
+    /* Load as F32 and quantize to INT4 */
     int64_t gu_numel = (int64_t)I * D;
     float *gu_f32 = falloc(gu_numel);
 
@@ -756,7 +756,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         gu_f32 = NULL;
         goto gate_up_loaded;
     } else if (t_gu->dtype == ST_U8) {
-        /* Già INT4 packed — carica direttamente */
+        /* Already INT4 packed — load directly */
         memset(&s->gu, 0, sizeof(QT));
         s->gu.fmt = 2;
         s->gu.O = I;
@@ -764,7 +764,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         int64_t rb = (int64_t)I * ((D + 1) / 2);
         s->gu.q4 = (uint8_t *)malloc(rb);
         st_read_raw(g_db, t_gu, s->gu.q4, rb);
-        /* Cerca scale */
+        /* Look for scales */
         snprintf(name, sizeof(name),
                  "model.layers.%d.mlp.experts.gate_up_proj.%d.qs", layer, eid);
         StTensor *t_s = st_find(g_db, name);
@@ -777,7 +777,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
             int64_t n_scale = st_numel(t_s);
             s->gu.s = (float *)malloc(n_scale * sizeof(float));
             st_read_raw(g_db, t_s, s->gu.s, n_scale * sizeof(float));
-            /* Determina block_size: se n_scale > O → group-scaled */
+            /* Determine block_size: if n_scale > O → group-scaled */
             if (n_scale > I) {
                 s->gu.block_size = (int)((int64_t)I * D / n_scale);
                 if (s->gu.block_size <= 0) s->gu.block_size = 64;
@@ -796,11 +796,11 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     }
 
 gate_up_loaded:
-    /* ── Carica gate_up bias (supporta anche il vecchio bias INT4+qs) ── */
+    /* ── Load gate_up bias (also supports the old INT4+qs bias) ── */
     s->gu_bias = load_expert_bias(layer, eid, "gate_up_proj_bias",
                                   c->n_experts, I);
 
-    /* ── Carica down_proj: [D, D] ── */
+    /* ── Load down_proj: [D, D] ── */
     snprintf(name, sizeof(name),
              "model.layers.%d.mlp.experts.down_proj.%d", layer, eid);
     StTensor *t_d = st_find(g_db, name);
@@ -815,7 +815,7 @@ gate_up_loaded:
         t_d = st_find(g_db, name);
     }
 
-    int down_I = I / 2;  /* input dimension del down = intermediate_size */
+    int down_I = I / 2;  /* input dimension of down = intermediate_size */
     if (t_d) {
         int64_t d_numel = (int64_t)D * down_I;
         float *d_f32 = falloc(d_numel);
@@ -839,7 +839,7 @@ gate_up_loaded:
             d_f32 = NULL;
             goto down_loaded;
         } else if (t_d->dtype == ST_U8) {
-            /* Già INT4 packed */
+            /* Already INT4 packed */
             memset(&s->d, 0, sizeof(QT));
             s->d.fmt = 2;
             s->d.O = D;
@@ -876,24 +876,24 @@ gate_up_loaded:
             return;
         }
     } else {
-        s->eid = -1;  /* Expert incompleto */
+        s->eid = -1;  /* Incomplete expert */
         return;
     }
 
 down_loaded:
-    /* ── Down bias (supporta anche il vecchio bias INT4+qs) ── */
+    /* ── Down bias (also supports the old INT4+qs bias) ── */
     s->d_bias = load_expert_bias(layer, eid, "down_proj_bias",
                                  c->n_experts, D);
     return;
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  EXPERT CACHE: lookup LRU + eviction
+ *  EXPERT CACHE: LRU lookup + eviction
  * ═══════════════════════════════════════════════════════════ */
 
-/* Flag `loading` di uno slot: 1 mentre il thread di prefetch lo sta riempiendo.
- * Release/acquire garantiscono che, quando il main osserva loading==0, veda anche
- * i buffer scritti dal prefetch. */
+/* A slot's `loading` flag: 1 while the prefetch thread is filling it.
+ * Release/acquire guarantee that, when the main thread observes loading==0, it
+ * also sees the buffers written by the prefetch. */
 static inline int slot_loading(ESlot *s) {
     return __atomic_load_n(&s->loading, __ATOMIC_ACQUIRE);
 }
@@ -927,7 +927,7 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
     ESlot *pool = m->ecache[layer];
     int n = m->ecn[layer];
 
-    /* Cerca nei pinned */
+    /* Look in the pinned set */
     for (int i = 0; i < m->npin[layer]; i++) {
         if (m->pin[layer][i].eid == eid) {
             m->pin[layer][i].last_used = ++m->eclock;
@@ -936,7 +936,7 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
         }
     }
 
-    /* Cerca nella cache LRU */
+    /* Look in the LRU cache */
     for (int i = 0; i < n; i++) {
         if (pool[i].eid == eid) {
             pool[i].last_used = ++m->eclock;
@@ -947,7 +947,7 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
 
     m->miss++;
 
-    /* Cache miss: evict LRU o usa slot vuoto */
+    /* Cache miss: evict LRU or use an empty slot */
     ESlot *victim = NULL;
     if (n < m->ecap) {
         victim = &pool[n];
@@ -962,10 +962,10 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
         }
     }
 
-    /* Carica da disco */
+    /* Load from disk */
     double t0 = now_s();
-    
-    /* Free vecchi dati se lo slot era occupato (eviction) */
+
+    /* Free old data if the slot was occupied (eviction) */
     if (victim->eid >= 0) {
         free(victim->gu.qf); victim->gu.qf = NULL;
         free(victim->gu.q4); victim->gu.q4 = NULL;
@@ -988,22 +988,22 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
     return victim;
 }
 
-/* Numero di thread per i read paralleli degli expert (1 = seriale). */
+/* Number of threads for parallel expert reads (1 = serial). */
 static int g_io_threads = 1;
 
-/* Carica in batch gli expert `eids[0..n)` del layer, restituendo gli slot in
- * `out`. Gli hit vengono risolti e "toccati" (LRU) per primi, così i victim
- * scelti per i miss non possono sfrattare né un hit né un miss già riservato;
- * i miss vengono poi letti da disco in parallelo (queue depth > 1). La
- * matematica non cambia: si leggono gli stessi byte negli stessi slot, solo in
- * ordine concorrente. Contratto: n <= ecap (garantito da chi chiama). */
+/* Batch-load the experts `eids[0..n)` of the layer, returning the slots in
+ * `out`. Hits are resolved and "touched" (LRU) first, so the victims chosen for
+ * the misses cannot evict either a hit or a miss already reserved; the misses
+ * are then read from disk in parallel (queue depth > 1). The math does not
+ * change: the same bytes are read into the same slots, only in concurrent
+ * order. Contract: n <= ecap (guaranteed by the caller). */
 static void cache_load_batch(Model *m, int layer, const int *eids, int n,
                              ESlot **out) {
     ESlot *pool = m->ecache[layer];
     int miss_i[128];
     int nmiss = 0;
 
-    /* Pass 1: risolvi gli hit (pinned o LRU) e marcali come appena usati. */
+    /* Pass 1: resolve the hits (pinned or LRU) and mark them as just used. */
     for (int i = 0; i < n; i++) {
         ESlot *found = NULL;
         for (int j = 0; j < m->npin[layer]; j++)
@@ -1012,7 +1012,7 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
             for (int j = 0; j < m->ecn[layer]; j++)
                 if (pool[j].eid == eids[i]) { found = &pool[j]; break; }
         if (found) {
-            slot_wait_ready(found);  /* se un prefetch sta caricando questo expert, attendi */
+            slot_wait_ready(found);  /* if a prefetch is loading this expert, wait */
             found->last_used = ++m->eclock;
             m->hits++;
             out[i] = found;
@@ -1022,10 +1022,10 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
         }
     }
 
-    /* Pass 2: riserva un victim per ogni miss (seriale: nessuna race su LRU).
-     * Gli slot con prefetch in corso (loading) non vengono mai scelti come victim;
-     * l'invariante ecap-topk garantito da prefetch_issue assicura che restino
-     * abbastanza slot liberi. */
+    /* Pass 2: reserve a victim for each miss (serial: no race on the LRU).
+     * Slots with a prefetch in progress (loading) are never chosen as victims;
+     * the ecap-topk invariant guaranteed by prefetch_issue ensures that enough
+     * free slots remain. */
     for (int mi = 0; mi < nmiss; mi++) {
         int i = miss_i[mi];
         ESlot *victim = NULL;
@@ -1037,12 +1037,12 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
                 if (slot_loading(&pool[j])) continue;
                 if (pool[j].last_used < oldest) { oldest = pool[j].last_used; victim = &pool[j]; }
             }
-            if (!victim) {  /* estrema difesa: attendi il primo slot in prefetch */
+            if (!victim) {  /* last-resort defense: wait for the first prefetching slot */
                 victim = &pool[0]; slot_wait_ready(victim);
             }
         }
         if (victim->eid >= 0) free_slot_buffers(victim);
-        victim->eid = eids[i];   /* riservato: verrà popolato in pass 3 */
+        victim->eid = eids[i];   /* reserved: it will be populated in pass 3 */
         victim->layer = layer;
         victim->last_used = ++m->eclock;
         m->miss++;
@@ -1050,10 +1050,9 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
         out[i] = victim;
     }
 
-    /* Pass 3: leggi i miss da disco, in parallelo se abilitato. Gli slot sono
-     * distinti, expert_load scrive solo nel proprio slot e legge g_db in sola
-     * lettura → nessuna sincronizzazione necessaria oltre agli handle per-thread
-     * di st.h. */
+    /* Pass 3: read the misses from disk, in parallel if enabled. The slots are
+     * distinct, expert_load writes only into its own slot and reads g_db
+     * read-only → no synchronization needed beyond st.h's per-thread handles. */
     if (nmiss > 0) {
         double t0 = now_s();
 #ifdef _OPENMP
@@ -1069,20 +1068,20 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  PREFETCH → LRU (thread separato, popola direttamente la cache)
+ *  PREFETCH → LRU (separate thread, populates the cache directly)
  *
- *  Il thread principale, a fine layer L, predice il top-k del layer L+1
- *  (proxy post-MoE, ~89% accurato sul 20B), RISERVA gli slot LRU per quegli
- *  expert e li passa a un thread che li legge da disco. Durante l'attention
- *  di L+1 il thread riempie gli slot; quando moe_forward(L+1) li richiede,
- *  sono già in cache. A differenza del vecchio PILOT (che scaldava solo la
- *  cache dell'OS → doppia lettura → −11%), qui non c'è seconda lettura.
+ *  At the end of layer L, the main thread predicts the top-k of layer L+1
+ *  (post-MoE proxy, ~89% accurate on the 20B), RESERVES the LRU slots for those
+ *  experts, and hands them to a thread that reads them from disk. During the
+ *  attention of L+1 the thread fills the slots; when moe_forward(L+1) requests
+ *  them, they are already in cache. Unlike the old PILOT (which only warmed the
+ *  OS cache → double read → −11%), here there is no second read.
  *
- *  Sicurezza: solo il main muta la LRU (riserva). Il thread scrive esclusiva-
- *  mente nei buffer degli slot riservati e imposta loading=0 (release) a fine
- *  lettura; il main attende loading==0 (acquire) prima di usare uno slot.
- *  prefetch_issue riserva al più (ecap − topk) slot, così restano sempre
- *  abbastanza slot non-loading per il routing reale.
+ *  Safety: only the main thread mutates the LRU (reservation). The thread writes
+ *  exclusively into the buffers of the reserved slots and sets loading=0
+ *  (release) when the read finishes; the main thread waits for loading==0
+ *  (acquire) before using a slot. prefetch_issue reserves at most (ecap − topk)
+ *  slots, so there are always enough non-loading slots for the real routing.
  * ═══════════════════════════════════════════════════════════ */
 
 #ifndef _WIN32
@@ -1098,7 +1097,7 @@ typedef struct {
     int    eids[64];
     volatile int has_job;
     volatile int shutdown;
-    uint64_t issued;      /* expert totali messi in prefetch */
+    uint64_t issued;      /* total experts submitted for prefetch */
 #ifdef _WIN32
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
@@ -1111,9 +1110,9 @@ typedef struct {
 } Prefetch;
 
 static Prefetch g_pf;
-static int g_pilot_enabled = 0;   /* nome storico: usato da main() */
+static int g_pilot_enabled = 0;   /* historical name: used by main() */
 
-/* ── Primitive di lock/segnale, 1 = successo per trylock su entrambe ── */
+/* ── Lock/signal primitives, 1 = success for trylock on both platforms ── */
 #ifdef _WIN32
 static int  pf_trylock(void) { return TryEnterCriticalSection(&g_pf.cs) != 0; }
 static void pf_lock(void)    { EnterCriticalSection(&g_pf.cs); }
@@ -1126,9 +1125,9 @@ static void pf_unlock(void)  { pthread_mutex_unlock(&g_pf.mutex); }
 static void pf_signal(void)  { pthread_cond_signal(&g_pf.cond); }
 #endif
 
-/* Corpo del worker: legge da disco ogni slot riservato e lo marca pronto. Gli
- * slot sono distinti ed expert_load è thread-safe (handle per-thread in st.h),
- * quindi il caricamento di un blocco usa gli stessi IO_THREADS del percorso sync. */
+/* Worker body: reads each reserved slot from disk and marks it ready. The slots
+ * are distinct and expert_load is thread-safe (per-thread handles in st.h), so
+ * loading a block uses the same IO_THREADS as the sync path. */
 static void prefetch_run_job(void) {
     int n = g_pf.n, layer = g_pf.layer;
     Model *m = g_pf.m;
@@ -1139,7 +1138,7 @@ static void prefetch_run_job(void) {
     for (int i = 0; i < n; i++) {
         if (!g_pf.shutdown)
             expert_load(m, layer, g_pf.eids[i], g_pf.slots[i]);
-        slot_set_loading(g_pf.slots[i], 0);  /* pronto (o abortito da shutdown) */
+        slot_set_loading(g_pf.slots[i], 0);  /* ready (or aborted by shutdown) */
     }
 }
 
@@ -1186,29 +1185,29 @@ static void pilot_init(Model *m) {
     g_pf.thread = CreateThread(NULL, 0, prefetch_thread, NULL, 0, NULL);
     if (!g_pf.thread) {
         DeleteCriticalSection(&g_pf.cs);
-        fprintf(stderr, "  ⚠ prefetch: creazione thread fallita\n");
+        fprintf(stderr, "  ⚠ prefetch: thread creation failed\n");
         return;
     }
 #else
     pthread_mutex_init(&g_pf.mutex, NULL);
     pthread_cond_init(&g_pf.cond, NULL);
     if (pthread_create(&g_pf.thread, NULL, prefetch_thread, NULL) != 0) {
-        fprintf(stderr, "  ⚠ prefetch: creazione thread fallita\n");
+        fprintf(stderr, "  ⚠ prefetch: thread creation failed\n");
         return;
     }
 #endif
     g_pilot_enabled = 1;
 }
 
-/* Main thread: riserva gli slot LRU per gli expert predetti `pred[0..k)` del
- * `layer` e li affida al worker. Non attende: se il worker è ancora occupato o
- * il lock è conteso, salta questo round (il prefetch è best-effort). */
+/* Main thread: reserves the LRU slots for the predicted experts `pred[0..k)` of
+ * `layer` and hands them to the worker. Does not wait: if the worker is still
+ * busy or the lock is contended, it skips this round (prefetch is best-effort). */
 static void prefetch_issue(Model *m, int layer, const int *pred, int k) {
     if (!g_pilot_enabled || layer < 0 || layer >= m->c.n_layers) return;
-    int max_reserve = m->ecap - m->c.topk;   /* lascia sempre topk slot al routing */
+    int max_reserve = m->ecap - m->c.topk;   /* always leave topk slots for routing */
     if (max_reserve <= 0) return;
     if (!pf_trylock()) return;
-    if (g_pf.has_job) { pf_unlock(); return; }   /* job precedente ancora in corso */
+    if (g_pf.has_job) { pf_unlock(); return; }   /* previous job still running */
 
     ESlot *pool = m->ecache[layer];
     int n = 0;
@@ -1273,7 +1272,7 @@ static void pilot_shutdown(void) {
     pthread_mutex_destroy(&g_pf.mutex);
     pthread_cond_destroy(&g_pf.cond);
 #endif
-    fprintf(stderr, "prefetch: %llu expert messi in prefetch\n",
+    fprintf(stderr, "prefetch: %llu experts submitted for prefetch\n",
             (unsigned long long)g_pf.issued);
     g_pilot_enabled = 0;
 }
@@ -1282,9 +1281,9 @@ static void pilot_shutdown(void) {
  *  MOE FORWARD (single token)
  * ═══════════════════════════════════════════════════════════ */
 
-/* Probe: predice il top-k del router del layer `nl` applicato all'input `x` (già
- * normalizzato) e lo scrive in `out`. Non altera la matematica: serve solo a
- * misurare l'accuratezza di due proxy per il prefetch. */
+/* Probe: predicts the top-k of layer `nl`'s router applied to the input `x`
+ * (already normalized) and writes it into `out`. Does not alter the math: it
+ * only measures the accuracy of two proxies for the prefetch. */
 static void predict_topk_into(Model *m, int nl, const float *x,
                               const Cfg *c, int *out) {
     int D = c->hidden, E = c->n_experts, K = c->topk;
@@ -1314,7 +1313,7 @@ static void moe_forward(float *out, const float *x, Model *m,
     int K = c->topk;
     Layer *l = &m->L[layer];
 
-    /* 1. Router: calcola score per ogni expert */
+    /* 1. Router: compute a score for each expert */
     float *scores = falloc(E);
     for (int e = 0; e < E; e++) {
         float dot = 0;
@@ -1325,8 +1324,8 @@ static void moe_forward(float *out, const float *x, Model *m,
     }
 
     /* 2. Top-K selection */
-    int sel[64];          /* expert selezionati */
-    float weights[64];    /* pesi corrispondenti */
+    int sel[64];          /* selected experts */
+    float weights[64];    /* corresponding weights */
 
     for (int k = 0; k < K; k++) {
         int best = -1;
@@ -1340,8 +1339,8 @@ static void moe_forward(float *out, const float *x, Model *m,
         weights[k] = best_s;
     }
 
-    /* Probe: confronta il routing reale di questo layer con i due proxy predetti
-     * per esso durante il layer precedente. */
+    /* Probe: compare this layer's real routing with the two proxies predicted
+     * for it during the previous layer. */
     if (g_predict_probe && m->pred_layer == layer) {
         for (int k = 0; k < K; k++) {
             for (int j = 0; j < K; j++)
@@ -1352,7 +1351,7 @@ static void moe_forward(float *out, const float *x, Model *m,
         m->pred_total += K;
     }
 
-    /* 3. Normalizza pesi (softmax sui top-k) */
+    /* 3. Normalize weights (softmax over the top-k) */
     softmax(weights, K);
     if (g_trace_numeric) {
         fprintf(stderr, "  numeric route L=%d:", layer);
@@ -1373,7 +1372,7 @@ static void moe_forward(float *out, const float *x, Model *m,
         free(sel_f);
     }
 
-    /* 4. Aggiorna statistiche di routing */
+    /* 4. Update routing statistics */
     for (int k = 0; k < K; k++) {
         if (m->eusage[layer])
             m->eusage[layer][sel[k]]++;
@@ -1381,9 +1380,9 @@ static void moe_forward(float *out, const float *x, Model *m,
             m->eheat[layer][sel[k]]++;
     }
 
-    /* 5. Carica e computa ogni expert.
-     * I K expert selezionati (unici, K <= ecap) vengono precaricati in un solo
-     * batch: i miss sono letti da disco in parallelo prima del calcolo. */
+    /* 5. Load and compute each expert.
+     * The K selected experts (unique, K <= ecap) are prefetched in a single
+     * batch: the misses are read from disk in parallel before computing. */
     float *expert_out = calloc(D, sizeof(float));
     memset(out, 0, D * sizeof(float));
 
@@ -1392,12 +1391,12 @@ static void moe_forward(float *out, const float *x, Model *m,
 
     for (int k = 0; k < K; k++) {
         ESlot *es = slots[k];
-        if (es->eid < 0) continue;  /* errore di caricamento */
+        if (es->eid < 0) continue;  /* load error */
 
         int I = c->moe_inter;  /* 5760 = gate_up fused */
         float *gu = falloc(I);
 
-        /* gate_up fused: una matmul per [5760, 2880] × x */
+        /* gate_up fused: one matmul for [5760, 2880] × x */
         matmul_qt(gu, x, &es->gu, 1);
         if (es->gu_bias) {
             for (int i = 0; i < I; i++) gu[i] += es->gu_bias[i];
@@ -1442,7 +1441,7 @@ static void moe_forward(float *out, const float *x, Model *m,
             int64_t sh[2] = {1, D}; oracle_dump(n, expert_out, 2, sh);
         }
 
-        /* Accumula pesato */
+        /* Accumulate weighted */
         float w = weights[k] * c->routed_scale;
         if (g_oracle_dir) {
             float *contrib = falloc(D);
@@ -1457,7 +1456,7 @@ static void moe_forward(float *out, const float *x, Model *m,
         free(gu);
     }
 
-    /* 6. (GPT-OSS non ha shared expert — tutti i layer sono MoE puri) */
+    /* 6. (GPT-OSS has no shared expert — all layers are pure MoE) */
     if (g_oracle_dir) {
         char n[128]; snprintf(n, sizeof(n), "layer%d.moe_out", layer);
         oracle_dump_vec(n, out, D);
@@ -1507,13 +1506,13 @@ static void embed_token(Model *m, int tok, float *x) {
  *  SAMPLING (temperature, top-p, top-k, repetition penalty)
  * ═══════════════════════════════════════════════════════════ */
 
-/* Parametri di sampling (letti dall'ambiente) */
+/* Sampling parameters (read from the environment) */
 static float g_temperature = 1.0f;
 static float g_top_p = 0.95f;
 static int   g_top_k = 50;
 static float g_rep_penalty = 1.1f;
 
-/* Storico token per repetition penalty */
+/* Token history for the repetition penalty */
 static int g_history[4096];
 static int g_history_len = 0;
 
@@ -1526,7 +1525,7 @@ static float rng_float(void) {
     return (float)(g_rng >> 33) / (float)(1ULL << 31);
 }
 
-/* Comparatore per sort decrescente */
+/* Comparator for descending sort */
 typedef struct { float val; int idx; } IdxVal;
 static int cmp_desc(const void *a, const void *b) {
     float fa = ((const IdxVal *)a)->val;
@@ -1565,10 +1564,10 @@ static int sample_logits(float *logits, int vocab) {
     float inv_temp = 1.0f / g_temperature;
     for (int i = 0; i < vocab; i++) logits[i] *= inv_temp;
 
-    /* 3. Top-K: tieni solo i K logits più alti.
-     * La soglia è il K-esimo valore più grande, trovato ordinando una copia
-     * dei logits (O(vocab·log vocab), indipendente da K: nessun tetto su K).
-     * Gli eventuali pareggi sulla soglia restano inclusi, come di consueto. */
+    /* 3. Top-K: keep only the K highest logits.
+     * The threshold is the K-th largest value, found by sorting a copy of the
+     * logits (O(vocab·log vocab), independent of K: no cap on K).
+     * Any ties at the threshold stay included, as usual. */
     if (g_top_k > 0 && g_top_k < vocab) {
         float *scratch = (float *)malloc((size_t)vocab * sizeof(float));
         if (scratch) {
@@ -1593,8 +1592,8 @@ static int sample_logits(float *logits, int vocab) {
 
     /* 5. Top-P (nucleus sampling) */
     if (g_top_p < 1.0f && g_top_p > 0.0f) {
-        /* Ordina per probabilità decrescente (solo quelli > 0) */
-        /* Per efficienza: raccogliamo solo i non-zero */
+        /* Sort by descending probability (only the > 0 ones) */
+        /* For efficiency: collect only the non-zero ones */
         int n_active = 0;
         for (int i = 0; i < vocab; i++)
             if (logits[i] > 1e-10f) n_active++;
@@ -1607,19 +1606,19 @@ static int sample_logits(float *logits, int vocab) {
             
             qsort(sorted, n_active, sizeof(IdxVal), cmp_desc);
             
-            /* Accumula fino a top_p */
+            /* Accumulate up to top_p */
             float cum = 0;
             int cutoff = n_active;
             for (int i = 0; i < n_active; i++) {
                 cum += sorted[i].val;
                 if (cum >= g_top_p) { cutoff = i + 1; break; }
             }
-            
-            /* Azzera tutto oltre il cutoff */
+
+            /* Zero out everything beyond the cutoff */
             for (int i = cutoff; i < n_active; i++)
                 logits[sorted[i].idx] = 0.0f;
-            
-            /* Rinormalizza */
+
+            /* Renormalize */
             sum = 0;
             for (int i = 0; i < vocab; i++) sum += logits[i];
             if (sum > 0) for (int i = 0; i < vocab; i++) logits[i] /= sum;
@@ -1628,7 +1627,7 @@ static int sample_logits(float *logits, int vocab) {
         }
     }
 
-    /* 6. Campiona dalla distribuzione */
+    /* 6. Sample from the distribution */
     float r = rng_float();
     float cum = 0;
     for (int i = 0; i < vocab; i++) {
@@ -1639,7 +1638,7 @@ static int sample_logits(float *logits, int vocab) {
         }
     }
     
-    /* Fallback: ultimo token con probabilità > 0 */
+    /* Fallback: last token with probability > 0 */
     for (int i = vocab - 1; i >= 0; i--) {
         if (logits[i] > 0) {
             if (g_history_len < 4096) g_history[g_history_len++] = i;
@@ -1650,7 +1649,7 @@ static int sample_logits(float *logits, int vocab) {
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  FORWARD PASS (un token, decode)
+ *  FORWARD PASS (one token, decode)
  * ═══════════════════════════════════════════════════════════ */
 
 static int forward_token(Model *m, int tok, int pos) {
@@ -1658,9 +1657,9 @@ static int forward_token(Model *m, int tok, int pos) {
     int D = c->hidden;
 
     float *h = falloc(D);           /* hidden state */
-    float *hn = falloc(D);          /* hidden normalizzato */
-    float *attn_out = falloc(D);    /* output attention */
-    float *ffn_out = falloc(D);     /* output FFN/MoE */
+    float *hn = falloc(D);          /* normalized hidden */
+    float *attn_out = falloc(D);    /* attention output */
+    float *ffn_out = falloc(D);     /* FFN/MoE output */
 
     /* Embedding */
     embed_token(m, tok, h);
@@ -1703,13 +1702,13 @@ static int forward_token(Model *m, int tok, int pos) {
             oracle_dump_vec(dump_name, hn, D);
         }
 
-        /* MoE (tutti i layer in GPT-OSS sono MoE) */
+        /* MoE (all layers in GPT-OSS are MoE) */
         double tm = now_s();
 
         moe_forward(ffn_out, hn, m, l, c);
 
-        /* Probe proxy A: predici il top-k di l+1 da hn (norm pre-MoE di l). hn
-         * non serve più dopo moe_forward, quindi verrà riusato come scratch. */
+        /* Probe proxy A: predict the top-k of l+1 from hn (pre-MoE norm of l). hn
+         * is no longer needed after moe_forward, so it will be reused as scratch. */
         if (g_predict_probe && l + 1 < c->n_layers)
             predict_topk_into(m, l + 1, hn, c, m->pred_next);
         m->t_moe += now_s() - tm;
@@ -1717,10 +1716,10 @@ static int forward_token(Model *m, int tok, int pos) {
         /* Residual */
         for (int i = 0; i < D; i++) h[i] += ffn_out[i];
 
-        /* Proxy B: predici il top-k di l+1 dallo stato post-MoE di l normalizzato
-         * col post_ln di l+1 (manca solo l'attention di l+1, ~89% accurato). È il
-         * segnale sia del probe sia del prefetch→LRU, che riserva quegli expert e
-         * li carica durante l'attention di l+1. */
+        /* Proxy B: predict the top-k of l+1 from l's post-MoE state normalized
+         * with l+1's post_ln (only l+1's attention is missing, ~89% accurate). It
+         * is the signal for both the probe and the prefetch→LRU, which reserves
+         * those experts and loads them during l+1's attention. */
         if ((g_predict_probe || g_pilot_enabled) && l + 1 < c->n_layers) {
             rmsnorm(hn, h, m->L[l + 1].post_ln, D, c->eps);
             predict_topk_into(m, l + 1, hn, c, m->pred_next2);
@@ -1757,16 +1756,16 @@ static int forward_token(Model *m, int tok, int pos) {
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  PREFILL BATCHED (batch-union degli expert)
+ *  BATCHED PREFILL (expert batch-union)
  *
- *  Elaborando più posizioni insieme, ogni expert unico del layer viene letto
- *  una sola volta invece di una volta per token. Con cache da 4 slot per layer
- *  e top-4, il percorso token-per-token sfratta l'intera cache a ogni token.
- *  La matematica è identica al percorso sequenziale: cambia solo l'ordine
- *  delle letture, mai il routing o la precisione.
+ *  By processing several positions together, each unique expert of the layer is
+ *  read only once instead of once per token. With a 4-slot-per-layer cache and
+ *  top-4, the token-by-token path evicts the entire cache at every token.
+ *  The math is identical to the sequential path: only the order of the reads
+ *  changes, never the routing or the precision.
  * ═══════════════════════════════════════════════════════════ */
 
-/* Applica un expert a x e accumula w * output in dst. */
+/* Apply an expert to x and accumulate w * output into dst. */
 static void expert_apply(ESlot *es, const float *x, float *dst, float w,
                          const Cfg *c) {
     int D = c->hidden, I = c->moe_inter, half = I / 2;
@@ -1791,8 +1790,8 @@ static void expert_apply(ESlot *es, const float *x, float *dst, float w,
     free(gu); free(eo);
 }
 
-/* Prefill di n token a partire da pos_base. Ritorna il token campionato
- * dall'ultima posizione, come farebbe l'ultimo forward_token sequenziale. */
+/* Prefill n tokens starting at pos_base. Returns the token sampled from the last
+ * position, as the last sequential forward_token would. */
 static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk;
@@ -1807,7 +1806,7 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
     int *uniq = (int *)malloc((size_t)E * sizeof(int));
     unsigned char *seen = (unsigned char *)malloc((size_t)E);
     if (!H || !XN || !sel_all || !w_all || !uniq || !seen) {
-        fprintf(stderr, "errore: memoria insufficiente per il prefill batched\n");
+        fprintf(stderr, "error: not enough memory for the batched prefill\n");
         exit(1);
     }
 
@@ -1816,7 +1815,7 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
     for (int l = 0; l < c->n_layers; l++) {
         Layer *ly = &m->L[l];
 
-        /* Attention: in ordine di posizione, così la KV precedente è pronta. */
+        /* Attention: in position order, so the previous KV is ready. */
         double ta = now_s();
         for (int p = 0; p < n; p++) {
             float *h = H + (int64_t)p * D;
@@ -1827,7 +1826,7 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
         m->t_attn += now_s() - ta;
 
         double tm = now_s();
-        /* Routing di tutte le posizioni, poi unione degli expert richiesti. */
+        /* Routing of all positions, then the union of the requested experts. */
         memset(seen, 0, (size_t)E);
         int n_uniq = 0;
         for (int p = 0; p < n; p++) {
@@ -1860,23 +1859,23 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
             }
         }
 
-        /* Un expert unico → una sola lettura, riusata da tutte le posizioni.
-         * Il buffer va azzerato: expert_apply accumula. Gli expert unici del
-         * batch superano spesso la capacità della cache, quindi si procede a
-         * blocchi: ogni blocco viene letto da disco in parallelo (queue depth > 1)
-         * e poi applicato a tutte le posizioni.
+        /* One unique expert → a single read, reused by all positions.
+         * The buffer must be zeroed: expert_apply accumulates. The batch's unique
+         * experts often exceed the cache capacity, so we proceed in blocks: each
+         * block is read from disk in parallel (queue depth > 1) and then applied
+         * to all positions.
          *
-         * Con prefetch attivo (PREFETCH=1) i blocchi sono dimezzati (due entrano
-         * in cache) e si esegue un pipeline a doppio buffer: mentre si calcola il
-         * blocco corrente (matmul su n posizioni, disco idle), il blocco successivo
-         * — già noto in uniq[], quindi prefetch ESATTO senza predizione — viene
-         * caricato dal thread di prefetch. La matematica non cambia. */
+         * With prefetch enabled (PREFETCH=1) the blocks are halved (two fit in the
+         * cache) and a double-buffer pipeline runs: while the current block is
+         * computed (matmul over n positions, disk idle), the next block — already
+         * known in uniq[], hence an EXACT prefetch with no prediction — is loaded
+         * by the prefetch thread. The math does not change. */
         float *moe = (float *)calloc((size_t)n * D, sizeof(float));
-        if (!moe) { fprintf(stderr, "errore: memoria MoE\n"); exit(1); }
+        if (!moe) { fprintf(stderr, "error: MoE memory\n"); exit(1); }
         int chunk = m->ecap < 128 ? m->ecap : 128;
         if (g_pilot_enabled) {
-            int half = m->ecap / 2;                 /* due blocchi in cache */
-            int cap  = m->ecap - c->topk;           /* invariante di prefetch_issue */
+            int half = m->ecap / 2;                 /* two blocks in cache */
+            int cap  = m->ecap - c->topk;           /* prefetch_issue invariant */
             if (half < 1) half = 1;
             if (cap >= 1 && half > cap) half = cap;
             if (half >= 1) chunk = half;
@@ -1884,11 +1883,11 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
         ESlot *slots[128];
         for (int base = 0; base < n_uniq; base += chunk) {
             int cnt = n_uniq - base < chunk ? n_uniq - base : chunk;
-            /* Rendi disponibile il blocco corrente: sincrono al primo giro,
-             * altrimenti servito (con attesa) dal prefetch del giro precedente. */
+            /* Make the current block available: synchronous on the first round,
+             * otherwise served (with a wait) by the previous round's prefetch. */
             cache_load_batch(m, l, uniq + base, cnt, slots);
-            /* Avvia il caricamento async del blocco successivo, che si sovrappone
-             * al calcolo di questo blocco. */
+            /* Start the async load of the next block, which overlaps with the
+             * computation of this block. */
             if (g_pilot_enabled && base + chunk < n_uniq) {
                 int nbase = base + chunk;
                 int ncnt = n_uniq - nbase < chunk ? n_uniq - nbase : chunk;
@@ -1918,7 +1917,7 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
         m->t_moe += now_s() - tm;
     }
 
-    /* Solo l'ultima posizione produce i logits utili. */
+    /* Only the last position produces the useful logits. */
     rmsnorm(hn, H + (int64_t)(n - 1) * D, m->final_norm, D, c->eps);
     double th = now_s();
     float *logits = falloc(c->vocab);
@@ -1932,8 +1931,8 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
     return sampled;
 }
 
-/* Prefill a blocchi. Ricade sul percorso sequenziale quando servono i dump
- * oracle, il tracing o una repetition penalty che dipende dallo storico. */
+/* Block prefill. Falls back to the sequential path when the oracle dumps, the
+ * tracing, or a repetition penalty that depends on the history are needed. */
 static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
     int batch = 64;
     { const char *v = getenv("PREFILL_BATCH"); if (v) batch = atoi(v); }
@@ -1957,7 +1956,7 @@ static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  STATISTICHE
+ *  STATISTICS
  * ═══════════════════════════════════════════════════════════ */
 
 static void stats_dump(Model *m) {
@@ -1980,19 +1979,19 @@ static void stats_dump(Model *m) {
     if (m->pred_total > 0) {
         double accA = 100.0 * m->pred_hit  / m->pred_total;
         double accB = 100.0 * m->pred_hit2 / m->pred_total;
-        double baseline = 100.0 * m->c.topk / m->c.n_experts;  /* overlap casuale atteso */
-        fprintf(stderr, "prefetch predict (%llu campioni, casuale ~%.1f%%):\n",
+        double baseline = 100.0 * m->c.topk / m->c.n_experts;  /* expected random overlap */
+        fprintf(stderr, "prefetch predict (%llu samples, random ~%.1f%%):\n",
                 (unsigned long long)m->pred_total, baseline);
-        fprintf(stderr, "  proxy A (hn pre-MoE):   %.1f%% expert corretti\n", accA);
-        fprintf(stderr, "  proxy B (post-MoE norm): %.1f%% expert corretti\n", accB);
+        fprintf(stderr, "  proxy A (hn pre-MoE):   %.1f%% correct experts\n", accA);
+        fprintf(stderr, "  proxy B (post-MoE norm): %.1f%% correct experts\n", accB);
     }
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  HOT-STORE PERSISTENTE (.picchio_usage)
+ *  PERSISTENT HOT-STORE (.picchio_usage)
  *
- *  Salva i contatori di routing tra sessioni.
- *  Al prossimo avvio, gli expert più caldi vengono pre-caricati.
+ *  Saves the routing counters between sessions.
+ *  On the next startup, the hottest experts are preloaded.
  * ═══════════════════════════════════════════════════════════ */
 
 static const char *g_model_path_global = NULL;
@@ -2007,7 +2006,7 @@ static void hotstore_save(Model *m) {
     FILE *f = fopen(path, "wb");
     if (!f) return;
     
-    /* Header: magic + versione + dimensioni */
+    /* Header: magic + version + dimensions */
     uint32_t magic = 0x50494343;  /* "PICC" */
     uint32_t version = 1;
     uint32_t n_layers = (uint32_t)c->n_layers;
@@ -2017,7 +2016,7 @@ static void hotstore_save(Model *m) {
     fwrite(&n_layers, 4, 1, f);
     fwrite(&n_experts, 4, 1, f);
     
-    /* Contatori per layer */
+    /* Per-layer counters */
     for (int l = 0; l < c->n_layers; l++) {
         if (m->eusage[l])
             fwrite(m->eusage[l], sizeof(uint32_t), c->n_experts, f);
@@ -2030,7 +2029,7 @@ static void hotstore_save(Model *m) {
     }
     
     fclose(f);
-    fprintf(stderr, "  hot-store salvato: %s\n", path);
+    fprintf(stderr, "  hot-store saved: %s\n", path);
 }
 
 static void hotstore_load(Model *m) {
@@ -2050,7 +2049,7 @@ static void hotstore_load(Model *m) {
     if (fread(&n_experts, 4, 1, f) != 1) { fclose(f); return; }
     
     if ((int)n_layers != c->n_layers || (int)n_experts != c->n_experts) {
-        fprintf(stderr, "  hot-store: dimensioni non corrispondono, ignoro\n");
+        fprintf(stderr, "  hot-store: dimensions do not match, ignoring\n");
         fclose(f);
         return;
     }
@@ -2065,15 +2064,15 @@ static void hotstore_load(Model *m) {
     }
     
     fclose(f);
-    fprintf(stderr, "  hot-store caricato: %llu routing registrati\n",
+    fprintf(stderr, "  hot-store loaded: %llu routings recorded\n",
             (unsigned long long)total_usage);
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  SELF-TEST: mini-modello sintetico per validare il forward
+ *  SELF-TEST: synthetic mini-model to validate the forward pass
  * ═══════════════════════════════════════════════════════════ */
 
-/* Genera pesi random deterministici (LCG semplice) */
+/* Generate deterministic random weights (simple LCG) */
 static uint32_t _rng_state = 42;
 static float _rng_f(void) {
     _rng_state = _rng_state * 1664525u + 1013904223u;
@@ -2086,7 +2085,7 @@ static void fill_random_f32(float *p, int64_t n) {
 
 static void fill_random_qt_f32(QT *t, int O, int I) {
     memset(t, 0, sizeof(*t));
-    t->fmt = 0;  /* F32 per il self-test (niente quantizzazione) */
+    t->fmt = 0;  /* F32 for the self-test (no quantization) */
     t->O = O;
     t->I = I;
     t->qf = falloc((int64_t)O * I);
@@ -2094,9 +2093,9 @@ static void fill_random_qt_f32(QT *t, int O, int I) {
 }
 
 static int self_test(void) {
-    fprintf(stderr, "── self-test: mini-modello sintetico ──\n\n");
+    fprintf(stderr, "── self-test: synthetic mini-model ──\n\n");
 
-    /* Configurazione mini: 2 layer, D=64, 4 heads, 2 KV heads, 4 expert, top-2 */
+    /* Mini configuration: 2 layers, D=64, 4 heads, 2 KV heads, 4 experts, top-2 */
     static Model m;
     memset(&m, 0, sizeof(m));
     Cfg *c = &m.c;
@@ -2129,19 +2128,19 @@ static int self_test(void) {
     fprintf(stderr, "  D=%d L=%d H=%d KV=%d hd=%d E=%d top%d vocab=%d\n",
             D, c->n_layers, H, KVH, hd, c->n_experts, c->topk, c->vocab);
 
-    /* Alloca embedding e lm_head */
+    /* Allocate embedding and lm_head */
     fill_random_qt_f32(&m.embed, c->vocab, D);
     fill_random_qt_f32(&m.lm_head, c->vocab, D);
     m.final_norm = falloc(D);
-    for (int i = 0; i < D; i++) m.final_norm[i] = 1.0f;  /* norms = 1 per test */
+    for (int i = 0; i < D; i++) m.final_norm[i] = 1.0f;  /* norms = 1 for the test */
 
-    /* Alloca layer */
+    /* Allocate layers */
     m.L = calloc(c->n_layers, sizeof(Layer));
     for (int l = 0; l < c->n_layers; l++) {
         Layer *ly = &m.L[l];
         ly->layer_type = c->layer_type[l];
 
-        /* RMSNorm weights (tutte 1.0 per test) */
+        /* RMSNorm weights (all 1.0 for the test) */
         ly->in_ln = falloc(D);
         ly->post_ln = falloc(D);
         for (int i = 0; i < D; i++) { ly->in_ln[i] = 1.0f; ly->post_ln[i] = 1.0f; }
@@ -2168,8 +2167,8 @@ static int self_test(void) {
     /* KV-cache */
     kv_init(&m.kv, c->n_layers, KVH, hd, c->ctx_len);
 
-    /* Expert cache — per il self-test, pre-carica tutti gli expert in RAM */
-    m.ecap = c->n_experts;  /* abbastanza slot per tutti */
+    /* Expert cache — for the self-test, preload all experts into RAM */
+    m.ecap = c->n_experts;  /* enough slots for all */
     m.ecache = calloc(c->n_layers, sizeof(ESlot *));
     m.ecn = calloc(c->n_layers, sizeof(int));
     m.pin = calloc(c->n_layers, sizeof(ESlot *));
@@ -2179,7 +2178,7 @@ static int self_test(void) {
 
     for (int l = 0; l < c->n_layers; l++) {
         m.ecache[l] = calloc(m.ecap, sizeof(ESlot));
-        m.ecn[l] = c->n_experts;  /* tutti pre-caricati */
+        m.ecn[l] = c->n_experts;  /* all preloaded */
         m.eusage[l] = calloc(c->n_experts, sizeof(uint32_t));
         m.eheat[l] = calloc(c->n_experts, sizeof(uint32_t));
 
@@ -2189,7 +2188,7 @@ static int self_test(void) {
             es->layer = l;
             /* gate_up fused: [moe_inter, D] */
             fill_random_qt_f32(&es->gu, c->moe_inter, D);
-            /* down: [D, moe_inter/2] — l'input al down è moe_inter/2 valori post-SwiGLU */
+            /* down: [D, moe_inter/2] — the input to down is moe_inter/2 post-SwiGLU values */
             fill_random_qt_f32(&es->d, D, c->moe_inter / 2);
             /* Bias */
             es->gu_bias = falloc(c->moe_inter);
@@ -2199,10 +2198,10 @@ static int self_test(void) {
         }
     }
 
-    fprintf(stderr, "  strutture allocate ✓\n");
+    fprintf(stderr, "  structures allocated ✓\n");
 
-    /* ── Forward pass: 8 token ── */
-    fprintf(stderr, "  forward pass: 8 token...\n");
+    /* ── Forward pass: 8 tokens ── */
+    fprintf(stderr, "  forward pass: 8 tokens...\n");
 
     int tokens[] = {1, 5, 3, 12, 7, 2, 9, 4};
     int n_tok = 8;
@@ -2212,7 +2211,7 @@ static int self_test(void) {
         int next = forward_token(&m, tokens[i], i);
         fprintf(stderr, "    pos=%d tok_in=%d → tok_out=%d\n", i, tokens[i], next);
         if (next < 0 || next >= c->vocab) {
-            fprintf(stderr, "  ✗ ERRORE: token fuori range [0, %d)\n", c->vocab);
+            fprintf(stderr, "  ✗ ERROR: token out of range [0, %d)\n", c->vocab);
             return 1;
         }
     }
@@ -2221,14 +2220,14 @@ static int self_test(void) {
     fprintf(stderr, "\n  ✓ %d forward in %.3f ms (%.1f tok/s)\n",
             n_tok, elapsed * 1000.0, n_tok / elapsed);
 
-    /* Verifica statistiche */
+    /* Verify statistics */
     fprintf(stderr, "  cache: hit=%llu miss=%llu (%.0f%%)\n",
             (unsigned long long)m.hits, (unsigned long long)m.miss,
             m.hits + m.miss > 0 ? 100.0 * m.hits / (m.hits + m.miss) : 0.0);
     fprintf(stderr, "  t_attn=%.3fms t_moe=%.3fms t_head=%.3fms\n",
             m.t_attn * 1000, m.t_moe * 1000, m.t_head * 1000);
 
-    /* ── Test componenti individuali ── */
+    /* ── Test individual components ── */
     fprintf(stderr, "\n  test RMSNorm...");
     {
         float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -2239,7 +2238,7 @@ static int self_test(void) {
         float rms = sqrtf((1+4+9+16)/4.0f);
         float expected0 = 1.0f / rms;
         if (fabsf(o[0] - expected0) > 1e-4f) {
-            fprintf(stderr, " ✗ atteso %.4f, ottenuto %.4f\n", expected0, o[0]);
+            fprintf(stderr, " ✗ expected %.4f, got %.4f\n", expected0, o[0]);
             return 1;
         }
         fprintf(stderr, " ✓\n");
@@ -2251,11 +2250,11 @@ static int self_test(void) {
         softmax(x, 3);
         float sum = x[0] + x[1] + x[2];
         if (fabsf(sum - 1.0f) > 1e-5f) {
-            fprintf(stderr, " ✗ somma=%.6f\n", sum);
+            fprintf(stderr, " ✗ sum=%.6f\n", sum);
             return 1;
         }
         if (x[2] < x[1] || x[1] < x[0]) {
-            fprintf(stderr, " ✗ ordine sbagliato\n");
+            fprintf(stderr, " ✗ wrong order\n");
             return 1;
         }
         fprintf(stderr, " ✓\n");
@@ -2269,7 +2268,7 @@ static int self_test(void) {
         float y[2] = {0, 0};
         matmul_f32(y, x, W, 1, 4, 2);
         if (fabsf(y[0] - 1.0f) > 1e-5f || fabsf(y[1] - 2.0f) > 1e-5f) {
-            fprintf(stderr, " ✗ y=[%.2f, %.2f] atteso [1, 2]\n", y[0], y[1]);
+            fprintf(stderr, " ✗ y=[%.2f, %.2f] expected [1, 2]\n", y[0], y[1]);
             return 1;
         }
         fprintf(stderr, " ✓\n");
@@ -2285,7 +2284,7 @@ static int self_test(void) {
         s = siluf(1.0f);
         float expected = 1.0f / (1.0f + expf(-1.0f));  /* ≈ 0.7311 */
         if (fabsf(s - expected) > 1e-4f) {
-            fprintf(stderr, " ✗ SiLU(1)=%.4f atteso %.4f\n", s, expected);
+            fprintf(stderr, " ✗ SiLU(1)=%.4f expected %.4f\n", s, expected);
             return 1;
         }
         fprintf(stderr, " ✓\n");
@@ -2293,7 +2292,7 @@ static int self_test(void) {
 
     fprintf(stderr, "  test RoPE...");
     {
-        /* Verifica che RoPE a pos=0 non cambia nulla (cos=1, sin=0) */
+        /* Check that RoPE at pos=0 changes nothing (cos=1, sin=0) */
         float q[16], k[8];
         for (int i = 0; i < 16; i++) q[i] = (float)(i + 1);
         for (int i = 0; i < 8; i++) k[i] = (float)(i + 1);
@@ -2307,14 +2306,14 @@ static int self_test(void) {
         rope_cfg.rope_factor = 1.0f;
         rope_cfg.rope_attn_factor = 1.0f;
         rope_apply(q, k, 0, 8, 2, 1, &rope_cfg);
-        /* A pos=0: ang=0 per tutti → cos=1, sin=0 → nessun cambiamento */
+        /* At pos=0: ang=0 for all → cos=1, sin=0 → no change */
         int ok = 1;
         for (int i = 0; i < 16; i++)
             if (fabsf(q[i] - q_orig[i]) > 1e-5f) { ok = 0; break; }
         for (int i = 0; i < 8; i++)
             if (fabsf(k[i] - k_orig[i]) > 1e-5f) { ok = 0; break; }
         if (!ok) {
-            fprintf(stderr, " ✗ RoPE pos=0 ha modificato i vettori\n");
+            fprintf(stderr, " ✗ RoPE pos=0 modified the vectors\n");
             return 1;
         }
         fprintf(stderr, " ✓\n");
@@ -2322,7 +2321,7 @@ static int self_test(void) {
 
     fprintf(stderr, "  test INT4 quant/matmul...");
     {
-        /* Quantizza una matrice F32, poi matmul e confronta */
+        /* Quantize an F32 matrix, then matmul and compare */
         int O = 4, I = 8;
         float W[32];
         for (int i = 0; i < 32; i++) W[i] = (float)(i - 16) * 0.1f;
@@ -2339,42 +2338,42 @@ static int self_test(void) {
         /* Quantized: INT4 matmul */
         matmul_i4(y_q4, x, q4, scale, 1, I, O);
 
-        /* L'errore di quantizzazione dovrebbe essere piccolo */
+        /* The quantization error should be small */
         float max_err = 0;
         for (int i = 0; i < O; i++) {
             float err = fabsf(y_ref[i] - y_q4[i]);
             if (err > max_err) max_err = err;
         }
-        if (max_err > 2.0f) {  /* tolleranza larga per INT4 */
-            fprintf(stderr, " ✗ errore max=%.2f\n", max_err);
+        if (max_err > 2.0f) {  /* wide tolerance for INT4 */
+            fprintf(stderr, " ✗ max error=%.2f\n", max_err);
             return 1;
         }
         fprintf(stderr, " ✓ (err max=%.4f)\n", max_err);
     }
 
-    fprintf(stderr, "\n── self-test SUPERATO ──\n");
-    fprintf(stderr, "  Il forward pass completo funziona correttamente.\n");
-    fprintf(stderr, "  Pronto per collegare il modello reale.\n\n");
+    fprintf(stderr, "\n── self-test PASSED ──\n");
+    fprintf(stderr, "  The full forward pass works correctly.\n");
+    fprintf(stderr, "  Ready to connect the real model.\n\n");
 
-    /* TODO: free tutto (per il self-test non importa) */
+    /* TODO: free everything (does not matter for the self-test) */
     return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════
- *  WEIGHT LOADER: carica pesi densi dal safetensors DB
+ *  WEIGHT LOADER: loads the dense weights from the safetensors DB
  * ═══════════════════════════════════════════════════════════ */
 
-/* Helper: carica un tensore F32 da safetensors.
- * Se il tensore è BF16, converte a F32. */
+/* Helper: load an F32 tensor from safetensors.
+ * If the tensor is BF16, convert to F32. */
 static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel) {
     StTensor *t = st_find(db, name);
     if (!t) {
-        fprintf(stderr, "  ⚠ tensore non trovato: %s\n", name);
+        fprintf(stderr, "  ⚠ tensor not found: %s\n", name);
         return NULL;
     }
     int64_t numel = st_numel(t);
     if (expected_numel > 0 && numel != expected_numel) {
-        fprintf(stderr, "  ⚠ %s: numel=%lld atteso=%lld\n",
+        fprintf(stderr, "  ⚠ %s: numel=%lld expected=%lld\n",
                 name, (long long)numel, (long long)expected_numel);
     }
 
@@ -2384,7 +2383,7 @@ static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel
     if (t->dtype == ST_F32) {
         st_read_raw(db, t, out, nbytes);
     } else if (t->dtype == ST_BF16) {
-        /* BF16 → F32: ogni BF16 è i 16 bit alti di un F32 */
+        /* BF16 → F32: each BF16 is the high 16 bits of an F32 */
         uint16_t *tmp = (uint16_t *)malloc(numel * 2);
         st_read_raw(db, t, tmp, nbytes);
         for (int64_t i = 0; i < numel; i++) {
@@ -2393,7 +2392,7 @@ static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel
         }
         free(tmp);
     } else if (t->dtype == ST_F16) {
-        /* F16 → F32 (conversione minimale) */
+        /* F16 → F32 (minimal conversion) */
         uint16_t *tmp = (uint16_t *)malloc(numel * 2);
         st_read_raw(db, t, tmp, nbytes);
         for (int64_t i = 0; i < numel; i++) {
@@ -2403,7 +2402,7 @@ static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel
             uint32_t mant = h & 0x3FF;
             uint32_t f;
             if (exp == 0) {
-                f = sign; /* ±0 o denorm → 0 */
+                f = sign; /* ±0 or denorm → 0 */
             } else if (exp == 31) {
                 f = sign | 0x7F800000 | (mant << 13); /* inf/nan */
             } else {
@@ -2413,7 +2412,7 @@ static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel
         }
         free(tmp);
     } else {
-        fprintf(stderr, "  ⚠ %s: dtype non supportato (%d)\n", name, t->dtype);
+        fprintf(stderr, "  ⚠ %s: unsupported dtype (%d)\n", name, t->dtype);
         free(out);
         return NULL;
     }
@@ -2421,12 +2420,12 @@ static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel
     return out;
 }
 
-/* Helper: carica un tensore e quantizzalo a INT4.
- * Carica come F32, poi quantizza in-place. Ritorna QT. */
+/* Helper: load a tensor and quantize it to INT4.
+ * Loads as F32, then quantizes in-place. Returns a QT. */
 static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
     StTensor *t = st_find(db, name);
     if (!t) {
-        fprintf(stderr, "  ⚠ non trovato: %s\n", name);
+        fprintf(stderr, "  ⚠ not found: %s\n", name);
         return -1;
     }
 
@@ -2436,12 +2435,12 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
     qt->I = I;
 
     if (t->dtype == ST_U8) {
-        /* Già INT4 packed dal convertitore */
+        /* Already INT4 packed by the converter */
         int64_t rb = (int64_t)O * ((I + 1) / 2);
         qt->q4 = (uint8_t *)malloc(rb);
         st_read_raw(db, t, qt->q4, rb);
 
-        /* Scale associate */
+        /* Associated scales */
         char sn[300];
         snprintf(sn, sizeof(sn), "%s.qs", name);
         StTensor *ts = st_find(db, sn);
@@ -2449,7 +2448,7 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
             int64_t n_scale = st_numel(ts);
             qt->s = (float *)malloc(n_scale * sizeof(float));
             st_read_raw(db, ts, qt->s, n_scale * sizeof(float));
-            /* Determina se è group-scaled: n_scale > O significa gs */
+            /* Determine whether it is group-scaled: n_scale > O means gs */
             if (n_scale > O) {
                 qt->block_size = (int)((int64_t)O * I / n_scale);
                 if (qt->block_size <= 0) qt->block_size = 64;
@@ -2465,8 +2464,8 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
     }
 
     if (t->dtype == ST_I8) {
-        /* INT8 per riga: usato per embedding e lm_head, che a INT4 degradano
-         * la distribuzione dei logit. */
+        /* INT8 per row: used for embedding and lm_head, which at INT4 degrade
+         * the logit distribution. */
         int64_t n = (int64_t)O * I;
         qt->fmt = 1;
         qt->q8 = (int8_t *)malloc(n);
@@ -2477,13 +2476,13 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
         snprintf(sn, sizeof(sn), "%s.qs", name);
         StTensor *ts = st_find(db, sn);
         if (!ts) {
-            fprintf(stderr, "  ⚠ scale INT8 mancanti: %s\n", sn);
+            fprintf(stderr, "  ⚠ missing INT8 scales: %s\n", sn);
             free(qt->q8); qt->q8 = NULL;
             return -1;
         }
         int64_t n_scale = st_numel(ts);
         if (n_scale != O) {
-            fprintf(stderr, "  ⚠ %s: %lld scale per %d righe\n", sn,
+            fprintf(stderr, "  ⚠ %s: %lld scales for %d rows\n", sn,
                     (long long)n_scale, O);
             free(qt->q8); qt->q8 = NULL;
             return -1;
@@ -2493,18 +2492,18 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
         return 0;
     }
 
-    /* F32/BF16/F16: carica */
+    /* F32/BF16/F16: load */
     float *f = load_f32_tensor(db, name, (int64_t)O * I);
     if (!f) return -1;
 
-    /* Se il tensore è F32 nel file, tienilo F32 (attention, non quantizzare) */
+    /* If the tensor is F32 in the file, keep it F32 (attention, do not quantize) */
     if (t->dtype == ST_F32) {
         qt->fmt = 0;
         qt->qf = f;
         return 0;
     }
 
-    /* BF16/F16 → quantizza a INT4 */
+    /* BF16/F16 → quantize to INT4 */
     qt->q4 = (uint8_t *)malloc((int64_t)O * ((I + 1) / 2));
     qt->s = falloc(O);
     quantize_rows_i4(f, qt->q4, qt->s, O, I);
@@ -2512,7 +2511,7 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
     return 0;
 }
 
-/* Carica tutti i pesi densi residenti (embedding, attention, norms, router) */
+/* Load all resident dense weights (embedding, attention, norms, router) */
 static int load_dense_weights(Model *m, StDB *db) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -2521,7 +2520,7 @@ static int load_dense_weights(Model *m, StDB *db) {
     int hd = c->head_dim;
     int64_t loaded = 0;
 
-    fprintf(stderr, "\n  caricamento pesi densi...\n");
+    fprintf(stderr, "\n  loading dense weights...\n");
 
     /* ── Embedding ── */
     fprintf(stderr, "    embed_tokens [%d, %d]...", c->vocab, D);
@@ -2546,7 +2545,7 @@ static int load_dense_weights(Model *m, StDB *db) {
     /* ── Final norm ── */
     m->final_norm = load_f32_tensor(db, "model.norm.weight", D);
     if (!m->final_norm) {
-        fprintf(stderr, "    ⚠ final_norm non trovata, uso 1.0\n");
+        fprintf(stderr, "    ⚠ final_norm not found, using 1.0\n");
         m->final_norm = falloc(D);
         for (int i = 0; i < D; i++) m->final_norm[i] = 1.0f;
     }
@@ -2599,11 +2598,11 @@ static int load_dense_weights(Model *m, StDB *db) {
             loaded += (H*hd + KVH*hd + KVH*hd + D) * 4;
         }
 
-        /* Attention sink logits (uno per query head) */
+        /* Attention sink logits (one per query head) */
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.sinks", l);
         ly->sinks = load_f32_tensor(db, name, H);
         if (!ly->sinks) {
-            fprintf(stderr, "  errore: attention sinks mancanti al layer %d\n", l);
+            fprintf(stderr, "  error: attention sinks missing at layer %d\n", l);
             return -1;
         }
         loaded += H * 4;
@@ -2612,7 +2611,7 @@ static int load_dense_weights(Model *m, StDB *db) {
         snprintf(name, sizeof(name), "model.layers.%d.mlp.router.weight", l);
         ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
         if (!ly->router) {
-            /* Prova nome alternativo */
+            /* Try an alternative name */
             snprintf(name, sizeof(name), "model.layers.%d.block_sparse_moe.gate.weight", l);
             ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
         }
@@ -2627,15 +2626,15 @@ static int load_dense_weights(Model *m, StDB *db) {
     }
 
     m->resident_bytes = loaded;
-    fprintf(stderr, "  ✓ pesi densi caricati: %.2f GB\n", loaded / 1e9);
+    fprintf(stderr, "  ✓ dense weights loaded: %.2f GB\n", loaded / 1e9);
     return 0;
 }
 
-/* Legge ID decimali separati da whitespace. Il chiamante libera *out_ids. */
+/* Reads decimal IDs separated by whitespace. The caller frees *out_ids. */
 static int read_token_ids_file(const char *path, int max_tokens, int **out_ids) {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "errore: impossibile aprire INPUT_FILE=%s\n", path);
+        fprintf(stderr, "error: cannot open INPUT_FILE=%s\n", path);
         return -1;
     }
 
@@ -2649,7 +2648,7 @@ static int read_token_ids_file(const char *path, int max_tokens, int **out_ids) 
     int rc;
     while ((rc = fscanf(f, "%ld", &value)) == 1) {
         if (value < 0 || value > INT_MAX || n >= max_tokens) {
-            fprintf(stderr, "errore: ID non valido o prompt oltre %d token in %s\n",
+            fprintf(stderr, "error: invalid ID or prompt beyond %d tokens in %s\n",
                     max_tokens, path);
             free(ids); fclose(f); return -1;
         }
@@ -2663,22 +2662,22 @@ static int read_token_ids_file(const char *path, int max_tokens, int **out_ids) 
         ids[n++] = (int)value;
     }
     if (rc != EOF) {
-        fprintf(stderr, "errore: contenuto non numerico in INPUT_FILE=%s\n", path);
+        fprintf(stderr, "error: non-numeric content in INPUT_FILE=%s\n", path);
         free(ids); fclose(f); return -1;
     }
     fclose(f);
     if (n == 0) {
-        fprintf(stderr, "errore: INPUT_FILE vuoto: %s\n", path);
+        fprintf(stderr, "error: empty INPUT_FILE: %s\n", path);
         free(ids); return -1;
     }
     *out_ids = ids;
     return n;
 }
 
-/* ── Modalità servizio: sessione multi-turn persistente su pipe ──
- * stdout contiene solo il protocollo, stderr solo diagnostica.
- * Invariante: ogni TOKEN emesso viene anche consumato dal forward, quindi
- * `pos` equivale sempre al numero di posizioni valide nella KV-cache. */
+/* ── Service mode: persistent multi-turn session over a pipe ──
+ * stdout contains only the protocol, stderr only diagnostics.
+ * Invariant: every emitted TOKEN is also consumed by the forward pass, so
+ * `pos` always equals the number of valid positions in the KV-cache. */
 static int service_loop(Model *m, int cap) {
     Cfg *c = &m->c;
     int pos = 0;
@@ -2700,22 +2699,22 @@ static int service_loop(Model *m, int cap) {
         }
 
         if (strcmp(cmd, "TURN") != 0) {
-            printf("ERROR BAD_COMMAND 1 comando sconosciuto\n");
+            printf("ERROR BAD_COMMAND 1 unknown command\n");
             fflush(stdout);
             return 1;
         }
 
-        /* Header esteso: sampling per-richiesta (temp, top_p, top_k) fra keep e n_ids. */
+        /* Extended header: per-request sampling (temp, top_p, top_k) between keep and n_ids. */
         long max_new = 0, keep = 0, n_ids = 0;
         float t_temp = 0.0f, t_topp = 0.0f;
         long t_topk = 0;
         if (scanf("%ld %ld %f %f %ld %ld", &max_new, &keep,
                   &t_temp, &t_topp, &t_topk, &n_ids) != 6) {
-            printf("ERROR BAD_HEADER 1 header TURN illeggibile\n");
+            printf("ERROR BAD_HEADER 1 unreadable TURN header\n");
             fflush(stdout);
             return 1;
         }
-        /* Applica il sampling di questo turno (clamp difensivo). */
+        /* Apply this turn's sampling (defensive clamp). */
         if (t_temp < 0.0f) t_temp = 0.0f;
         if (t_temp > 5.0f) t_temp = 5.0f;
         if (t_topp <= 0.0f || t_topp > 1.0f) t_topp = 1.0f;
@@ -2725,9 +2724,9 @@ static int service_loop(Model *m, int cap) {
         g_top_k = (int)t_topk;
         if (max_new < 0 || keep < 0 || keep > pos || n_ids <= 0 ||
             keep + n_ids > cap || n_ids > cap) {
-            printf("ERROR BAD_RANGE 0 keep/n_ids fuori limiti (pos=%d cap=%d)\n", pos, cap);
+            printf("ERROR BAD_RANGE 0 keep/n_ids out of bounds (pos=%d cap=%d)\n", pos, cap);
             fflush(stdout);
-            /* Nessuna mutazione: la sessione resta usabile. Scarta gli ID pendenti. */
+            /* No mutation: the session stays usable. Discard the pending IDs. */
             for (long i = 0; i < n_ids; i++) { long skip; if (scanf("%ld", &skip) != 1) return 1; }
             continue;
         }
@@ -2743,12 +2742,12 @@ static int service_loop(Model *m, int cap) {
         }
         if (!valid) {
             free(ids);
-            printf("ERROR BAD_TOKEN 0 ID fuori vocabolario\n");
+            printf("ERROR BAD_TOKEN 0 ID out of vocabulary\n");
             fflush(stdout);
             continue;
         }
 
-        /* Riusa il prefisso: le posizioni successive verranno sovrascritte. */
+        /* Reuse the prefix: the subsequent positions will be overwritten. */
         pos = (int)keep;
         int next = prefill_tokens(m, ids, (int)n_ids, pos);
         pos += (int)n_ids;
@@ -2782,7 +2781,7 @@ static int service_loop(Model *m, int cap) {
 
 int main(int argc, char **argv) {
     fprintf(stderr, "🪶 picchio v0.5.0 — GPT-OSS MoE streaming engine\n");
-    fprintf(stderr, "   GQA · INT4 · streaming CPU (architettura letta da config.json)\n\n");
+    fprintf(stderr, "   GQA · INT4 · CPU streaming (architecture read from config.json)\n\n");
 
     /* ── Self-test mode ── */
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
@@ -2793,9 +2792,9 @@ int main(int argc, char **argv) {
     if (!model_path) {
         if (argc > 1) model_path = argv[1];
         else {
-            fprintf(stderr, "Uso: MODEL=/path/to/gptoss_i4 ./picchio [max_tokens]\n");
-            fprintf(stderr, "     oppure: ./picchio /path/to/gptoss_i4 [max_tokens]\n");
-            fprintf(stderr, "     oppure: ./picchio --self-test\n");
+            fprintf(stderr, "Usage: MODEL=/path/to/gptoss_i4 ./picchio [max_tokens]\n");
+            fprintf(stderr, "       or: ./picchio /path/to/gptoss_i4 [max_tokens]\n");
+            fprintf(stderr, "       or: ./picchio --self-test\n");
             return 1;
         }
     }
@@ -2810,24 +2809,24 @@ int main(int argc, char **argv) {
     { const char *p = getenv("PREDICT_PROBE");
       g_predict_probe = p && atoi(p) != 0; }
 
-    fprintf(stderr, "modello:    %s\n", model_path);
+    fprintf(stderr, "model:      %s\n", model_path);
     { const char *svc = getenv("SERVICE");
       if (svc && atoi(svc))
-          fprintf(stderr, "modalità:   servizio (il limite di token arriva con ogni TURN)\n\n");
+          fprintf(stderr, "mode:       service (the token limit arrives with each TURN)\n\n");
       else
-          fprintf(stderr, "max token:  %d\n\n", max_tokens); }
+          fprintf(stderr, "max tokens: %d\n\n", max_tokens); }
 
-    /* ── 1. Carica configurazione ── */
+    /* ── 1. Load configuration ── */
     static Model m;
     memset(&m, 0, sizeof(m));
     m.pred_layer = -1;
 
     if (cfg_load(&m.c, model_path) != 0) {
-        fprintf(stderr, "errore: impossibile caricare config.json\n");
+        fprintf(stderr, "error: cannot load config.json\n");
         return 1;
     }
 
-    /* ── 2. Apri file safetensors ── */
+    /* ── 2. Open the safetensors files ── */
     StDB db;
     st_init(&db);
 
@@ -2835,17 +2834,17 @@ int main(int argc, char **argv) {
         char path[512];
         FILE *test;
 
-        /* Prova dense.safetensors */
+        /* Try dense.safetensors */
         snprintf(path, sizeof(path), "%s/dense.safetensors", model_path);
         test = fopen(path, "rb");
         if (test) { fclose(test); st_open_file(&db, path); }
 
-        /* model.safetensors (singolo file HF) */
+        /* model.safetensors (single HF file) */
         snprintf(path, sizeof(path), "%s/model.safetensors", model_path);
         test = fopen(path, "rb");
         if (test) { fclose(test); st_open_file(&db, path); }
 
-        /* Shard: model-NNNNN-of-NNNNN.safetensors (formato HF) */
+        /* Shards: model-NNNNN-of-NNNNN.safetensors (HF format) */
         for (int i = 1; i <= 200; i++) {
             int found = 0;
             for (int total = 2; total <= 200; total++) {
@@ -2857,8 +2856,8 @@ int main(int argc, char **argv) {
             if (!found && i > 1) break;
         }
 
-        /* File shard aggiuntivi su altri dischi, separati da ';'.
-         * L'ordine è significativo: st_find usa il primo tensore omonimo. */
+        /* Additional shard files on other disks, separated by ';'.
+         * The order matters: st_find uses the first tensor with a given name. */
         const char *aux_env = getenv("MODEL_AUX");
         if (aux_env && *aux_env) {
             char aux_list[2048];
@@ -2871,14 +2870,14 @@ int main(int argc, char **argv) {
                 if (*cursor) {
                     test = fopen(cursor, "rb");
                     if (test) { fclose(test); st_open_file(&db, cursor); }
-                    else fprintf(stderr, "  ⚠ MODEL_AUX non trovato: %s\n", cursor);
+                    else fprintf(stderr, "  ⚠ MODEL_AUX not found: %s\n", cursor);
                 }
                 if (!sep) break;
                 cursor = sep + 1;
             }
         }
 
-        /* Shard: model-NNNNN.safetensors (formato Picchio convertito) */
+        /* Shards: model-NNNNN.safetensors (converted Picchio format) */
         for (int i = 0; i < 200; i++) {
             snprintf(path, sizeof(path), "%s/model-%05d.safetensors", model_path, i);
             test = fopen(path, "rb");
@@ -2894,63 +2893,64 @@ int main(int argc, char **argv) {
     }
 
     if (db.n_tensors == 0) {
-        fprintf(stderr, "\n⚠ nessun tensore trovato in %s\n", model_path);
-        fprintf(stderr, "  Usa: python3 convert.py --model openai/gpt-oss-120b --output %s\n",
+        fprintf(stderr, "\n⚠ no tensors found in %s\n", model_path);
+        fprintf(stderr, "  Use: python3 convert.py --model openai/gpt-oss-120b --output %s\n",
                 model_path);
         st_close(&db);
         return 1;
     }
 
-    fprintf(stderr, "✓ %d tensori da %d file\n", db.n_tensors, db.n_files);
+    fprintf(stderr, "✓ %d tensors from %d files\n", db.n_tensors, db.n_files);
 
-    /* Rendi il DB accessibile dal loader degli expert */
+    /* Make the DB accessible to the expert loader */
     g_db = &db;
 
-    /* ── 3. Alloca strutture e carica pesi ── */
+    /* ── 3. Allocate structures and load weights ── */
     Cfg *c = &m.c;
     m.L = calloc(c->n_layers, sizeof(Layer));
 
-    /* KV-cache (512 posizioni iniziali per stare in 16 GB RAM) */
+    /* KV-cache (512 initial positions to fit in 16 GB RAM) */
     int initial_ctx = 512;
     const char *ctx_env = getenv("CTX");
     if (ctx_env) initial_ctx = atoi(ctx_env);
     if (initial_ctx > c->ctx_len) initial_ctx = c->ctx_len;
     kv_init(&m.kv, c->n_layers, c->n_kv_heads, c->head_dim, initial_ctx);
 
-    /* Cache expert per-layer — budget di RAM per gli expert (ogni expert ~12.4 MB).
-     * Più cache = più hit = meno byte da disco, che è il collo di bottiglia reale.
-     * Sweep misurato sul 20B (16 GB RAM, RSS reale ora disponibile): il default
-     * storico di 6 GB dava 21 slot/layer e 88.9% di hit; a 8 GB si arriva a 28
-     * slot/layer e 91.2%, con RSS ~8.5 GB (largo margine sui 15.8 GB fisici). La
-     * residenza piena del 20B (32 expert/layer) si raggiunge intorno a PIN_GB=9,
-     * oltre il quale non c'è guadagno perché gli expert per layer sono solo 32.
-     * Il default è ora adattivo: senza PIN_GB si rileva la RAM fisica e si assegna
-     * agli expert tutto tranne una riserva per densa/KV/OS. Su 16 GB questo dà ~10 GB
-     * di budget (residenza piena del 20B); scala su macchine più grandi e si autolimita
-     * su quelle piccole. La vecchia stima che PIN_GB basso saturasse la RAM era basata
-     * su una misura RSS rotta su Windows (vedi rss_gb), ora corretta. */
+    /* Per-layer expert cache — RAM budget for the experts (each expert ~12.4 MB).
+     * More cache = more hits = fewer bytes from disk, which is the real bottleneck.
+     * Sweep measured on the 20B (16 GB RAM, real RSS now available): the historical
+     * default of 6 GB gave 21 slots/layer and 88.9% hit; at 8 GB it reaches 28
+     * slots/layer and 91.2%, with RSS ~8.5 GB (wide margin over the 15.8 GB
+     * physical). Full residency of the 20B (32 experts/layer) is reached around
+     * PIN_GB=9, beyond which there is no gain because there are only 32 experts
+     * per layer. The default is now adaptive: without PIN_GB it detects the
+     * physical RAM and assigns the experts everything except a reserve for
+     * dense/KV/OS. On 16 GB this gives ~10 GB of budget (full 20B residency); it
+     * scales up on larger machines and self-limits on small ones. The old estimate
+     * that a low PIN_GB would saturate RAM was based on a broken RSS measurement on
+     * Windows (see rss_gb), now fixed. */
     int pin_gb_env = 0;
     { const char *v = getenv("PIN_GB"); if (v) pin_gb_env = atoi(v); }
     int64_t GB = 1024LL * 1024 * 1024;
     int64_t avail_bytes;
     if (pin_gb_env > 0) {
-        avail_bytes = (int64_t)pin_gb_env * GB;   /* override esplicito */
-        fprintf(stderr, "  PIN_GB=%d (esplicito)\n", pin_gb_env);
+        avail_bytes = (int64_t)pin_gb_env * GB;   /* explicit override */
+        fprintf(stderr, "  PIN_GB=%d (explicit)\n", pin_gb_env);
     } else {
         int64_t phys = physical_ram_bytes();
         if (phys > 0) {
-            /* Riserva per densa (~3–4,5 GB) + KV + overhead OS. Il resto va agli
-             * expert. La cache si autolimita comunque a n_experts×n_layers. */
+            /* Reserve for dense (~3–4.5 GB) + KV + OS overhead. The rest goes to
+             * the experts. The cache self-limits to n_experts×n_layers anyway. */
             int64_t reserve = 6LL * GB;
             avail_bytes = phys - reserve;
-            if (avail_bytes < 2 * GB) avail_bytes = 2 * GB;  /* floor RAM scarsa */
-            fprintf(stderr, "  RAM fisica %.1f GB → budget expert %.1f GB "
-                    "(riserva %.0f GB per densa/KV/OS; override con PIN_GB)\n",
+            if (avail_bytes < 2 * GB) avail_bytes = 2 * GB;  /* floor for scarce RAM */
+            fprintf(stderr, "  physical RAM %.1f GB → expert budget %.1f GB "
+                    "(reserve %.0f GB for dense/KV/OS; override with PIN_GB)\n",
                     (double)phys / 1e9, (double)avail_bytes / 1e9,
                     (double)reserve / 1e9);
         } else {
-            avail_bytes = 8LL * GB;  /* RAM non rilevabile: default fisso */
-            fprintf(stderr, "  RAM non rilevabile → budget expert 8 GB\n");
+            avail_bytes = 8LL * GB;  /* RAM undetectable: fixed default */
+            fprintf(stderr, "  RAM undetectable → expert budget 8 GB\n");
         }
     }
     int64_t expert_bytes = (int64_t)c->moe_inter * ((c->hidden + 1) / 2)  /* gate_up */
@@ -2960,11 +2960,11 @@ int main(int argc, char **argv) {
     m.ecap = total_slots / c->n_layers;
     if (m.ecap < 4) m.ecap = 4;
     if (m.ecap > 128) m.ecap = 128;
-    { const char *v = getenv("ECAP");   /* override manuale per tuning/test */
+    { const char *v = getenv("ECAP");   /* manual override for tuning/tests */
       if (v) { int e = atoi(v); if (e > 0) m.ecap = e > 128 ? 128 : e; } }
-    if (m.ecap > c->n_experts) m.ecap = c->n_experts;  /* mai più slot che expert */
-    if (m.ecap < c->topk) m.ecap = c->topk;  /* cache_load_batch richiede ecap>=topk */
-    fprintf(stderr, "  expert cache: %d slot/layer × %d layer (%d expert totali, ~%.1f GB)\n",
+    if (m.ecap > c->n_experts) m.ecap = c->n_experts;  /* never more slots than experts */
+    if (m.ecap < c->topk) m.ecap = c->topk;  /* cache_load_batch requires ecap>=topk */
+    fprintf(stderr, "  expert cache: %d slots/layer × %d layers (%d experts total, ~%.1f GB)\n",
             m.ecap, c->n_layers, m.ecap * c->n_layers,
             (double)m.ecap * c->n_layers * expert_bytes / 1e9);
     m.ecache = calloc(c->n_layers, sizeof(ESlot *));
@@ -2980,19 +2980,19 @@ int main(int argc, char **argv) {
         m.eheat[l] = calloc(c->n_experts, sizeof(uint32_t));
     }
 
-    /* Carica pesi densi */
+    /* Load dense weights */
     double t0 = now_s();
     g_model_path_global = model_path;
     if (load_dense_weights(&m, &db) != 0) {
-        fprintf(stderr, "errore: caricamento pesi fallito\n");
+        fprintf(stderr, "error: weight loading failed\n");
         st_close(&db);
         return 1;
     }
 
-    /* Carica hot-store da sessione precedente */
+    /* Load the hot-store from a previous session */
     hotstore_load(&m);
 
-    /* ── 4. Carica tokenizer ── */
+    /* ── 4. Load the tokenizer ── */
     Tokenizer tok;
     int has_tokenizer = 0;
     {
@@ -3001,14 +3001,14 @@ int main(int argc, char **argv) {
         if (tok_load(&tok, tok_path) == 0) {
             has_tokenizer = 1;
         } else {
-            fprintf(stderr, "  ⚠ tokenizer.json non trovato — modo raw token ID\n");
+            fprintf(stderr, "  ⚠ tokenizer.json not found — raw token ID mode\n");
         }
     }
 
-    fprintf(stderr, "✓ caricato in %.1f s · residente %.2f GB\n",
+    fprintf(stderr, "✓ loaded in %.1f s · resident %.2f GB\n",
             now_s() - t0, m.resident_bytes / 1e9);
 
-    /* ── 5. Parametri di sampling ── */
+    /* ── 5. Sampling parameters ── */
     {
         const char *v;
         v = getenv("TEMPERATURE"); if (v) g_temperature = (float)atof(v);
@@ -3016,41 +3016,41 @@ int main(int argc, char **argv) {
         v = getenv("TOPK"); if (v) g_top_k = atoi(v);
         v = getenv("REP");  if (v) g_rep_penalty = (float)atof(v);
         v = getenv("SEED"); if (v) g_rng = (uint64_t)atoll(v);
-        else g_rng = (uint64_t)time(NULL);  /* random seed di default */
+        else g_rng = (uint64_t)time(NULL);  /* default random seed */
     }
     fprintf(stderr, "sampling: temp=%.2f top_p=%.2f top_k=%d rep=%.2f\n",
             g_temperature, g_top_p, g_top_k, g_rep_penalty);
 
-    /* Read paralleli degli expert (queue depth > 1). IO_THREADS controlla il
-     * numero di thread; PIPE=0 forza il percorso seriale per compatibilità. */
+    /* Parallel expert reads (queue depth > 1). IO_THREADS controls the number of
+     * threads; PIPE=0 forces the serial path for compatibility. */
     {
         const char *v = getenv("IO_THREADS");
         g_io_threads = v ? atoi(v) : 4;
         const char *pipe = getenv("PIPE");
         if (pipe && atoi(pipe) == 0) g_io_threads = 1;
         if (g_io_threads < 1) g_io_threads = 1;
-        fprintf(stderr, "I/O expert: %d thread (%s)\n", g_io_threads,
-                g_io_threads > 1 ? "read paralleli" : "seriale");
+        fprintf(stderr, "expert I/O: %d threads (%s)\n", g_io_threads,
+                g_io_threads > 1 ? "parallel reads" : "serial");
     }
 
-    /* Prefetch → LRU (PREFETCH=1, alias storico PILOT=1). Predice gli expert del
-     * layer successivo (proxy post-MoE) e li carica durante l'attention. */
+    /* Prefetch → LRU (PREFETCH=1, historical alias PILOT=1). Predicts the next
+     * layer's experts (post-MoE proxy) and loads them during the attention. */
     {
         const char *v = getenv("PREFETCH");
         if (!v) v = getenv("PILOT");
         if (v && atoi(v)) {
             pilot_init(&m);
-            fprintf(stderr, "prefetch → LRU abilitato (proxy post-MoE)\n");
+            fprintf(stderr, "prefetch → LRU enabled (post-MoE proxy)\n");
         }
     }
 
-    /* ── 6. Generazione ── */
+    /* ── 6. Generation ── */
     fprintf(stderr, "\n");
 
-    /* Modalità servizio: sessione persistente, nessun prompt/decode nel C. */
+    /* Service mode: persistent session, no prompt/decode in C. */
     { const char *v = getenv("SERVICE");
       if (v && atoi(v)) {
-        fprintf(stderr, "servizio: sessione persistente, capacità KV %d posizioni\n",
+        fprintf(stderr, "service: persistent session, KV capacity %d positions\n",
                 initial_ctx);
         int rc = service_loop(&m, initial_ctx);
         stats_dump(&m);
@@ -3069,7 +3069,7 @@ int main(int argc, char **argv) {
     #define TOK_RETURN  200002
     #define TOK_CALL    200012
 
-    /* Costruisci prompt con template Harmony legacy oppure usa ID ufficiali da file. */
+    /* Build the prompt with the legacy Harmony template, or use official IDs from a file. */
     int prompt_tokens_stack[8192];
     int *prompt_tokens = prompt_tokens_stack;
     int prompt_tokens_owned = 0;
@@ -3084,14 +3084,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         prompt_tokens_owned = 1;
-        fprintf(stderr, "prompt (INPUT_FILE raw ID, %d token)\n", n_prompt);
+        fprintf(stderr, "prompt (INPUT_FILE raw ID, %d tokens)\n", n_prompt);
     } else {
-        /* Leggi prompt da stdin o variabile d'ambiente. */
+        /* Read the prompt from stdin or an environment variable. */
         char prompt[4096] = "";
         const char *user_prompt = getenv("INPUT");
         if (!user_prompt || strlen(user_prompt) == 0) {
             user_prompt = getenv("PROMPT");
-            /* Ignora il PROMPT di Windows ($P$G). */
+            /* Ignore the Windows PROMPT variable ($P$G). */
             if (user_prompt && (strstr(user_prompt, "$P$G") || strlen(user_prompt) == 0))
                 user_prompt = NULL;
         }
@@ -3116,7 +3116,7 @@ int main(int argc, char **argv) {
                     if (*p == '\0') break;
                     prompt_tokens[n_prompt++] = (int)strtol(p, (char **)&p, 10);
                 }
-                fprintf(stderr, "prompt (raw ID, %d token)\n", n_prompt);
+                fprintf(stderr, "prompt (raw ID, %d tokens)\n", n_prompt);
             } else {
                 const char *sys_msg = "You are ChatGPT, a large language model trained by OpenAI.\n"
                                       "Knowledge cutoff: 2024-06\n"
@@ -3136,7 +3136,7 @@ int main(int argc, char **argv) {
                 prompt_tokens[n_prompt++] = TOK_END;
                 prompt_tokens[n_prompt++] = TOK_START;
                 n_prompt += tok_encode(&tok, "assistant", prompt_tokens + n_prompt, 16);
-                fprintf(stderr, "prompt: \"%s\" → %d token (Harmony legacy)\n",
+                fprintf(stderr, "prompt: \"%s\" → %d tokens (Harmony legacy)\n",
                         prompt, n_prompt);
             }
         } else if (prompt[0] != '\0') {
@@ -3146,12 +3146,12 @@ int main(int argc, char **argv) {
                 if (*p == '\0') break;
                 prompt_tokens[n_prompt++] = (int)strtol(p, (char **)&p, 10);
             }
-            fprintf(stderr, "prompt (raw ID): %d token\n", n_prompt);
+            fprintf(stderr, "prompt (raw ID): %d tokens\n", n_prompt);
         }
     }
 
     if (n_prompt == 0) {
-        fprintf(stderr, "errore: prompt vuoto\n");
+        fprintf(stderr, "error: empty prompt\n");
         if (prompt_tokens_owned) free(prompt_tokens);
         if (has_tokenizer) tok_free(&tok);
         st_close(&db);
@@ -3159,7 +3159,7 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < n_prompt; i++) {
         if (prompt_tokens[i] < 0 || prompt_tokens[i] >= c->vocab) {
-            fprintf(stderr, "errore: token ID fuori vocabolario alla posizione %d: %d\n",
+            fprintf(stderr, "error: token ID out of vocabulary at position %d: %d\n",
                     i, prompt_tokens[i]);
             if (prompt_tokens_owned) free(prompt_tokens);
             if (has_tokenizer) tok_free(&tok);
@@ -3168,87 +3168,87 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Prefill: processa tutti i token del prompt */
-    fprintf(stderr, "prefill %d token...\n", n_prompt);
+    /* Prefill: process all the prompt tokens */
+    fprintf(stderr, "prefill %d tokens...\n", n_prompt);
     double t_prefill = now_s();
     int last_tok = prefill_tokens(&m, prompt_tokens, n_prompt, 0);
     fprintf(stderr, "✓ prefill in %.2f s (next=%d)\n\n", now_s() - t_prefill, last_tok);
 
-    /* Decode: genera token autoregressivamente */
+    /* Decode: generate tokens autoregressively */
     double t_gen = now_s();
     int pos = n_prompt;
     int tok_id = last_tok;
-    int in_final = 0;       /* 1 quando siamo nel canale "final" */
-    int skip_header = 1;    /* 1 per saltare i token dell'header (channel, etc.) */
+    int in_final = 0;       /* 1 when we are in the "final" channel */
+    int skip_header = 1;    /* 1 to skip the header tokens (channel, etc.) */
 
-    /* Se no tokenizer, stampa tutto direttamente (no harmony parsing) */
+    /* If no tokenizer, print everything directly (no harmony parsing) */
     if (!has_tokenizer) { in_final = 1; skip_header = 0; }
-    
-    /* Debug: mostra anche analysis se VERBOSE=1 */
+
+    /* Debug: also show analysis if VERBOSE=1 */
     int show_all = 0;
     { const char *v = getenv("VERBOSE"); if (v && atoi(v)) show_all = 1; }
     int output_ids = 0;
     { const char *v = getenv("OUTPUT"); if (v && strcmp(v, "ids") == 0) output_ids = 1; }
 
     for (int i = 0; i < max_tokens; i++) {
-        /* Il protocollo machine-readable include sempre il terminatore. */
+        /* The machine-readable protocol always includes the terminator. */
         if (output_ids) {
             printf("%d\n", tok_id);
             fflush(stdout);
         }
 
-        /* Stop della risposta assistant: return o call. TOK_END chiude solo un messaggio. */
+        /* Stop of the assistant response: return or call. TOK_END only closes a message. */
         if (tok_id == TOK_RETURN || tok_id == TOK_CALL) break;
-        if (tok_id == c->stop_ids[0]) break;  /* EOS generico */
+        if (tok_id == c->stop_ids[0]) break;  /* generic EOS */
 
         if (output_ids) {
-            /* Nessun decode o filtro C: il bridge Harmony possiede il rendering. */
+            /* No C decode or filter: the Harmony bridge owns the rendering. */
         }
-        /* Gestione canali harmony:
-         * - Dopo <|channel|>, leggi il nome del canale
-         * - Se "final", mostra il contenuto
-         * - Se "analysis", non mostrare (chain of thought interna)
+        /* Harmony channel handling:
+         * - After <|channel|>, read the channel name
+         * - If "final", show the content
+         * - If "analysis", do not show (internal chain of thought)
          */
         else if (tok_id == TOK_CHANNEL) {
-            skip_header = 1;  /* prossimi token sono header di canale */
+            skip_header = 1;  /* the next tokens are a channel header */
         } else if (tok_id == TOK_MESSAGE) {
-            skip_header = 0;  /* dopo <|message|> inizia il contenuto */
+            skip_header = 0;  /* after <|message|> the content begins */
         } else if (tok_id == TOK_START) {
-            skip_header = 1;  /* inizio di un nuovo messaggio */
+            skip_header = 1;  /* start of a new message */
             in_final = 0;
         } else if (tok_id == TOK_END) {
-            /* Fine messaggio — non stampare */
+            /* End of message — do not print */
         } else if (skip_header) {
-            /* Siamo nell'header — controlla se è "final" o se è un token normale */
+            /* We are in the header — check whether it is "final" or a normal token */
             if (tok_id == TOK_CHANNEL || tok_id == TOK_START || tok_id == TOK_END ||
                 tok_id == TOK_MESSAGE) {
-                /* Token speciale nell'header — già gestito sopra */
+                /* Special token in the header — already handled above */
             } else if (has_tokenizer) {
                 const char *s = tok_decode(&tok, tok_id);
                 if (strstr(s, "final")) { in_final = 1; }
                 else if (strstr(s, "analysis")) { in_final = 0; }
                 else if (strstr(s, "commentary")) { in_final = 0; }
                 else {
-                    /* Token normale fuori da qualsiasi struttura — 
-                     * il modello sta generando senza header harmony.
-                     * Trattiamo come contenuto diretto. */
+                    /* Normal token outside any structure —
+                     * the model is generating without a harmony header.
+                     * We treat it as direct content. */
                     skip_header = 0;
                     in_final = 1;
-                    /* Stampa questo token */
+                    /* Print this token */
                     char decoded[512];
                     tok_decode_raw(&tok, tok_id, decoded, sizeof(decoded));
                     printf("%s", decoded);
                     fflush(stdout);
                 }
             } else {
-                /* No tokenizer, token normale: stampa */
+                /* No tokenizer, normal token: print */
                 skip_header = 0;
                 in_final = 1;
                 printf("[%d]", tok_id);
                 fflush(stdout);
             }
         } else {
-            /* Contenuto del messaggio — stampa se siamo in final (o verbose) */
+            /* Message content — print if we are in final (or verbose) */
             if (in_final || show_all || !has_tokenizer) {
                 if (has_tokenizer) {
                     char decoded[512];
@@ -3261,7 +3261,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Forward per il prossimo token */
+        /* Forward for the next token */
         tok_id = forward_token(&m, tok_id, pos);
         pos++;
         m.n_emit++;
@@ -3273,13 +3273,13 @@ int main(int argc, char **argv) {
     /* Stats */
     fprintf(stderr, "\n");
     if (m.n_emit > 0) {
-        fprintf(stderr, "generati %llu token in %.2f s (%.1f tok/s)\n",
+        fprintf(stderr, "generated %llu tokens in %.2f s (%.1f tok/s)\n",
                 (unsigned long long)m.n_emit, gen_elapsed,
                 m.n_emit / gen_elapsed);
     }
     stats_dump(&m);
 
-    /* Salva hot-store per la prossima sessione */
+    /* Save the hot-store for the next session */
     hotstore_save(&m);
 
     /* Cleanup */
