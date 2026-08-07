@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""convert_streaming.py — Scarica e converte GPT-OSS-120B un shard alla volta.
+"""convert_streaming.py — Download and convert GPT-OSS-120B one shard at a time.
 
-Non tiene mai più di 1 shard raw su disco (~4.6 GB).
-Scarica → converte → cancella raw → prossimo shard.
+Never keeps more than 1 raw shard on disk (~4.6 GB).
+Download → convert → delete raw → next shard.
 """
 import sys, time, json, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,8 +18,8 @@ N_SHARDS = 15  # model-00000-of-00014 to model-00014-of-00014
 os.makedirs(OUTPUT, exist_ok=True)
 os.makedirs(RAW_DIR, exist_ok=True)
 
-# Scarica config e tokenizer
-print("=== Scaricamento config/tokenizer ===")
+# Download config and tokenizer
+print("=== Downloading config/tokenizer ===")
 for fname in ["config.json", "tokenizer.json", "tokenizer_config.json",
               "special_tokens_map.json", "generation_config.json"]:
     try:
@@ -31,35 +31,35 @@ for fname in ["config.json", "tokenizer.json", "tokenizer_config.json",
 cfg = json.load(open(f"{OUTPUT}/config.json"))
 print(f"\n  D={cfg['hidden_size']} L={cfg['num_hidden_layers']} E={cfg['num_local_experts']}")
 
-# Rigenera vocab binario
-print("\n=== Export vocab binario ===")
+# Regenerate the binary vocab
+print("\n=== Exporting binary vocab ===")
 from export_vocab import export_vocab
 export_vocab(f"{OUTPUT}/tokenizer.json", f"{OUTPUT}/picchio_vocab.bin")
 
-# Converte shard per shard
-print(f"\n=== Conversione {N_SHARDS} shard (attention=F32, expert=INT4 gs64) ===\n")
+# Convert shard by shard
+print(f"\n=== Converting {N_SHARDS} shards (attention=F32, expert=INT4 gs64) ===\n")
 t_total = time.time()
 
 for si in range(N_SHARDS):
     shard_name = f"model-{si:05d}-of-{N_SHARDS-1:05d}.safetensors"
     out_path = Path(OUTPUT) / f"model-{si:05d}.safetensors"
     
-    # Skip se già convertito
+    # Skip if already converted
     if out_path.exists() and out_path.stat().st_size > 1e9:
-        print(f"  [{si+1}/{N_SHARDS}] {shard_name} — già convertito, skip")
+        print(f"  [{si+1}/{N_SHARDS}] {shard_name} — already converted, skip")
         continue
-    
+
     print(f"  [{si+1}/{N_SHARDS}] {shard_name}")
-    
-    # 1. Scarica
+
+    # 1. Download
     t0 = time.time()
-    print(f"    scaricamento...", end="", flush=True)
+    print(f"    downloading...", end="", flush=True)
     raw_path = hf_hub_download(REPO, shard_name, local_dir=RAW_DIR)
     t_dl = time.time() - t0
     raw_size = Path(raw_path).stat().st_size
     print(f" {raw_size/1e9:.1f} GB in {t_dl:.0f}s")
     
-    # 2. Converti
+    # 2. Convert
     t0 = time.time()
     stats = {'total_tensors':0,'norms':0,'bias':0,'router':0,'dense_i4':0,
              'expert_i4':0,'expert_blocks':0,'expert_scales':0,'other':0}
@@ -104,19 +104,19 @@ for si in range(N_SHARDS):
         t = output_tensors[bk]
         if t.dtype != np.float32: output_tensors[bk] = t.astype(np.float32)
     
-    # Salva
+    # Save
     save_file(output_tensors, str(out_path))
     t_conv = time.time() - t0
     out_size = out_path.stat().st_size
-    
-    # Verifica attention
-    attn_f32 = sum(1 for k in output_tensors if 'self_attn' in k and 'weight' in k 
+
+    # Verify attention
+    attn_f32 = sum(1 for k in output_tensors if 'self_attn' in k and 'weight' in k
                    and output_tensors[k].dtype == np.float32 and output_tensors[k].ndim > 0)
-    
-    print(f"    → {out_path.name}: {out_size/1e9:.2f} GB, {len(output_tensors)} tensori, "
+
+    print(f"    → {out_path.name}: {out_size/1e9:.2f} GB, {len(output_tensors)} tensors, "
           f"attn_f32={attn_f32}, {t_conv:.0f}s")
-    
-    # 3. Cancella raw (libera spazio per il prossimo)
+
+    # 3. Delete the raw file (frees space for the next one)
     try:
         os.remove(raw_path)
     except:
@@ -130,9 +130,9 @@ shutil.rmtree(RAW_DIR, ignore_errors=True)
 
 elapsed = time.time() - t_total
 print(f"\n{'='*60}")
-print(f"  Conversione completata in {elapsed/60:.0f} min")
+print(f"  Conversion completed in {elapsed/60:.0f} min")
 print(f"  Output: {OUTPUT}")
 files = list(Path(OUTPUT).glob("model-*.safetensors"))
 total = sum(f.stat().st_size for f in files)
-print(f"  {len(files)} shard, {total/1e9:.1f} GB totale")
-print(f"\n  Per usare: picchio.exe {OUTPUT}")
+print(f"  {len(files)} shards, {total/1e9:.1f} GB total")
+print(f"\n  To use: picchio.exe {OUTPUT}")

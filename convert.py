@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""convert.py — Converte GPT-OSS-120B da HuggingFace a INT4 per Picchio.
+"""convert.py — Convert GPT-OSS-120B from HuggingFace to INT4 for Picchio.
 
-Il modello originale ha:
-  - Parte densa (attention, embed, norms, router): BF16
-  - Expert MoE (gate_up_proj, down_proj): MXFP4
+The original model has:
+  - Dense part (attention, embed, norms, router): BF16
+  - MoE experts (gate_up_proj, down_proj): MXFP4
 
-Questo convertitore:
-  1. Scarica shard per shard (non tutto in RAM)
-  2. Parte densa BF16 → quantizza a INT4 simmetrico per-riga
-  3. Expert MXFP4 → dequantizza a F32 → requantizza a INT4
-  4. Norms e bias: mantiene F32
-  5. Scrive in safetensors con layout Picchio
+This converter:
+  1. Downloads shard by shard (not everything in RAM)
+  2. Dense part BF16 → quantize to per-row symmetric INT4
+  3. Experts MXFP4 → dequantize to F32 → requantize to INT4
+  4. Norms and biases: kept as F32
+  5. Writes safetensors with the Picchio layout
 
-Output stimato: ~57 GB (INT4 per tutto).
-RAM richiesta: ~4 GB (un shard alla volta).
+Estimated output: ~57 GB (INT4 for everything).
+RAM required: ~4 GB (one shard at a time).
 
-Uso:
+Usage:
   python convert.py --model openai/gpt-oss-120b --output D:/gptoss_i4
-  python convert.py --model D:/gptoss_orig --output D:/gptoss_i4  # da locale
+  python convert.py --model D:/gptoss_orig --output D:/gptoss_i4  # from local
 
-Requisiti:
+Requirements:
   pip install safetensors numpy torch huggingface_hub
 """
 
@@ -40,13 +40,13 @@ except ImportError:
     sys.exit(1)
 
 
-# ── INT4 quantizzazione simmetrica per-riga ──
+# ── INT4 per-row symmetric quantization ──
 
 def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
-    """Quantizza F32 [O, I] → (packed_uint8, scales_f32).
-    
-    Se group_size > 0: scala ogni group_size valori (gs64 = +9pp qualità).
-    Schema: value = (nibble - 8) * scale
+    """Quantize F32 [O, I] → (packed_uint8, scales_f32).
+
+    If group_size > 0: one scale every group_size values (gs64 = +9pp quality).
+    Scheme: value = (nibble - 8) * scale
     Range: [-8, 7], packed 2 per byte (lo nibble first).
     """
     if tensor.ndim == 1:
@@ -55,12 +55,12 @@ def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
     O, I = tensor.shape
     
     if group_size <= 0 or group_size >= I:
-        # Per-row scaling (vecchio, meno preciso)
+        # Per-row scaling (old, less precise)
         amax = np.max(np.abs(tensor), axis=1)
         scales = np.where(amax > 1e-8, amax / 7.0, 1e-8).astype(np.float32)
         quantized = np.clip(np.round(tensor / scales[:, None]), -8, 7).astype(np.int8)
     else:
-        # Group-scaled: una scala ogni group_size valori
+        # Group-scaled: one scale every group_size values
         n_groups = (I + group_size - 1) // group_size
         scales = np.empty((O, n_groups), dtype=np.float32)
         quantized = np.empty((O, I), dtype=np.int8)
@@ -77,7 +77,7 @@ def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
         
         scales = scales.reshape(-1)  # flatten [O * n_groups]
     
-    # Pack 2 valori per byte
+    # Pack 2 values per byte
     rb = (I + 1) // 2
     packed = np.zeros((O, rb), dtype=np.uint8)
     
@@ -93,9 +93,9 @@ def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
     return packed.reshape(-1), scales
 
 
-# ── MXFP4 dequantizzazione ──
+# ── MXFP4 dequantization ──
 
-# Tabella FP4 E2M1: 4 bit → float value
+# FP4 E2M1 table: 4 bits → float value
 # Bit layout: [sign(1)][exp(2)][mantissa(1)]
 FP4_LUT = np.array([
     0.0,    0.5,   1.0,   1.5,   2.0,   3.0,   4.0,   6.0,    # 0000-0111
@@ -104,17 +104,17 @@ FP4_LUT = np.array([
 
 
 def quantize_int8(tensor: np.ndarray) -> tuple:
-    """INT8 simmetrico con scala per riga.
+    """Symmetric INT8 with a per-row scale.
 
-    Usato per embedding e lm_head, che la configurazione ufficiale GPT-OSS esclude
-    dalla quantizzazione MXFP4 (`modules_to_not_convert`). A INT4 il rumore finisce
-    direttamente sui logit di un vocabolario da 201k voci; INT8 costa il doppio in
-    spazio ma riduce l'errore di circa 16 volte.
+    Used for embedding and lm_head, which the official GPT-OSS configuration
+    excludes from MXFP4 quantization (`modules_to_not_convert`). At INT4 the noise
+    lands directly on the logits of a 201k-entry vocabulary; INT8 costs twice the
+    space but reduces the error by about 16×.
     """
     rows, cols = tensor.shape
     q = np.empty((rows, cols), dtype=np.int8)
     scales = np.empty(rows, dtype=np.float32)
-    # A blocchi: su [201088, 2880] una copia intera costerebbe oltre 2 GB.
+    # In blocks: on [201088, 2880] a full copy would cost over 2 GB.
     block = max(1, 8_000_000 // max(cols, 1))
     for start in range(0, rows, block):
         end = min(start + block, rows)
@@ -135,12 +135,12 @@ def decode_e8m0(raw: np.ndarray) -> np.ndarray:
 
 def dequant_mxfp4(blocks: np.ndarray, scales: np.ndarray, 
                    shape: tuple, block_size: int = 32) -> np.ndarray:
-    """Dequantizza un tensore MXFP4 a F32.
-    
-    blocks: uint8 packed (2 FP4 per byte), shape flat
-    scales: E8M0 o float scale per blocco
+    """Dequantize an MXFP4 tensor to F32.
+
+    blocks: uint8 packed (2 FP4 per byte), flat shape
+    scales: E8M0 or float scale per block
     shape: (rows, cols) output
-    block_size: elementi per blocco (tipicamente 32)
+    block_size: elements per block (typically 32)
     """
     rows, cols = shape
     n_blocks_per_row = (cols + block_size - 1) // block_size
@@ -154,14 +154,14 @@ def dequant_mxfp4(blocks: np.ndarray, scales: np.ndarray,
             col_end = min(col_start + block_size, cols)
             n_vals = col_end - col_start
             
-            # Scale per questo blocco
+            # Scale for this block
             scale_idx = r * n_blocks_per_row + b
             if scale_idx < len(scales):
                 sc = float(scales[scale_idx])
             else:
                 sc = 1.0
-            
-            # Unpacked valori
+
+            # Unpacked values
             block_offset = r * n_blocks_per_row * bytes_per_block + b * bytes_per_block
             for i in range(0, n_vals, 2):
                 byte_idx = block_offset + i // 2
@@ -179,12 +179,12 @@ def dequant_mxfp4(blocks: np.ndarray, scales: np.ndarray,
 
 def dequant_mxfp4_fast(blocks: np.ndarray, scales: np.ndarray,
                        shape: tuple, block_size: int = 32) -> np.ndarray:
-    """Versione vettorizzata (molto più veloce) della dequantizzazione MXFP4."""
+    """Vectorized (much faster) version of the MXFP4 dequantization."""
     rows, cols = shape
     n_blocks_per_row = (cols + block_size - 1) // block_size
     bytes_per_block = block_size // 2
-    
-    # Unpack tutti i nibble
+
+    # Unpack all the nibbles
     lo_nibbles = blocks & 0x0F
     hi_nibbles = (blocks >> 4) & 0x0F
     
@@ -211,11 +211,11 @@ def dequant_mxfp4_fast(blocks: np.ndarray, scales: np.ndarray,
     return out.astype(np.float32)
 
 
-# ── Conversione principale ──
+# ── Main conversion ──
 
-def convert_shard(shard_path: str, output_tensors: dict, cfg: dict, 
+def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                   stats: dict, dense_bits: int = 4):
-    """Converte un singolo shard safetensors."""
+    """Convert a single safetensors shard."""
     
     D = cfg["hidden_size"]
     I = cfg["intermediate_size"]
@@ -225,11 +225,11 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
         keys = list(f.keys())
         
         for key in keys:
-            # Leggi metadata per dtype senza caricare il tensore
-            # safe_open con numpy non supporta bfloat16, usiamo torch
+            # Read metadata for dtype without loading the tensor
+            # safe_open with numpy does not support bfloat16, use torch
             pass
-    
-    # Riapri con torch per gestire bfloat16
+
+    # Reopen with torch to handle bfloat16
     try:
         import torch
         with safe_open(shard_path, framework="pt") as f:
@@ -239,7 +239,7 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                 tensor = f.get_tensor(key)  # torch tensor
                 original_dtype = tensor.dtype
                 
-                # Converti a float32 numpy
+                # Convert to float32 numpy
                 if tensor.dtype == torch.bfloat16:
                     tensor_np = tensor.float().numpy()
                 elif tensor.dtype == torch.float16:
@@ -255,7 +255,7 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                 
                 original_shape = tensor_np.shape
                 
-                # Determina il tipo di tensore
+                # Determine the tensor type
                 is_norm = "layernorm" in key or "norm.weight" in key
                 is_bias = ".bias" in key or key.endswith("_bias")
                 is_embed = "embed_tokens" in key or "lm_head" in key
@@ -277,20 +277,20 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                     
                 elif is_expert:
                     if is_bias:
-                        # I bias expert sono BF16/F16/F32 aggregati [E,...]:
-                        # non quantizzarli e non produrre .qs.
+                        # Expert biases are aggregated BF16/F16/F32 [E,...]:
+                        # do not quantize them and do not produce .qs.
                         output_tensors[key] = tensor_np.astype(np.float32)
                         stats["bias"] += tensor_np.size * 4
                     elif "blocks" in key:
-                        # MXFP4 blocks — dequantizziamo con le scale associate
-                        # Salva temporaneamente, processeremo dopo con le scale
+                        # MXFP4 blocks — dequantized with the associated scales
+                        # Save temporarily, we will process it later with the scales
                         output_tensors[key] = tensor_np
-                        stats["expert_i4"] += 0  # conteggio dopo
+                        stats["expert_i4"] += 0  # counted later
                     elif "scales" in key:
-                        # MXFP4 scales E8M0 — salva per combinare con blocks
+                        # MXFP4 scales E8M0 — save to combine with blocks
                         output_tensors[key] = tensor_np
                     else:
-                        # Expert weight F32 — quantizza a INT4
+                        # Expert weight F32 — quantize to INT4
                         t_f32 = tensor_np.astype(np.float32)
                         if t_f32.ndim >= 2:
                             t_2d = t_f32.reshape(-1, t_f32.shape[-1])
@@ -308,14 +308,14 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                         output_tensors[key] = t_f32
                         stats["bias"] += t_f32.nbytes
                     elif is_attn:
-                        # Attention: NON quantizzare (modules_to_not_convert)
-                        # Mantieni F32 per preservare qualità
+                        # Attention: do NOT quantize (modules_to_not_convert)
+                        # Keep F32 to preserve quality
                         output_tensors[key] = t_f32
                         stats["dense_i4"] += t_f32.nbytes
                     else:
-                        # Embedding/lm_head: INT8 per riga, non INT4.
-                        # Sono esclusi dalla quantizzazione ufficiale: a INT4 il
-                        # rumore sui logit degrada le generazioni lunghe.
+                        # Embedding/lm_head: INT8 per row, not INT4.
+                        # They are excluded from the official quantization: at INT4
+                        # the logit noise degrades long generations.
                         t_2d = t_f32.reshape(-1, t_f32.shape[-1])
                         q8, scales = quantize_int8(t_2d)
                         output_tensors[key] = q8
@@ -327,19 +327,19 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                 
                 stats["total_tensors"] += 1
     except ImportError:
-        print("  ✗ PyTorch richiesto per leggere tensori BF16")
+        print("  ✗ PyTorch required to read BF16 tensors")
         print("    pip install torch")
         sys.exit(1)
 
 
 def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
-    """Converte il modello GPT-OSS-120B."""
-    
+    """Convert the GPT-OSS-120B model."""
+
     model_path = Path(model_path)
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Copia config e tokenizer
+
+    # Copy config and tokenizer
     import shutil
     for fname in ["config.json", "tokenizer.json", "tokenizer_config.json",
                   "special_tokens_map.json", "generation_config.json"]:
@@ -348,30 +348,30 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
             shutil.copy2(src, output_path / fname)
             print(f"  ✓ {fname}")
     
-    # Carica config
+    # Load config
     with open(model_path / "config.json") as f:
         cfg = json.load(f)
-    
-    print(f"\n  Modello: GPT-OSS-120B")
+
+    print(f"\n  Model: GPT-OSS-120B")
     print(f"  D={cfg['hidden_size']} L={cfg['num_hidden_layers']} "
           f"E={cfg['num_local_experts']} top{cfg['num_experts_per_tok']}")
-    print(f"  Formato input: MXFP4 (expert) + BF16 (denso)")
-    print(f"  Formato output: INT4 simmetrico per-riga")
-    
-    # Trova tutti i file safetensors
+    print(f"  Input format: MXFP4 (experts) + BF16 (dense)")
+    print(f"  Output format: per-row symmetric INT4")
+
+    # Find all safetensors files
     shard_files = sorted(model_path.glob("*.safetensors"))
     if not shard_files:
-        # Prova nella subdirectory "original"
+        # Try the "original" subdirectory
         shard_files = sorted((model_path / "original").glob("*.safetensors"))
-    
+
     if not shard_files:
-        print(f"\n  ✗ Nessun file .safetensors trovato in {model_path}")
-        print(f"  Scarica con: huggingface-cli download openai/gpt-oss-120b --local-dir {model_path}")
+        print(f"\n  ✗ No .safetensors file found in {model_path}")
+        print(f"  Download with: huggingface-cli download openai/gpt-oss-120b --local-dir {model_path}")
         return
     
-    print(f"\n  {len(shard_files)} shard da convertire")
-    
-    # Converti shard per shard
+    print(f"\n  {len(shard_files)} shards to convert")
+
+    # Convert shard by shard
     stats = {
         "total_tensors": 0, "norms": 0, "bias": 0, "router": 0,
         "dense_i4": 0, "expert_i4": 0, "expert_blocks": 0,
@@ -388,10 +388,10 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
         output_tensors = {}
         convert_shard(str(shard_path), output_tensors, cfg, stats, dense_bits)
         
-        # ── Post-processing: dequantizza MXFP4 blocks+scales → INT4 ──
+        # ── Post-processing: dequantize MXFP4 blocks+scales → INT4 ──
         blocks_keys = [k for k in list(output_tensors.keys()) if k.endswith("_blocks")]
         for bk in blocks_keys:
-            base = bk[:-7]  # rimuovi "_blocks"
+            base = bk[:-7]  # remove "_blocks"
             sk = base + "_scales"
             
             if sk not in output_tensors:
@@ -408,7 +408,7 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
             
             print(f"    MXFP4: {base} [{n_exp}×{rows}×{cols}]...", end="", flush=True)
             
-            # Dequant per expert, riga per riga (vettorizzato per blocco)
+            # Dequant per expert, row by row (vectorized per block)
             for e in range(n_exp):
                 # blocks[e]: [rows, n_blk, 16] → unpack nibbles
                 blk_flat = blocks[e].reshape(rows, n_blk * 16)  # [rows, n_blk*16]
@@ -430,28 +430,28 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
                 sc_float = np.ldexp(np.ones_like(sc, dtype=np.float32),
                                     sc.astype(np.int32) - 127)  # [rows, n_blk]
                 
-                # Broadcast scale per blocco di 32
+                # Broadcast the scale per block of 32
                 sc_expanded = np.repeat(sc_float, block_size, axis=1)[:, :cols]
                 values *= sc_expanded
-                
-                # Quantizza a INT4
+
+                # Quantize to INT4
                 packed, row_scales = quantize_int4(values)
-                
-                # Salva con nome per Picchio:
+
+                # Save with the Picchio name:
                 # model.layers.X.mlp.experts.Y.{gate_up_proj|down_proj}
-                # Estraiamo layer e nome proiezione dal key
+                # We extract the layer and projection name from the key
                 # base = "model.layers.X.mlp.experts.{gate_up_proj|down_proj}"
                 out_key = f"{base}.{e}"
                 output_tensors[out_key] = packed
                 output_tensors[out_key + ".qs"] = row_scales
                 stats["expert_i4"] += packed.nbytes + row_scales.nbytes
             
-            # Rimuovi blocks e scales originali
+            # Remove the original blocks and scales
             del output_tensors[bk]
             del output_tensors[sk]
-            print(f" ✓ ({n_exp} expert)")
-        
-        # Converti bias expert da BF16 a F32
+            print(f" ✓ ({n_exp} experts)")
+
+        # Convert expert biases from BF16 to F32
         bias_keys = [k for k in list(output_tensors.keys()) 
                      if "experts" in k and "bias" in k and isinstance(output_tensors[k], np.ndarray)]
         for bk in bias_keys:
@@ -459,69 +459,69 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
             if t.dtype != np.float32:
                 output_tensors[bk] = t.astype(np.float32)
         
-        # Salva output shard
+        # Save the output shard
         out_name = f"model-{si:05d}.safetensors"
         out_path = output_path / out_name
-        
-        # save_file vuole np arrays
+
+        # save_file wants np arrays
         save_file(output_tensors, str(out_path))
-        
+
         shard_bytes = out_path.stat().st_size
         total_output_bytes += shard_bytes
         elapsed = time.time() - t0
-        
+
         print(f"    → {out_name} ({shard_bytes/1e9:.2f} GB, "
-              f"{len(output_tensors)} tensori, {elapsed:.1f}s)")
-    
+              f"{len(output_tensors)} tensors, {elapsed:.1f}s)")
+
     total_elapsed = time.time() - t_start
-    
-    # Riepilogo
+
+    # Summary
     print(f"\n{'='*60}")
-    print(f"  Conversione completata in {total_elapsed:.0f}s")
+    print(f"  Conversion completed in {total_elapsed:.0f}s")
     print(f"  Output: {output_path}")
-    print(f"  Dimensione totale: {total_output_bytes/1e9:.1f} GB")
-    print(f"  Tensori: {stats['total_tensors']}")
+    print(f"  Total size: {total_output_bytes/1e9:.1f} GB")
+    print(f"  Tensors: {stats['total_tensors']}")
     print(f"  Dense INT4: {stats['dense_i4']/1e9:.2f} GB")
     print(f"  Expert INT4: {stats['expert_i4']/1e9:.2f} GB")
     print(f"  Norms (F32): {stats['norms']/1e6:.1f} MB")
     print(f"  Router (F32): {stats['router']/1e6:.1f} MB")
     print(f"  Bias (F32): {stats['bias']/1e6:.1f} MB")
-    print(f"\n  Per usare: picchio.exe {output_path}")
+    print(f"\n  To use: picchio.exe {output_path}")
 
 
-# ── Download + conversione ──
+# ── Download + conversion ──
 
 def download_and_convert(repo_id: str, output_path: str, dense_bits: int = 4):
-    """Scarica il modello da HuggingFace e converte in un unico passaggio."""
-    
+    """Download the model from HuggingFace and convert it in a single pass."""
+
     try:
         from huggingface_hub import snapshot_download, list_repo_files
     except ImportError:
         print("pip install huggingface_hub")
         sys.exit(1)
-    
+
     print(f"  Repository: {repo_id}")
-    
-    # Lista file per capire la dimensione
+
+    # List the files to gauge the size
     files = list_repo_files(repo_id)
     st_files = [f for f in files if f.endswith(".safetensors")]
-    print(f"  {len(st_files)} file safetensors nel repo")
-    
-    # Scarica tutto (con resume) nella directory output
-    # HF Hub gestisce il caching e il resume automaticamente
-    print(f"\n  Scaricamento in corso (resumable, ~57 GB)...")
-    print(f"  Destinazione: {output_path}")
-    print(f"  (Puoi interrompere e riprendere in qualsiasi momento)\n")
-    
+    print(f"  {len(st_files)} safetensors files in the repo")
+
+    # Download everything (with resume) into the output directory
+    # HF Hub handles caching and resume automatically
+    print(f"\n  Downloading (resumable, ~57 GB)...")
+    print(f"  Destination: {output_path}")
+    print(f"  (You can interrupt and resume at any time)\n")
+
     local_dir = snapshot_download(
         repo_id,
         local_dir=output_path + "_raw",
         allow_patterns=["*.safetensors", "*.json"],
     )
-    
-    print(f"\n  ✓ Download completato: {local_dir}")
-    
-    # Converti
+
+    print(f"\n  ✓ Download complete: {local_dir}")
+
+    # Convert
     convert_model(local_dir, output_path, dense_bits)
 
 
@@ -529,16 +529,16 @@ def download_and_convert(repo_id: str, output_path: str, dense_bits: int = 4):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Converte GPT-OSS-120B da MXFP4/BF16 a INT4 per Picchio"
+        description="Convert GPT-OSS-120B from MXFP4/BF16 to INT4 for Picchio"
     )
     parser.add_argument("--model", required=True,
-                        help="Percorso locale al modello o repo HuggingFace (es. openai/gpt-oss-120b)")
+                        help="Local path to the model or HuggingFace repo (e.g. openai/gpt-oss-120b)")
     parser.add_argument("--output", required=True,
-                        help="Directory output per il modello convertito")
+                        help="Output directory for the converted model")
     parser.add_argument("--dense-bits", type=int, default=4, choices=[4, 8],
-                        help="Bit per la parte densa (4 o 8, default: 4)")
+                        help="Bits for the dense part (4 or 8, default: 4)")
     parser.add_argument("--download", action="store_true",
-                        help="Scarica da HuggingFace prima di convertire")
+                        help="Download from HuggingFace before converting")
     
     args = parser.parse_args()
     
@@ -548,8 +548,8 @@ def main():
         download_and_convert(args.model, args.output, args.dense_bits)
     else:
         if not Path(args.model).exists():
-            print(f"  ✗ Percorso non trovato: {args.model}")
-            print(f"  Usa --download per scaricare da HuggingFace")
+            print(f"  ✗ Path not found: {args.model}")
+            print(f"  Use --download to download from HuggingFace")
             sys.exit(1)
         convert_model(args.model, args.output, args.dense_bits)
 

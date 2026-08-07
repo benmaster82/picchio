@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scarica solo i bias expert originali GPT-OSS e crea un sidecar F32."""
+"""Download only the original GPT-OSS expert biases and create an F32 sidecar."""
 import argparse
 import json
 import struct
@@ -23,7 +23,7 @@ def request_range(session, url, start, end, retries=6):
             response.raise_for_status()
             expected = end - start + 1
             if response.status_code != 206 or len(response.content) != expected:
-                raise IOError(f"range incompleto: {len(response.content)}/{expected}")
+                raise IOError(f"incomplete range: {len(response.content)}/{expected}")
             return response.content
         except Exception:
             if attempt + 1 == retries:
@@ -67,7 +67,7 @@ def main():
             elif dtype == "F16":
                 array = np.frombuffer(raw, dtype="<f2").astype(np.float32)
             else:
-                raise ValueError(f"dtype non supportato: {dtype} per {name}")
+                raise ValueError(f"unsupported dtype: {dtype} for {name}")
             tensors[name] = array.reshape(meta["shape"]).copy()
         print(f"[{index}/{len(shards)}] {filename}: {len(names)} bias", flush=True)
 
@@ -76,7 +76,7 @@ def main():
         "source": REPO,
         "purpose": "Picchio expert biases F32 sidecar",
     })
-    print(f"Sidecar: {output} — {len(tensors)} tensori — {output.stat().st_size/1e6:.1f} MB")
+    print(f"Sidecar: {output} — {len(tensors)} tensors — {output.stat().st_size/1e6:.1f} MB")
 
 
 if __name__ == "__main__":

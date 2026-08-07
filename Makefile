@@ -1,21 +1,21 @@
 # Picchio — Makefile
-# Motore MoE streaming per GPT-OSS-120B
+# Streaming MoE engine for GPT-OSS-120B
 
 CC      ?= gcc
 CFLAGS  := -O3 -march=native -fopenmp -Wall -Wextra -Wpedantic
 LDFLAGS := -lm -lpthread -fopenmp
 
-# Windows (MinGW): rss_gb usa GetProcessMemoryInfo → serve psapi
+# Windows (MinGW): rss_gb uses GetProcessMemoryInfo → needs psapi
 ifeq ($(OS),Windows_NT)
 LDFLAGS += -lpsapi
 endif
 
-# Sorgenti (nella root, non in c/)
+# Sources (in the root, not in c/)
 SRC     := picchio.c
 HEADERS := quant.h json.h st.h
 TARGET  := picchio
 
-# CUDA (opzionale)
+# CUDA (optional)
 ifdef CUDA
 CFLAGS  += -DPICCHIO_CUDA
 LDFLAGS += -lcuda -lcudart
@@ -29,40 +29,39 @@ all: $(TARGET)
 
 $(TARGET): $(SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
-	@echo "✓ $(TARGET) compilato"
+	@echo "✓ $(TARGET) built"
 
 # ── Test ──
 
 check: $(TARGET)
 	@echo "── self-test ──"
 	./$(TARGET) --self-test 2>/dev/null || true
-	@echo "✓ test superati"
+	@echo "✓ tests passed"
 
 # ── Info ──
 
 info:
-	@echo "picchio — motore MoE streaming per GPT-OSS-120B"
+	@echo "picchio — streaming MoE engine for GPT-OSS-120B"
 	@echo ""
 	@echo "Build:  make"
 	@echo "Run:    MODEL=/path/to/gptoss_i4 ./picchio"
 	@echo "Test:   make check"
 	@echo "Clean:  make clean"
 	@echo ""
-	@echo "Variabili d'ambiente:"
-	@echo "  MODEL     percorso al modello convertito"
-	@echo "  MAX       token massimi da generare (default: 128)"
-	@echo "  TEMP      temperatura sampling (default: 1.0)"
-	@echo "  TOPP      nucleus sampling top-p (default: 0.95)"
-	@echo "  PIN_GB    GB di RAM per hot-store expert (default: auto)"
-	@echo "  DIRECT    1=O_DIRECT per expert (default: 0)"
-	@echo "  PREFETCH  1=prefetch→LRU del layer successivo (default: 0; alias PILOT)"
-	@echo "  IO_THREADS thread per i read paralleli degli expert (default: 4)"
-	@echo "  PIPE      0=forza read seriali (compat), altrimenti usa IO_THREADS"
-	@echo "  ECAP      override slot cache per layer (default: auto da PIN_GB)"
-	@echo "  PREDICT_PROBE 1=misura accuratezza predizione prefetch (diagnostica)"
+	@echo "Environment variables:"
+	@echo "  MODEL       path to the converted model"
+	@echo "  MAX         maximum tokens to generate (default: 128)"
+	@echo "  TEMPERATURE sampling temperature (default: 1.0)"
+	@echo "  TOPP        nucleus sampling top-p (default: 0.95)"
+	@echo "  PIN_GB      GB of RAM for the expert cache (default: auto)"
+	@echo "  PREFETCH    1=prefetch→LRU of the next layer (default: 0; alias PILOT)"
+	@echo "  IO_THREADS  threads for parallel expert reads (default: 4)"
+	@echo "  PIPE        0=force serial reads (compat), otherwise use IO_THREADS"
+	@echo "  ECAP        override cache slots per layer (default: auto from PIN_GB)"
+	@echo "  PREDICT_PROBE 1=measure prefetch prediction accuracy (diagnostic)"
 
 # ── Clean ──
 
 clean:
 	rm -f $(TARGET) $(TARGET).exe
-	@echo "✓ pulito"
+	@echo "✓ cleaned"

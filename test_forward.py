@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""test_forward.py — Valida il forward pass di Picchio in Python.
+"""test_forward.py — Validate Picchio's forward pass in Python.
 
-Carica il mini-modello di test e esegue un forward pass identico a quello
-del codice C, poi verifica che ogni componente funziona correttamente.
+Loads the test mini-model and runs a forward pass identical to the C code, then
+verifies that each component works correctly.
 
-Questo serve come:
-  1. Oracle: genera output di riferimento per validare il C
-  2. Test strutturale: verifica che l'architettura è corretta
-  3. Validazione prima di avere il compilatore
+This serves as:
+  1. Oracle: generates reference output to validate the C
+  2. Structural test: verifies the architecture is correct
+  3. Validation before having the compiler
 
-Uso:
+Usage:
   python3 test_forward.py [test_model]
 """
 
@@ -58,11 +58,11 @@ def rope(v, pos, head_dim, theta=10000.0):
 
 
 def forward_pass(model_dir):
-    """Esegue un forward pass completo sul mini-modello."""
+    """Run a complete forward pass on the mini-model."""
 
     model_dir = Path(model_dir)
 
-    # Carica config
+    # Load config
     with open(model_dir / "config.json") as f:
         cfg = json.load(f)
 
@@ -85,26 +85,26 @@ def forward_pass(model_dir):
     print(f"Config: D={D} L={L} H={H} KVH={KVH} hd={hd} E={E} top{topk} V={V}")
     print(f"        moe_inter={moe_inter} sw={sw} theta={theta}")
 
-    # Carica pesi
+    # Load weights
     tensors = load_file(str(model_dir / "model.safetensors"))
-    print(f"Tensori caricati: {len(tensors)}")
+    print(f"Tensors loaded: {len(tensors)}")
 
-    # ── Test componenti ──
-    print("\n── Test componenti ──")
+    # ── Component tests ──
+    print("\n── Component tests ──")
 
     # Test RMSNorm
     x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     w = np.ones(4, dtype=np.float32)
     out = rmsnorm(x, w, eps)
     rms = np.sqrt(np.mean(x*x) + eps)
-    assert abs(out[0] - 1.0/rms) < 1e-5, f"RMSNorm fallito: {out[0]} vs {1.0/rms}"
+    assert abs(out[0] - 1.0/rms) < 1e-5, f"RMSNorm failed: {out[0]} vs {1.0/rms}"
     print("  RMSNorm ✓")
 
     # Test softmax
     x = np.array([1.0, 2.0, 3.0])
     s = softmax(x)
-    assert abs(np.sum(s) - 1.0) < 1e-6, "Softmax somma != 1"
-    assert s[2] > s[1] > s[0], "Softmax ordine sbagliato"
+    assert abs(np.sum(s) - 1.0) < 1e-6, "Softmax sum != 1"
+    assert s[2] > s[1] > s[0], "Softmax wrong order"
     print("  Softmax ✓")
 
     # Test SiLU
@@ -116,11 +116,11 @@ def forward_pass(model_dir):
     # Test RoPE pos=0
     v = np.arange(1, hd+1, dtype=np.float32)
     v_rope = rope(v, 0, hd, theta)
-    assert np.allclose(v, v_rope, atol=1e-5), "RoPE pos=0 ha modificato il vettore"
+    assert np.allclose(v, v_rope, atol=1e-5), "RoPE pos=0 modified the vector"
     print("  RoPE (pos=0) ✓")
 
-    # ── Forward pass su 4 token ──
-    print("\n── Forward pass: 4 token ──")
+    # ── Forward pass on 4 tokens ──
+    print("\n── Forward pass: 4 tokens ──")
 
     tokens = [1, 5, 3, 7]
 
@@ -256,9 +256,9 @@ def forward_pass(model_dir):
         next_tok = np.argmax(logits)
         print(f"  pos={pos} tok_in={tok} → tok_out={next_tok} (logit_max={logits[next_tok]:.4f})")
 
-    print("\n── Forward pass COMPLETATO ──")
-    print("Il codice Python produce output coerente (pesi random = output random ma valido).")
-    print("Quando il C compila, il self-test dovrebbe dare risultati analoghi.")
+    print("\n── Forward pass COMPLETE ──")
+    print("The Python code produces coherent output (random weights = random but valid output).")
+    print("When the C compiles, the self-test should give analogous results.")
     return 0
 
 
