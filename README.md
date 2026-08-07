@@ -1,5 +1,23 @@
 # Picchio 🪶
 
+```
+     ▄▄▄       ██
+   ▄██████▄    ██
+  ██████████   ██
+  ████ ███████▄██   peck!
+  ████████████ ██
+   ██████████  ██
+   ██████████  ██
+    ████████   ██
+    ████████   ██
+     ██████    ██
+     ██████    ██
+    ██▘  ▝██   ██
+```
+
+> *The woodpecker drums a hundred times a second on a huge trunk —
+> we drum 128 experts on a huge disk.*
+
 **A streaming Mixture-of-Experts (MoE) inference engine for the GPT-OSS models
 (20B and 120B), written in pure C, that runs models larger than your RAM on
 ordinary consumer hardware.**
