@@ -36,6 +36,11 @@ class PicchioSession:
                     "OMP_NUM_THREADS": str(threads)})
         if sampling:
             env.update({k: str(v) for k, v in sampling.items() if v is not None})
+        # Sampling di default inviato in ogni TURN (override per-turno possibile).
+        s = sampling or {}
+        self.temperature = 1.0 if s.get("TEMPERATURE") is None else float(s["TEMPERATURE"])
+        self.top_p = 0.95 if s.get("TOPP") is None else float(s["TOPP"])
+        self.top_k = 50 if s.get("TOPK") is None else int(s["TOPK"])
         if model_aux:
             env["MODEL_AUX"] = model_aux
         self.proc = subprocess.Popen(
@@ -56,8 +61,13 @@ class PicchioSession:
             raise RuntimeError("il servizio Picchio si è chiuso inaspettatamente")
         return line.strip()
 
-    def turn(self, ids, max_new, keep, on_token):
-        payload = f"TURN {max_new} {keep} {len(ids)} " + " ".join(map(str, ids)) + "\n"
+    def turn(self, ids, max_new, keep, on_token,
+             temperature=None, top_p=None, top_k=None):
+        temp = self.temperature if temperature is None else temperature
+        topp = self.top_p if top_p is None else top_p
+        topk = self.top_k if top_k is None else top_k
+        payload = (f"TURN {max_new} {keep} {temp} {topp} {topk} {len(ids)} "
+                   + " ".join(map(str, ids)) + "\n")
         self.proc.stdin.write(payload)
         self.proc.stdin.flush()
         produced = []

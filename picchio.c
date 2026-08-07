@@ -2716,12 +2716,24 @@ static int service_loop(Model *m, int cap) {
             return 1;
         }
 
+        /* Header esteso: sampling per-richiesta (temp, top_p, top_k) fra keep e n_ids. */
         long max_new = 0, keep = 0, n_ids = 0;
-        if (scanf("%ld %ld %ld", &max_new, &keep, &n_ids) != 3) {
+        float t_temp = 0.0f, t_topp = 0.0f;
+        long t_topk = 0;
+        if (scanf("%ld %ld %f %f %ld %ld", &max_new, &keep,
+                  &t_temp, &t_topp, &t_topk, &n_ids) != 6) {
             printf("ERROR BAD_HEADER 1 header TURN illeggibile\n");
             fflush(stdout);
             return 1;
         }
+        /* Applica il sampling di questo turno (clamp difensivo). */
+        if (t_temp < 0.0f) t_temp = 0.0f;
+        if (t_temp > 5.0f) t_temp = 5.0f;
+        if (t_topp <= 0.0f || t_topp > 1.0f) t_topp = 1.0f;
+        if (t_topk < 0) t_topk = 0;
+        g_temperature = t_temp;
+        g_top_p = t_topp;
+        g_top_k = (int)t_topk;
         if (max_new < 0 || keep < 0 || keep > pos || n_ids <= 0 ||
             keep + n_ids > cap || n_ids > cap) {
             printf("ERROR BAD_RANGE 0 keep/n_ids fuori limiti (pos=%d cap=%d)\n", pos, cap);

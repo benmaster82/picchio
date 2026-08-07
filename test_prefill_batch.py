@@ -22,7 +22,7 @@ def run(batch):
                             stdout=subprocess.PIPE, text=True, encoding="ascii",
                             errors="replace", bufsize=1)
     assert proc.stdout.readline().startswith("READY ")
-    proc.stdin.write(f"TURN {MAX_NEW} 0 {len(PROMPT)} " +
+    proc.stdin.write(f"TURN {MAX_NEW} 0 0 1 0 {len(PROMPT)} " +
                      " ".join(map(str, PROMPT)) + "\n")
     proc.stdin.flush()
     tokens = []

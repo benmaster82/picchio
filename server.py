@@ -89,9 +89,11 @@ class Engine:
             if no_reasoning else [])
         return list(full) + final_prefill, final_prefill
 
-    def generate(self, ids, final_prefill, max_new, on_delta):
+    def generate(self, ids, final_prefill, max_new, on_delta,
+                 temperature=None, top_p=None, top_k=None):
         """Esegue un turno. `on_delta(channel, text)` per ogni frammento.
 
+        temperature/top_p/top_k: override per-richiesta (None = default sessione).
         Ritorna (final_text, analysis_text, finish_reason, prompt_tokens,
         completion_tokens).
         """
@@ -105,9 +107,12 @@ class Engine:
             if a != b:
                 break
             keep += 1
+        # Riprocessa sempre almeno l'ultimo token: se il prompt è identico o è un
+        # prefisso di quanto già consumato, keep coprirebbe tutto e il delta sarebbe
+        # vuoto, senza un token da cui far ripartire la generazione.
+        if keep >= len(ids):
+            keep = len(ids) - 1
         delta = ids[keep:]
-        if not delta:
-            raise ValueError("delta vuoto: nulla da elaborare")
         print(f"[turno: riuso {keep}/{len(ids)} posizioni, {len(delta)} da elaborare]",
               file=sys.stderr)
 
@@ -126,7 +131,9 @@ class Engine:
                     collected[ch].append(chunk)
                 on_delta(ch, chunk)
 
-        produced, reason, _pos = self.session.turn(delta, max_new, keep, on_token)
+        produced, reason, _pos = self.session.turn(
+            delta, max_new, keep, on_token,
+            temperature=temperature, top_p=top_p, top_k=top_k)
         self.committed = ids + produced
 
         return (
@@ -208,6 +215,10 @@ class Handler(BaseHTTPRequestHandler):
         max_new = int(req.get("max_tokens") or req.get("max_completion_tokens") or 512)
         stream = bool(req.get("stream", False))
         req_date = req.get("date", eng.default_date)
+        # Sampling per-richiesta (None = default della sessione).
+        sampling = {"temperature": req.get("temperature"),
+                    "top_p": req.get("top_p"),
+                    "top_k": req.get("top_k")}
 
         try:
             ids, final_prefill = eng.build_ids(messages, reasoning, req_date, no_reasoning)
@@ -219,16 +230,16 @@ class Handler(BaseHTTPRequestHandler):
         created = int(time.time())
 
         if stream:
-            self._handle_stream(eng, ids, final_prefill, max_new, cid, created)
+            self._handle_stream(eng, ids, final_prefill, max_new, cid, created, sampling)
         else:
-            self._handle_blocking(eng, ids, final_prefill, max_new, cid, created)
+            self._handle_blocking(eng, ids, final_prefill, max_new, cid, created, sampling)
 
     # --- non streaming ---
-    def _handle_blocking(self, eng, ids, final_prefill, max_new, cid, created):
+    def _handle_blocking(self, eng, ids, final_prefill, max_new, cid, created, sampling):
         try:
             with eng.lock:
                 final, analysis, finish, ptok, ctok = eng.generate(
-                    ids, final_prefill, max_new, lambda ch, txt: None)
+                    ids, final_prefill, max_new, lambda ch, txt: None, **sampling)
         except ValueError as exc:
             self._error(400, str(exc))
             return
@@ -248,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     # --- streaming SSE ---
-    def _handle_stream(self, eng, ids, final_prefill, max_new, cid, created):
+    def _handle_stream(self, eng, ids, final_prefill, max_new, cid, created, sampling):
         self._sse_open()
 
         def frame(delta, finish=None):
@@ -268,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with eng.lock:
                 _final, _analysis, finish, _p, _c = eng.generate(
-                    ids, final_prefill, max_new, on_delta)
+                    ids, final_prefill, max_new, on_delta, **sampling)
         except ValueError as exc:
             self._sse_send(frame({"content": f"[errore: {exc}]"}, "stop"))
             self.wfile.write(b"data: [DONE]\n\n")

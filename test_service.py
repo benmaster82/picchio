@@ -34,7 +34,8 @@ class Service:
         return line.strip()
 
     def turn(self, ids, max_new, keep=0):
-        payload = f"TURN {max_new} {keep} {len(ids)} " + " ".join(map(str, ids)) + "\n"
+        payload = (f"TURN {max_new} {keep} 0 1 0 {len(ids)} "
+                   + " ".join(map(str, ids)) + "\n")
         self.proc.stdin.write(payload)
         self.proc.stdin.flush()
         tokens = []

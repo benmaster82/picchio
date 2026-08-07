@@ -173,10 +173,12 @@ Il modello è un unico processo con una sola KV-cache: le richieste vengono
 **serializzate** con un lock. Il riuso del prefisso lavora sui token, quindi fra
 richieste diverse recupera comunque l'overlap e ricalcola solo alla divergenza.
 Il canale `analysis` viene esposto in `reasoning_content`, la risposta in
-`content`. Parametri per-richiesta: `max_tokens`, `reasoning_effort`
-(`low`/`medium`/`high`) e `no_reasoning` (via `extra_body`). temperature/top-p/
-top-k sono fissati all'avvio del server (il C li legge da env una sola volta):
-l'override per-richiesta richiederebbe di estendere il protocollo `TURN`.
+`content`. Parametri per-richiesta: `max_tokens`, `temperature`, `top_p`,
+`top_k`, `reasoning_effort` (`low`/`medium`/`high`) e `no_reasoning` (via
+`extra_body`). temperature/top-p/top-k viaggiano nell'header `TURN` esteso
+(`TURN <max_new> <keep> <temp> <top_p> <top_k> <n_ids> ...`), quindi cambiano
+a ogni richiesta senza riavviare il server; se omessi si usano i default passati
+all'avvio.
 
 ## File
 
@@ -219,7 +221,8 @@ test_forward.py  — oracle Python per validazione
 - [ ] PILOT prefetch utile: va riscritto per popolare direttamente la cache LRU
 - [x] Server API OpenAI-compatible (`server.py`): `/v1/chat/completions` streaming
       SSE e non, `/v1/models`, `/health`. Drop-in col client `openai` ufficiale;
-      richieste serializzate su un'unica sessione con riuso del prefisso KV
+      richieste serializzate su un'unica sessione con riuso del prefisso KV.
+      Sampling (temperature/top-p/top-k) per-richiesta via header `TURN` esteso
 
 ## Licenza
 

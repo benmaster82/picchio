@@ -155,7 +155,9 @@ Protocollo di servizio, righe di testo su pipe, stdout riservato al protocollo e
 alla diagnostica:
 
 - `READY <ctx_capacity> <vocab> <stop_ids...>` all'avvio;
-- `TURN <max_new> <keep> <n_ids> <ids...>`: riusa `keep` posizioni e consuma i nuovi ID;
+- `TURN <max_new> <keep> <temp> <top_p> <top_k> <n_ids> <ids...>`: riusa `keep`
+  posizioni e consuma i nuovi ID; i tre parametri di sampling valgono per il turno
+  (clamp difensivo lato C), rendendo la temperatura per-richiesta senza riavviare;
 - `TOKEN <id>` per ogni token generato, terminatore incluso;
 - `DONE <RETURN|CALL|MAX_TOKENS|CONTEXT_FULL> <n_output> <pos>`;
 - `ERROR <code> <fatal> <messaggio>` con validazione prima di mutare la KV;
