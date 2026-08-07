@@ -1,0 +1,29 @@
+# Normalize line endings: store text as LF in the repository, check out as LF.
+# This keeps the tree consistent across Windows/Linux/macOS and silences the
+# "LF will be replaced by CRLF" warnings.
+* text=auto eol=lf
+
+# Explicit text types (belt and suspenders)
+*.c        text eol=lf
+*.h        text eol=lf
+*.py       text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
+*.txt      text eol=lf
+*.sh       text eol=lf
+Makefile   text eol=lf
+.gitignore text eol=lf
+
+# Windows batch files must keep CRLF
+*.bat      text eol=crlf
+
+# Binary files: never touch line endings
+*.safetensors binary
+*.bin      binary
+*.exe      binary
+*.dll      binary
+*.o        binary
+*.obj      binary
+*.npy      binary
+*.png      binary
+*.jpg      binary
