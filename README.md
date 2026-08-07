@@ -504,4 +504,4 @@ service protocol, and the measured results, read [`DESIGN.md`](DESIGN.md).
 
 ## 12. License
 
-Apache 2.0.
+MIT — see [`LICENSE`](LICENSE).

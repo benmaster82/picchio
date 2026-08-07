@@ -6,7 +6,7 @@
 **Goal:** run GPT-OSS-120B (117B parameters, MoE) on consumer hardware
 (16 GB RAM, NVMe SSD, optional GPU) in pure C, with experts streamed from disk.
 
-License: Apache 2.0.
+License: MIT.
 
 ## 0. Status and normative contract (July 2026 revision)
 
