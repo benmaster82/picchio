@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="620" height="140" viewBox="0 0 620 140">
+  <g shape-rendering="crispEdges">
+    <!-- red crown -->
+    <rect x="42" y="0" width="14" height="14" fill="#e24a3a"/>
+    <rect x="56" y="0" width="14" height="14" fill="#e24a3a"/>
+    <rect x="28" y="14" width="14" height="14" fill="#e24a3a"/>
+    <rect x="42" y="14" width="14" height="14" fill="#e24a3a"/>
+    <rect x="56" y="14" width="14" height="14" fill="#e24a3a"/>
+    <!-- head (green) + eye -->
+    <rect x="14" y="28" width="14" height="14" fill="#37a159"/>
+    <rect x="28" y="28" width="14" height="14" fill="#37a159"/>
+    <rect x="42" y="28" width="14" height="14" fill="#1e1e22"/>
+    <rect x="56" y="28" width="14" height="14" fill="#37a159"/>
+    <rect x="70" y="28" width="14" height="14" fill="#37a159"/>
+    <!-- head band + straight beak (grey), pointing right -->
+    <rect x="14" y="42" width="14" height="14" fill="#37a159"/>
+    <rect x="28" y="42" width="14" height="14" fill="#37a159"/>
+    <rect x="42" y="42" width="14" height="14" fill="#37a159"/>
+    <rect x="56" y="42" width="14" height="14" fill="#37a159"/>
+    <rect x="70" y="42" width="14" height="14" fill="#37a159"/>
+    <rect x="84" y="42" width="14" height="14" fill="#6e6e74"/>
+    <rect x="98" y="42" width="14" height="14" fill="#6e6e74"/>
+    <rect x="112" y="42" width="14" height="14" fill="#6e6e74"/>
+    <!-- breast -->
+    <rect x="14" y="56" width="14" height="14" fill="#37a159"/>
+    <rect x="28" y="56" width="14" height="14" fill="#7ecb92"/>
+    <rect x="42" y="56" width="14" height="14" fill="#7ecb92"/>
+    <rect x="56" y="56" width="14" height="14" fill="#7ecb92"/>
+    <rect x="70" y="56" width="14" height="14" fill="#37a159"/>
+    <!-- belly -->
+    <rect x="14" y="70" width="14" height="14" fill="#7ecb92"/>
+    <rect x="28" y="70" width="14" height="14" fill="#7ecb92"/>
+    <rect x="42" y="70" width="14" height="14" fill="#7ecb92"/>
+    <rect x="56" y="70" width="14" height="14" fill="#7ecb92"/>
+    <rect x="70" y="70" width="14" height="14" fill="#37a159"/>
+    <!-- lower body + red vent -->
+    <rect x="28" y="84" width="14" height="14" fill="#37a159"/>
+    <rect x="42" y="84" width="14" height="14" fill="#7ecb92"/>
+    <rect x="56" y="84" width="14" height="14" fill="#e24a3a"/>
+    <rect x="70" y="84" width="14" height="14" fill="#37a159"/>
+    <!-- stiff tail, down -->
+    <rect x="28" y="98" width="14" height="14" fill="#37a159"/>
+    <rect x="42" y="98" width="14" height="14" fill="#2c7a46"/>
+    <rect x="56" y="98" width="14" height="14" fill="#37a159"/>
+    <rect x="42" y="112" width="14" height="14" fill="#2c7a46"/>
+    <rect x="56" y="112" width="14" height="14" fill="#2c7a46"/>
+    <rect x="56" y="126" width="14" height="14" fill="#2c7a46"/>
+  </g>
+  <text x="210" y="62" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="52" font-weight="bold" fill="#2f8f57">picchio</text>
+  <text x="210" y="94" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="19" fill="#808080" font-style="italic">patient engine, immense model</text>
+  <text x="210" y="122" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="15" fill="#9a9a9a">GPT-OSS &#183; 120B MoE &#183; int4 &#183; streaming CPU</text>
+</svg>
