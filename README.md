@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/picchio.svg" alt="picchio — it drums the model off the disk — GPT-OSS · 20B/120B · int4 · streaming CPU" width="560">
+  <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS · 20B/120B · int4 · streaming CPU" width="560">
 </p>
 
-> *The woodpecker drums a hundred times a second on a huge trunk —
+> *The woodpecker drums a hundred times a second on a huge trunk;
 > we drum 128 experts on a huge disk.*
 
 **A streaming Mixture-of-Experts (MoE) inference engine for the GPT-OSS models
@@ -19,7 +19,7 @@ without a datacenter GPU.
 Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
 GPT-OSS architecture.
 
-> **New to this?** Read the sections in order. Every command below is complete —
+> **New to this?** Read the sections in order. Every command below is complete:
 > nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
 > equivalents are given where they differ.
 
@@ -31,8 +31,8 @@ GPT-OSS architecture.
 2. [Install the toolchain](#2-install-the-toolchain)
 3. [Build the engine](#3-build-the-engine)
 4. [Download and convert a model](#4-download-and-convert-a-model)
-5. [Run it — the chat bridge (recommended)](#5-run-it--the-chat-bridge-recommended)
-6. [Run it — as an OpenAI-compatible API server](#6-run-it--as-an-openai-compatible-api-server)
+5. [Run it: the chat bridge (recommended)](#5-run-it-the-chat-bridge-recommended)
+6. [Run it: an OpenAI-compatible API server](#6-run-it-an-openai-compatible-api-server)
 7. [Running the big model (120B)](#7-running-the-big-model-120b)
 8. [Tuning & environment variables](#8-tuning--environment-variables)
 9. [Troubleshooting](#9-troubleshooting)
@@ -106,7 +106,7 @@ From the project folder (`C:\picchio` or wherever you cloned it):
 .\build.bat
 ```
 
-This produces a **self-contained `picchio.exe`** (statically linked — it does not
+This produces a **self-contained `picchio.exe`** (statically linked, it does not
 need any MinGW DLLs and runs from anywhere).
 
 Or compile by hand from the MSYS2 MinGW terminal:
@@ -124,11 +124,11 @@ make
 
 ### Why these flags (don't skip them)
 
-- `-fopenmp` — enables multi-core. **Without it, all matmuls run on one core** and
+- `-fopenmp`: enables multi-core. **Without it, all matmuls run on one core** and
   everything is several times slower.
-- `-mavx2 -mfma` — enables the SIMD kernels. Without them the math falls back to
+- `-mavx2 -mfma`: enables the SIMD kernels. Without them the math falls back to
   slow scalar code. Your CPU must support AVX2.
-- `-static` (Windows) — bakes the OpenMP/pthread runtime into the exe so you don't
+- `-static` (Windows): bakes the OpenMP/pthread runtime into the exe so you don't
   need `libgomp-1.dll` / `libwinpthread-1.dll` next to it.
 
 ### Verify the build
@@ -138,8 +138,8 @@ make
 ./picchio --self-test            # Linux/macOS
 ```
 
-This runs the full forward pass on a tiny synthetic model — **no model download
-needed**. You should see `── self-test SUPERATO ──` ("self-test passed"). If you
+This runs the full forward pass on a tiny synthetic model, **no model download
+needed**. You should see `── self-test PASSED ──`. If you
 do, the engine works.
 
 ---
@@ -162,11 +162,11 @@ pip install torch safetensors numpy huggingface_hub
 python convert.py --model openai/gpt-oss-20b --output D:\gptoss20b_i4 --download
 ```
 
-- `--model` — the Hugging Face repo id (`openai/gpt-oss-20b`).
-- `--output` — a folder **you choose** where the converted model will be written.
+- `--model`: the Hugging Face repo id (`openai/gpt-oss-20b`).
+- `--output`: a folder **you choose** where the converted model will be written.
   Put it on your fastest internal disk. Use any path you like (e.g.
   `C:\models\gptoss20b_i4` or `~/gptoss20b_i4`).
-- `--download` — fetch the model from Hugging Face automatically. Omit this if you
+- `--download`: fetch the model from Hugging Face automatically. Omit this if you
   already downloaded the raw model yourself and pointed `--model` at a local
   folder.
 
@@ -193,7 +193,7 @@ Your model folder is now ready to use.
 
 ---
 
-## 5. Run it — the chat bridge (recommended)
+## 5. Run it: the chat bridge (recommended)
 
 `chat.py` is the **recommended way to talk to the model**. It uses OpenAI's
 official "Harmony" library to format the conversation exactly the way GPT-OSS
@@ -213,11 +213,11 @@ pip install -r requirements-chat.txt
 python chat.py "Write a short greeting in English." --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024
 ```
 
-- **`--model`** — the folder you converted in step 4. **You must pass this**
+- **`--model`**: the folder you converted in step 4. **You must pass this**
   (the built-in default points at a 120B path and won't match your setup).
-- **`--pin-gb`** — how many GB of RAM to spend on the expert cache. More = faster
+- **`--pin-gb`**: how many GB of RAM to spend on the expert cache. More = faster
   (fewer disk reads). `4` is a good start on a 16 GB machine.
-- **`--ctx`** — context window in tokens (how much conversation history fits).
+- **`--ctx`**: context window in tokens (how much conversation history fits).
   `1024` is fine to start.
 
 ### c) Interactive multi-turn chat
@@ -247,7 +247,7 @@ Type your message after `Tu:`. Type `/exit` or `/quit` to leave.
 ### The bare-metal path (advanced / quick test)
 
 You can run the engine directly without Python. This uses a **built-in
-approximate tokenizer** (not token-exact — prefer `chat.py` for real use):
+approximate tokenizer** (not token-exact; prefer `chat.py` for real use):
 
 ```powershell
 $env:MODEL = "D:\gptoss20b_i4"
@@ -263,7 +263,7 @@ MODEL=~/gptoss20b_i4 INPUT="The capital of Italy is" MAX=40 ./picchio
 
 ---
 
-## 6. Run it — as an OpenAI-compatible API server
+## 6. Run it: an OpenAI-compatible API server
 
 `server.py` exposes the model over HTTP with the same API shape as OpenAI, so any
 OpenAI-compatible client or tool can talk to it. It uses only the Python standard
@@ -279,7 +279,7 @@ It prints `[server in ascolto su http://127.0.0.1:8000 ...]` when ready.
 
 ### Endpoints
 
-- `POST /v1/chat/completions` — streaming (SSE) and non-streaming.
+- `POST /v1/chat/completions`: streaming (SSE) and non-streaming.
 - `GET  /v1/models`
 - `GET  /health`
 
@@ -318,7 +318,7 @@ serving many users concurrently.
 
 ## 7. Running the big model (120B)
 
-The 120B is ~66 GB converted. It runs on the same machine as the 20B — just more
+The 120B is ~66 GB converted. It runs on the same machine as the 20B, just more
 slowly, because more must be streamed from disk.
 
 ### Download + convert shard by shard
@@ -335,10 +335,10 @@ python convert_streaming.py
 
 Output/paths are set at the top of `convert_streaming.py` (`OUTPUT`, `RAW_DIR`,
 `REPO`); edit them if you want different locations. The process is
-**resumable** — already-converted shards are skipped if you re-run it.
+**resumable**: already-converted shards are skipped if you re-run it.
 
 > **Slow download?** Hugging Face can be throttled on some connections. A regional
-> mirror is often much faster — set `$env:HF_ENDPOINT = "https://hf-mirror.com"`
+> mirror is often much faster; set `$env:HF_ENDPOINT = "https://hf-mirror.com"`
 > before running. The conversion resumes wherever it left off.
 
 ### Expert bias sidecar
@@ -377,7 +377,7 @@ flags map onto these). The most useful:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MODEL` | — | Path to the converted model folder (or pass it as the first argument). |
+| `MODEL` | (none) | Path to the converted model folder (or pass it as the first argument). |
 | `PIN_GB` | **auto** | GB of RAM for the expert cache. **The single biggest performance knob.** By default it's sized automatically from your physical RAM (all RAM minus a ~6 GB reserve). A bigger cache means fewer disk reads. Setting a value overrides the auto-sizing. |
 | `CTX` | 512 | KV-cache size in tokens (max prompt+generation length). |
 | `OMP_NUM_THREADS` | all cores | Number of CPU threads for the matmuls. |
@@ -386,7 +386,7 @@ flags map onto these). The most useful:
 | `TOPP` / `TOPK` | 0.95 / 50 | Nucleus / top-k sampling. |
 | `SEED` | fixed | RNG seed for reproducible sampling. |
 | `IO_THREADS` | 4 | Threads used for reading experts from disk in parallel. |
-| `MODEL_AUX` | — | Extra model files on other disks (semicolon-separated). |
+| `MODEL_AUX` | (none) | Extra model files on other disks (semicolon-separated). |
 
 Performance notes:
 
@@ -504,4 +504,4 @@ service protocol, and the measured results, read [`DESIGN.md`](DESIGN.md).
 
 ## 12. License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
