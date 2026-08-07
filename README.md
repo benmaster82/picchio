@@ -148,11 +148,42 @@ Il bridge rileva automaticamente lo shard 12 e il sidecar bias nelle posizioni c
 `--model-aux` sovrascrive esplicitamente `MODEL_AUX`. `tok.h` resta un fallback
 interattivo, ma non è dichiarato token-exact.
 
+## Server API OpenAI-compatible
+
+`server.py` espone Picchio come API HTTP compatibile con OpenAI, riusando la
+stessa infrastruttura token-exact di `chat.py` (Harmony ufficiale + processo
+SERVICE persistente con riuso del prefisso KV). Solo stdlib, nessuna dipendenza
+oltre a `openai-harmony`.
+
+```powershell
+python server.py --model D:\gptoss20b_i4 --port 8000 --pin-gb 4 --ctx 1024
+```
+
+Endpoint: `POST /v1/chat/completions` (streaming SSE e non), `GET /v1/models`,
+`GET /health`. Funziona drop-in col client `openai` ufficiale:
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+r = c.chat.completions.create(model="gptoss20b",
+        messages=[{"role": "user", "content": "Ciao"}], max_tokens=64)
+```
+
+Il modello è un unico processo con una sola KV-cache: le richieste vengono
+**serializzate** con un lock. Il riuso del prefisso lavora sui token, quindi fra
+richieste diverse recupera comunque l'overlap e ricalcola solo alla divergenza.
+Il canale `analysis` viene esposto in `reasoning_content`, la risposta in
+`content`. Parametri per-richiesta: `max_tokens`, `reasoning_effort`
+(`low`/`medium`/`high`) e `no_reasoning` (via `extra_body`). temperature/top-p/
+top-k sono fissati all'avvio del server (il C li legge da env una sola volta):
+l'override per-richiesta richiederebbe di estendere il protocollo `TURN`.
+
 ## File
 
 ```
 picchio.c        — motore principale (include la modalità SERVICE persistente)
 chat.py           — chat Harmony ufficiale ↔ ID raw, multi-turn
+server.py         — API HTTP OpenAI-compatible (streaming SSE, /v1/chat/completions)
 test_service.py   — equivalenza riuso prefisso vs prefill completo
 check_harmony_delta.py — verifica prefix-preserving del render Harmony
 requirements-chat.txt — dipendenza Harmony fissata
@@ -186,7 +217,9 @@ test_forward.py  — oracle Python per validazione
       sulle suite tiny F32/INT4, anche sotto eviction. Controllo con `IO_THREADS`
       (default 4, `PIPE=0` forza seriale); `ECAP` regola gli slot per layer
 - [ ] PILOT prefetch utile: va riscritto per popolare direttamente la cache LRU
-- [ ] Server API OpenAI-compatible
+- [x] Server API OpenAI-compatible (`server.py`): `/v1/chat/completions` streaming
+      SSE e non, `/v1/models`, `/health`. Drop-in col client `openai` ufficiale;
+      richieste serializzate su un'unica sessione con riuso del prefisso KV
 
 ## Licenza
 
