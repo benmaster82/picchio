@@ -1,690 +1,722 @@
-# Picchio — Motore MoE Streaming per GPT-OSS-120B
+# Picchio — Streaming MoE Engine for GPT-OSS-120B
 
-> *Il picchio tamburella cento volte al secondo su un tronco enorme —
-> noi tamburelliamo 128 expert su un disco enorme.*
+> *The woodpecker (picchio) drums a hundred times a second on a huge trunk —
+> we drum 128 experts on a huge disk.*
 
-**Obiettivo:** eseguire GPT-OSS-120B (117B parametri, MoE) su hardware consumer
-(16 GB RAM, SSD NVMe, GPU opzionale) in puro C, con expert streamati da disco.
+**Goal:** run GPT-OSS-120B (117B parameters, MoE) on consumer hardware
+(16 GB RAM, NVMe SSD, optional GPU) in pure C, with experts streamed from disk.
 
-Licenza: Apache 2.0.
+License: Apache 2.0.
 
-## 0. Stato e contratto normativo (revisione luglio 2026)
+## 0. Status and normative contract (July 2026 revision)
 
-Le sezioni storiche successive descrivono l'idea iniziale e possono contenere stime
-superate. In caso di conflitto, questa sezione ha precedenza. L'architettura reale
-usata da Picchio è: hidden size 2880, 36 layer tutti MoE, 64 query head, 8 KV head,
-head dimension 64, 128 expert per layer, top-4, intermediate size 2880, gate/up fuso
-5760, attention sliding-window 128 alternata con full attention, `rope_theta=150000`
-e vocabolario circa 201K. GPT-OSS usa inoltre attention sinks, YaRN e una variante
-clipped SwiGLU: nessuno di questi dettagli può essere sostituito da un'approssimazione
-senza una prova oracle.
+The historical sections that follow describe the initial idea and may contain
+outdated estimates. In case of conflict, this section takes precedence. The
+actual architecture used by Picchio is: hidden size 2880, 36 layers all MoE,
+64 query heads, 8 KV heads, head dimension 64, 128 experts per layer, top-4,
+intermediate size 2880, fused gate/up 5760, sliding-window-128 attention
+alternated with full attention, `rope_theta=150000`, and a vocabulary of about
+201K. GPT-OSS additionally uses attention sinks, YaRN, and a clipped SwiGLU
+variant: none of these details can be replaced with an approximation without an
+oracle proof.
 
-Lo stato corrente è **runtime end-to-end e forward numericamente validati** contro
-Transformers sul tiny model, sia in F32 sia in INT4 group-scaled. Il GPT-OSS-120B reale
-ha inoltre completato più passi autoregressivi con KV-cache e logits finiti. Questa
-validazione riguarda runtime e forward su ID token raw; tokenizer o200k e Harmony non
-sono ancora token-exact e restano una suite separata.
+The current status is **end-to-end runtime and forward pass numerically
+validated** against Transformers on the tiny model, both in F32 and in
+group-scaled INT4. The real GPT-OSS-120B has also completed multiple
+autoregressive steps with KV-cache and finite logits. This validation covers the
+runtime and forward pass on raw token IDs; the o200k tokenizer and Harmony are
+not yet token-exact and remain a separate suite.
 
-### 0.1 Fixture ufficiale
+### 0.1 Official fixture
 
-- Modello: `tiny-random/gpt-oss`
-- Revisione bloccata: `02ba5c61f879b5a38a8b1f7a8e0409b8e1bb8f38`
-- Scopo: debug architetturale; pesi casuali, non valutazione della qualità linguistica.
-- Input primario: ID token raw fissi. Tokenizer e Harmony sono una suite separata.
-- Riferimento: `transformers==4.57.1`, `torch==2.6.0`, `safetensors==0.6.2`.
-- Esecuzione: batch 1, `eval()`, nessun gradiente, nessun sampling, PILOT disattivato,
-  repetition penalty 1.0 e argmax deterministico.
+- Model: `tiny-random/gpt-oss`
+- Pinned revision: `02ba5c61f879b5a38a8b1f7a8e0409b8e1bb8f38`
+- Purpose: architectural debugging; random weights, not an evaluation of language
+  quality.
+- Primary input: fixed raw token IDs. Tokenizer and Harmony are a separate suite.
+- Reference: `transformers==4.57.1`, `torch==2.6.0`, `safetensors==0.6.2`.
+- Execution: batch 1, `eval()`, no gradient, no sampling, PILOT disabled,
+  repetition penalty 1.0, and deterministic argmax.
 
-### 0.2 Tre livelli di validazione
+### 0.2 Three levels of validation
 
-**L0 — Container-exact.** Il convertitore deve produrre un manifest con nome, dtype,
-shape, byte count, schema di quantizzazione, group size e hash. Ogni peso obbligatorio,
-inclusi bias expert e attention sinks, deve esistere. Packed INT4, scale e righe
-dequantizzate campione devono coincidere tra Python e C entro la tolleranza dichiarata.
-Short read, shape inattesa o fallback silenzioso sono errori fatali.
+**L0 — Container-exact.** The converter must produce a manifest with name, dtype,
+shape, byte count, quantization scheme, group size, and hash. Every mandatory
+weight, including expert biases and attention sinks, must exist. Packed INT4,
+scales, and sample dequantized rows must match between Python and C within the
+declared tolerance. A short read, an unexpected shape, or a silent fallback are
+fatal errors.
 
-**L1 — Implementation-exact.** Picchio C viene confrontato con un oracle Python che
-legge gli stessi file convertiti Picchio e riproduce la stessa dequantizzazione. Gli
-indici top-k e l'argmax devono essere identici; per tensori F32 si registrano max-abs,
-max-rel e cosine error. Questo livello separa i bug del runtime dagli effetti della
-quantizzazione lossy.
+**L1 — Implementation-exact.** Picchio C is compared against a Python oracle that
+reads the same Picchio-converted files and reproduces the same dequantization.
+The top-k indices and argmax must be identical; for F32 tensors we record max-abs,
+max-rel, and cosine error. This level separates runtime bugs from the effects of
+lossy quantization.
 
-**L2 — Transformers token-exact.** Con gli stessi ID di input, Picchio viene confrontato
-con Transformers sul checkpoint originale. Gli ID greedy devono coincidere. Poiché
-MXFP4/BF16 → INT4 gs64 è lossy, un mismatch L2 dopo il superamento di L0 e L1 deve
-riportare anche top-1/top-2 margin e differenza logits: non dimostra da solo un bug C.
+**L2 — Transformers token-exact.** With the same input IDs, Picchio is compared
+against Transformers on the original checkpoint. Greedy IDs must match. Because
+MXFP4/BF16 → INT4 gs64 is lossy, an L2 mismatch after L0 and L1 have passed must
+also report top-1/top-2 margin and logit difference: on its own it does not prove
+a C bug.
 
-### 0.3 Checkpoint e ordine obbligatorio
+### 0.3 Checkpoints and mandatory order
 
-Per un token a posizione 0 e layer 0 confrontare, nell'ordine:
+For a token at position 0 and layer 0, compare, in order:
 
-1. embedding e RMSNorm pre-attention;
-2. Q/K/V prima e dopo bias;
-3. Q/K dopo RoPE/YaRN;
-4. KV scritto, intervallo della mask e attention scores;
-5. sink logit, massa softmax del sink, concat head e output projection;
-6. residual e RMSNorm pre-MoE;
-7. router logits, top-k ordinato e relativi pesi;
-8. gate/up con bias, split, clipped SwiGLU, down con bias e contributi pesati;
-9. residual di fine layer;
-10. final norm, logits, top-10, margine top-1/top-2 e argmax.
+1. embedding and pre-attention RMSNorm;
+2. Q/K/V before and after bias;
+3. Q/K after RoPE/YaRN;
+4. KV written, mask range, and attention scores;
+5. sink logit, sink softmax mass, head concat, and output projection;
+6. residual and pre-MoE RMSNorm;
+7. router logits, sorted top-k, and their weights;
+8. gate/up with bias, split, clipped SwiGLU, down with bias, and weighted
+   contributions;
+9. end-of-layer residual;
+10. final norm, logits, top-10, top-1/top-2 margin, and argmax.
 
-Dopo il singolo token: sequenza corta sul layer 0; posizioni 127/128/129 per la sliding
-window; un token attraverso tutti i layer; prefill raw fisso; infine 8–32 token greedy.
-Si corregge esclusivamente il primo checkpoint divergente, poi si ripete dall'inizio.
+After the single token: a short sequence on layer 0; positions 127/128/129 for the
+sliding window; one token through all layers; a fixed raw prefill; finally 8–32
+greedy tokens. Only the first divergent checkpoint is fixed, then the process is
+repeated from the start.
 
-I dump sono F32 little-endian o `.npy`, accompagnati da JSON con versione, revisione,
-input IDs, posizione, layer, shape, dtype, hash e statistiche. Sul tiny si possono
-salvare tensori completi; sul 120B si usano hash e probe. OpenMP/SIMD, cache eviction,
-hot-store, PILOT, tokenizer e Harmony vengono riabilitati e verificati solo dopo L1.
+Dumps are F32 little-endian or `.npy`, accompanied by JSON with version, revision,
+input IDs, position, layer, shape, dtype, hash, and statistics. On the tiny model
+full tensors can be saved; on the 120B, hashes and probes are used. OpenMP/SIMD,
+cache eviction, hot-store, PILOT, tokenizer, and Harmony are re-enabled and
+verified only after L1.
 
-### 0.4 Criteri di accettazione della milestone “token corretto”
+### 0.4 Acceptance criteria for the "correct token" milestone
 
-- Fixture riproducibile dalla revisione bloccata e senza dipendere dal modello 120B.
-- Nessun peso obbligatorio mancante o sostituito con valori di default.
-- Test isolati superati per INT4 gs64, embedding, RMSNorm, RoPE/YaRN, softmax con sink,
-  routing e clipped SwiGLU.
-- Tutti i checkpoint L1 entro le tolleranze registrate e top-k/argmax identici.
-- Sequenza greedy L1 identica per almeno 32 token raw.
-- Risultato L2 documentato separatamente; solo dopo si applicano le correzioni validate
-  alla conversione e al runtime del GPT-OSS-120B.
+- Fixture reproducible from the pinned revision, without depending on the 120B
+  model.
+- No mandatory weight missing or replaced with default values.
+- Isolated tests passed for INT4 gs64, embedding, RMSNorm, RoPE/YaRN, softmax with
+  sink, routing, and clipped SwiGLU.
+- All L1 checkpoints within the recorded tolerances and top-k/argmax identical.
+- Identical L1 greedy sequence for at least 32 raw tokens.
+- L2 result documented separately; only afterwards are the validated fixes applied
+  to the conversion and runtime of GPT-OSS-120B.
 
-### 0.5 Risultati della validazione
+### 0.5 Validation results
 
-Validazione completata il 29 luglio 2026:
+Validation completed on 29 July 2026:
 
-- checkpoint F32 layer-by-layer entro `atol=rtol=1e-5`;
-- top-k, pesi router e argmax identici;
-- 32 token greedy identici tra Picchio e Transformers;
-- KV-cache e confine sliding verificati alla posizione 130;
-- container INT4 group-scaled confrontato con un riferimento dequantizzato identico;
-- tutti i 15 shard reali validati con il parser safetensors ufficiale;
-- shard 13, trovato troncato, ricostruito expert-per-expert con verifica bit-per-bit
-  delle scale già presenti;
-- GPT-OSS-120B eseguito per più passi autoregressivi senza NaN/Inf.
+- layer-by-layer F32 checkpoints within `atol=rtol=1e-5`;
+- top-k, router weights, and argmax identical;
+- 32 greedy tokens identical between Picchio and Transformers;
+- KV-cache and sliding boundary verified at position 130;
+- group-scaled INT4 container compared against an identical dequantized reference;
+- all 15 real shards validated with the official safetensors parser;
+- shard 13, found truncated, rebuilt expert-by-expert with bit-for-bit
+  verification of the scales already present;
+- GPT-OSS-120B run for multiple autoregressive steps without NaN/Inf.
 
-La vecchia conversione aveva quantizzato per errore i bias expert. Il runtime supporta
-quel formato per retrocompatibilità, ma la modalità raccomandata usa il sidecar F32
-prodotto da `download_expert_biases.py`. Le conversioni future preservano direttamente
-i bias expert in F32.
+The old conversion had mistakenly quantized the expert biases. The runtime
+supports that format for backward compatibility, but the recommended mode uses the
+F32 sidecar produced by `download_expert_biases.py`. Future conversions preserve
+the expert biases directly in F32.
 
-### 0.6 Milestone chat single-turn token-exact
+### 0.6 Single-turn token-exact chat milestone
 
-Il primo percorso chat non duplica o200k/Harmony in C. Un bridge Python, basato sulla
-libreria ufficiale `openai-harmony` a versione fissata, possiede rendering del prompt,
-tokenizzazione, parsing dei canali e decode. Picchio riceve e produce esclusivamente
-ID token raw; `tok.h` resta un fallback interattivo approssimato e non fa parte del
-contratto token-exact.
+The first chat path does not duplicate o200k/Harmony in C. A Python bridge, based
+on the official `openai-harmony` library at a pinned version, owns prompt
+rendering, tokenization, channel parsing, and decoding. Picchio receives and
+produces only raw token IDs; `tok.h` remains an approximate interactive fallback
+and is not part of the token-exact contract.
 
-Il protocollo runtime deve offrire:
+The runtime protocol must offer:
 
-- input da file di ID decimali, per non dipendere dal limite delle variabili d'ambiente
-  Windows; `RAW=1` e `INPUT` restano compatibili;
-- output machine-readable contenente ogni ID generato, inclusi token Harmony e stop,
-  senza filtro o decode C;
-- stdout riservato agli ID in tale modalità e diagnostica su stderr;
-- stop esplicito su `<|return|>` e `<|call|>`, riportando anche il terminatore;
-  `<|end|>` chiude un messaggio ma non l'intera risposta assistant;
-- campionamento greedy riproducibile per la prima validazione.
+- input from a file of decimal IDs, to avoid depending on the Windows environment
+  variable limit; `RAW=1` and `INPUT` remain compatible;
+- machine-readable output containing every generated ID, including Harmony and
+  stop tokens, with no C-side filtering or decoding;
+- stdout reserved for IDs in that mode, and diagnostics on stderr;
+- explicit stop on `<|return|>` and `<|call|>`, also reporting the terminator;
+  `<|end|>` closes a message but not the entire assistant response;
+- reproducible greedy sampling for the first validation.
 
-Criteri di accettazione: gli ID renderizzati dal bridge coincidono con Harmony
-ufficiale; il trasporto file→C è esatto; la sequenza di output completa è parsabile da
-Harmony; la modalità raw esistente e le suite tiny F32/INT4 non regrediscono.
+Acceptance criteria: the IDs rendered by the bridge match official Harmony; the
+file→C transport is exact; the full output sequence is parsable by Harmony; the
+existing raw mode and the tiny F32/INT4 suites do not regress.
 
-Risultato: milestone raggiunta il 29 luglio 2026. Il GPT-OSS-120B reale ha risposto
-"Ciao!" con prompt Harmony di 77 token, prefill 930,34 s, 23 token in 251,34 s, circa
-0,09 token/s e 20,3% di cache hit expert.
+Result: milestone reached on 29 July 2026. The real GPT-OSS-120B answered "Ciao!"
+with a 77-token Harmony prompt, 930.34 s prefill, 23 tokens in 251.34 s, about
+0.09 tokens/s and 20.3% expert cache hit.
 
-### 0.7 Milestone chat multi-turn persistente
+### 0.7 Persistent multi-turn chat milestone
 
-Obiettivo: non ricaricare il modello e non ricalcolare il prefisso già elaborato.
+Goal: do not reload the model and do not recompute the prefix already processed.
 
-Vincolo misurato: il rendering Harmony **non** è prefix-preserving tra turni. Nel
-re-render canonico il canale `analysis` viene scartato e il `<|return|>` finale diventa
-`<|end|>`. Conservando l'analysis la divergenza si riduce al solo terminatore, con circa
-l'88% delle posizioni riusabili. Il protocollo non può quindi limitarsi ad accodare un
-delta: il bridge calcola il prefisso comune più lungo e il runtime riparte da quella
-posizione, sovrascrivendo la KV successiva.
+Measured constraint: Harmony rendering is **not** prefix-preserving between turns.
+In the canonical re-render the `analysis` channel is dropped and the final
+`<|return|>` becomes `<|end|>`. By keeping the analysis, the divergence is reduced
+to just the terminator, with about 88% of positions reusable. The protocol
+therefore cannot simply append a delta: the bridge computes the longest common
+prefix and the runtime restarts from that position, overwriting the subsequent KV.
 
-Invariante obbligatorio: ogni token trasmesso deve essere anche consumato dal forward,
-inclusi `<|return|>` e `<|call|>`, così che `pos` coincida sempre con il numero di
-posizioni valide in KV. Un token emesso ma non consumato renderebbe il turno successivo
-numericamente errato.
+Mandatory invariant: every transmitted token must also be consumed by the forward
+pass, including `<|return|>` and `<|call|>`, so that `pos` always matches the
+number of valid positions in KV. A token emitted but not consumed would make the
+next turn numerically wrong.
 
-Protocollo di servizio, righe di testo su pipe, stdout riservato al protocollo e stderr
-alla diagnostica:
+Service protocol, text lines over a pipe, stdout reserved for the protocol and
+stderr for diagnostics:
 
-- `READY <ctx_capacity> <vocab> <stop_ids...>` all'avvio;
-- `TURN <max_new> <keep> <temp> <top_p> <top_k> <n_ids> <ids...>`: riusa `keep`
-  posizioni e consuma i nuovi ID; i tre parametri di sampling valgono per il turno
-  (clamp difensivo lato C), rendendo la temperatura per-richiesta senza riavviare;
-- `TOKEN <id>` per ogni token generato, terminatore incluso;
+- `READY <ctx_capacity> <vocab> <stop_ids...>` at startup;
+- `TURN <max_new> <keep> <temp> <top_p> <top_k> <n_ids> <ids...>`: reuse `keep`
+  positions and consume the new IDs; the three sampling parameters apply to the
+  turn (defensive clamp on the C side), making temperature per-request without a
+  restart;
+- `TOKEN <id>` for each generated token, terminator included;
 - `DONE <RETURN|CALL|MAX_TOKENS|CONTEXT_FULL> <n_output> <pos>`;
-- `ERROR <code> <fatal> <messaggio>` con validazione prima di mutare la KV;
-- `RESET` riporta `pos` a 0 conservando modello e cache expert; `SHUTDOWN` esce pulito.
+- `ERROR <code> <fatal> <message>` with validation before mutating the KV;
+- `RESET` sets `pos` back to 0 keeping the model and expert cache; `SHUTDOWN`
+  exits cleanly.
 
-La capacità KV reale è `CTX`: nessun prompt può superarla, perché oltre quel limite le
-scritture verrebbero ignorate silenziosamente producendo risultati errati.
+The real KV capacity is `CTX`: no prompt may exceed it, because beyond that limit
+writes would be silently ignored, producing wrong results.
 
-Risultati del 29 luglio 2026, verificati sul tiny model:
+Results from 29 July 2026, verified on the tiny model:
 
-- il riuso del prefisso produce token identici al prefill completo, con `pos` coerente;
-- `keep` fuori range viene rifiutato senza corrompere la sessione;
-- due turni consecutivi hanno riusato 68 posizioni su 77;
-- le suite tiny F32 e INT4 non sono regredite.
+- prefix reuse produces tokens identical to the full prefill, with consistent
+  `pos`;
+- an out-of-range `keep` is rejected without corrupting the session;
+- two consecutive turns reused 68 of 77 positions;
+- the tiny F32 and INT4 suites did not regress.
 
-Sul GPT-OSS-120B reale la sessione persistente ha risposto correttamente, con canale
-`analysis` e `final` separati dal parser ufficiale.
+On the real GPT-OSS-120B the persistent session answered correctly, with the
+`analysis` and `final` channels separated by the official parser.
 
-### 0.8 Prestazioni: misure e vincoli hardware
+### 0.8 Performance: measurements and hardware constraints
 
-Profilo di un turno reale da 77 token di prompt e 24 generati:
+Profile of a real turn with a 77-token prompt and 24 generated:
 
-- `t_moe` 983,70 s, di cui **565,73 s di attesa disco** su 11.569 letture;
-- `t_attn` 134,20 s, `t_head` 71,29 s;
-- cache hit expert 20,5% su 14.544 richieste;
-- circa 0,09 token/s.
+- `t_moe` 983.70 s, of which **565.73 s spent waiting on disk** over 11,569 reads;
+- `t_attn` 134.20 s, `t_head` 71.29 s;
+- expert cache hit 20.5% over 14,544 requests;
+- about 0.09 tokens/s.
 
-Vincolo di memoria misurato: 15,83 GB totali con circa 6,86 GB liberi. La parte densa
-occupa 4,46 GB, quindi la cache expert non può superare circa 2,4 GB. `PIN_GB` 1 e 2
-producono entrambi il minimo di 4 slot per layer; `PIN_GB=3` porterebbe il totale a
-7,6 GB, oltre la memoria libera, causando paging. L'aumento della cache richiede
-quindi più RAM, non solo un parametro diverso.
+Measured memory constraint: 15.83 GB total with about 6.86 GB free. The dense part
+occupies 4.46 GB, so the expert cache cannot exceed about 2.4 GB. `PIN_GB` 1 and 2
+both produce the minimum of 4 slots per layer; `PIN_GB=3` would bring the total to
+7.6 GB, beyond the free memory, causing paging. Increasing the cache therefore
+requires more RAM, not just a different parameter.
 
-Vincolo di I/O: il modello risiede su un SSD esterno **USB** con bridge JMicron, non
-sull'NVMe interno, coerente con i circa 253 MB/s osservati.
+I/O constraint: the model resides on an external **USB** SSD with a JMicron
+bridge, not on the internal NVMe, consistent with the ~253 MB/s observed.
 
-Prefetch su Windows: il thread PILOT non modifica la cache LRU e non condivide gli
-handle del thread principale. Apre handle propri, copia l'input di routing, calcola il
-top-k del layer successivo e legge gli intervalli degli expert previsti per portarli
-nella cache del sistema operativo. Le strutture condivise vengono solo lette, quindi
-non esiste corsa critica che possa alterare il risultato numerico; il controllo di
-presenza in cache è volutamente senza lock e un esito impreciso costa al massimo una
-lettura inutile. La correttezza con prefetch attivo è verificata dalle suite tiny.
+Prefetch on Windows: the PILOT thread does not modify the LRU cache and does not
+share the main thread's handles. It opens its own handles, copies the routing
+input, computes the top-k of the next layer, and reads the predicted expert ranges
+to bring them into the operating system's cache. Shared structures are only read,
+so there is no data race that could alter the numeric result; the cache-presence
+check is deliberately lock-free and an imprecise outcome costs at most one useless
+read. Correctness with prefetch enabled is verified by the tiny suites.
 
-**OpenMP.** Il binario veniva compilato senza `-fopenmp`, quindi i `#pragma omp` dei
-kernel matmul in `quant.h` erano ignorati e tutto il calcolo restava su un core, su una
-CPU con 6 core fisici. L'opzione `-Wno-unknown-pragmas` nascondeva l'avviso. Entrambe le
-cose sono state corrette: `-fopenmp` è obbligatorio e l'avviso deve restare visibile.
+**OpenMP.** The binary was being compiled without `-fopenmp`, so the `#pragma omp`
+directives of the matmul kernels in `quant.h` were ignored and all computation
+stayed on a single core, on a CPU with 6 physical cores. The `-Wno-unknown-pragmas`
+option was hiding the warning. Both were fixed: `-fopenmp` is mandatory and the
+warning must remain visible.
 
-Misure comparate sullo stesso turno, 77 token di prompt e 24 generati:
+Comparative measurements on the same turn, 77-token prompt and 24 generated:
 
-| Configurazione | `t_attn` | `t_moe` | `t_head` | disco | totale fasi |
+| Configuration | `t_attn` | `t_moe` | `t_head` | disk | phase total |
 |---|---|---|---|---|---|
-| Base, un core | 134,20 s | 983,70 s | 71,29 s | 565,73 s | ~1.189 s |
-| OpenMP | 30,98 s | 649,91 s | 19,93 s | 534,69 s | ~701 s |
-| OpenMP + PILOT | 30,64 s | 730,05 s | 19,30 s | 614,21 s | ~780 s |
+| Baseline, single core | 134.20 s | 983.70 s | 71.29 s | 565.73 s | ~1,189 s |
+| OpenMP | 30.98 s | 649.91 s | 19.93 s | 534.69 s | ~701 s |
+| OpenMP + PILOT | 30.64 s | 730.05 s | 19.30 s | 614.21 s | ~780 s |
 
-Conclusioni: OpenMP vale circa 1,7× e il MoE al netto del disco scende da circa 418 s a
-circa 115 s. Il PILOT così concepito **peggiora di circa l'11%**, perché scalda la cache
-del sistema operativo che qui non ha spazio: le pagine vengono espulse e il disco viene
-letto due volte. Per questo il prefetch resta opzionale e disattivato per default.
+Conclusions: OpenMP is worth about 1.7×, and the MoE net of disk drops from about
+418 s to about 115 s. PILOT as conceived here **makes things about 11% worse**,
+because it warms the operating system's cache, which has no room here: pages are
+evicted and the disk is read twice. That is why prefetch remains optional and off
+by default.
 
-Riprogettazione necessaria del prefetch: inserire l'expert direttamente nella cache LRU
-con sincronizzazione, eliminando la seconda lettura, e misurare quanti expert previsti
-vengono realmente usati, dato che il routing del layer successivo è stimato dallo stato
-nascosto del layer corrente ed è quindi approssimato.
+Necessary redesign of prefetch: insert the expert directly into the LRU cache with
+synchronization, eliminating the second read, and measure how many predicted
+experts are actually used, given that the next layer's routing is estimated from
+the current layer's hidden state and is therefore approximate.
 
-**Prefill batched (batch-union).** Con cache da 4 slot per layer e top-4, il percorso
-token-per-token sfratta l'intera cache a ogni posizione, quindi il prompt rilegge gli
-stessi expert molte volte. Il prefill elabora ora le posizioni a blocchi: per ogni layer
-si esegue l'attention in ordine di posizione, poi si calcola il routing di tutte le
-posizioni e si legge **una sola volta** ogni expert dell'unione, riusandolo per tutte le
-posizioni che lo hanno selezionato. La matematica non cambia: cambia solo l'ordine delle
-letture. Il percorso sequenziale resta attivo con dump oracle, tracing o repetition
-penalty, così le suite di validazione non sono influenzate. `test_prefill_batch.py`
-verifica che le due strade producano token identici.
+**Batched prefill (batch-union).** With a 4-slot-per-layer cache and top-4, the
+token-by-token path evicts the entire cache at every position, so the prompt
+re-reads the same experts many times. Prefill now processes positions in blocks:
+for each layer, attention is run in position order, then the routing of all
+positions is computed and each expert of the union is read **only once**, reusing
+it for all positions that selected it. The math does not change: only the order of
+reads changes. The sequential path stays active with oracle dumps, tracing, or
+repetition penalty, so the validation suites are unaffected. `test_prefill_batch.py`
+verifies that the two paths produce identical tokens.
 
-### 0.10 Precisione di embedding e lm_head
+### 0.10 Precision of embedding and lm_head
 
-Il container iniziale quantizzava `embed_tokens` e `lm_head` a INT4 gs64, mentre la
-configurazione ufficiale GPT-OSS li esclude esplicitamente dalla quantizzazione insieme a
-`self_attn` e `router` (`modules_to_not_convert`). Con generazioni brevi il difetto resta
-invisibile; su testi lunghi la risposta collassava in un misto di lingue e ripetizioni.
+The initial container quantized `embed_tokens` and `lm_head` to INT4 gs64, whereas
+the official GPT-OSS configuration explicitly excludes them from quantization along
+with `self_attn` and `router` (`modules_to_not_convert`). With short generations
+the defect stays invisible; on long texts the response collapsed into a mix of
+languages and repetitions.
 
-Misure su un campione di 16.384 righe dei pesi originali:
+Measurements on a sample of 16,384 rows of the original weights:
 
-| Tensore | INT4 gs64 | INT8 per riga |
+| Tensor | INT4 gs64 | INT8 per row |
 |---|---|---|
-| `lm_head` | 11,04% di errore relativo | 0,99% |
-| `embed_tokens` | 15,67% | 3,35% |
+| `lm_head` | 11.04% relative error | 0.99% |
+| `embed_tokens` | 15.67% | 3.35% |
 
-Con `lm_head` a INT4 l'argmax coincide solo nel 76,6% dei casi e il rumore sui logit è
-l'8,7% della loro deviazione standard: il token più probabile cambia in circa un caso su
-quattro. A INT8 l'argmax coincide al 100% e il rumore scende allo 0,77%.
+With `lm_head` at INT4 the argmax matches only 76.6% of the time and the logit
+noise is 8.7% of their standard deviation: the most probable token changes in about
+one case out of four. At INT8 the argmax matches 100% and the noise drops to 0.77%.
 
-Correzione adottata: INT8 con scala per riga per entrambi i tensori, verificata da
-`check_head_quality.py`. Costa circa 0,5 GB di parte densa, da 3,20 a 3,71 GB, contro i
-circa 4,6 GB che servirebbero mantenendoli in F32. Il loader riconosce i tensori `I8` con
-le relative scale; i kernel INT8 erano già presenti.
+Adopted fix: INT8 with per-row scale for both tensors, verified by
+`check_head_quality.py`. It costs about 0.5 GB of dense part, from 3.20 to 3.71 GB,
+versus the ~4.6 GB that would be needed to keep them in F32. The loader recognizes
+`I8` tensors with their scales; the INT8 kernels were already present.
 
-Conferma sperimentale: la richiesta che prima degenerava produce ora un elenco corretto e
-ben formattato in italiano con `--temperature 0.7`, e il ragionamento interno scende da 94
-a 14 token. Il difetto non era nel campionamento né nel runtime, che nel frattempo era
-stato verificato con oracle fino a 300 posizioni.
+Experimental confirmation: the request that previously degenerated now produces a
+correct, well-formatted list in Italian with `--temperature 0.7`, and the internal
+reasoning drops from 94 to 14 tokens. The defect was not in the sampling nor in the
+runtime, which had meanwhile been verified with the oracle up to 300 positions.
 
-**Regola.** Rispettare la lista di esclusione della quantizzazione del modello. La testa
-di uscita proietta su 201.088 voci: comprimerla a 4 bit sposta la distribuzione dei token
-molto più di quanto suggerisca l'errore medio sui pesi.
+**Rule.** Respect the model's quantization exclusion list. The output head projects
+onto 201,088 entries: compressing it to 4 bits shifts the token distribution far
+more than the average weight error would suggest.
 
 ### 0.9 GPT-OSS-20B
 
-Stesso codice, nessuna modifica: dimensioni, layer, expert e pattern di attention sono
-letti da `config.json`. Il 20B ha 24 layer e 32 expert per layer, top-4, hidden 2880.
-La conversione ha prodotto 14,0 GB in 856 s, con 3,20 GB densi, 10,75 GB di expert e i
-bias expert già in F32, quindi senza sidecar.
+Same code, no changes: dimensions, layers, experts, and attention patterns are read
+from `config.json`. The 20B has 24 layers and 32 experts per layer, top-4, hidden
+2880. The conversion produced 14.0 GB in 856 s, with 3.20 GB dense, 10.75 GB of
+experts, and the expert biases already in F32, so without a sidecar.
 
-Confronto sullo stesso prompt Harmony e sullo stesso hardware:
+Comparison on the same Harmony prompt and the same hardware:
 
-| Metrica | 120B | 20B |
+| Metric | 120B | 20B |
 |---|---|---|
-| Cache hit | 20,5% | 56,7% |
-| Attesa disco | 534,69 s | 97,83 s |
-| `t_moe` | 649,91 s | 181,88 s |
-| `t_attn` | 30,98 s | 19,63 s |
-| `t_head` | 19,93 s | 6,94 s |
-| Totale fasi | ~701 s | ~208 s |
+| Cache hit | 20.5% | 56.7% |
+| Disk wait | 534.69 s | 97.83 s |
+| `t_moe` | 649.91 s | 181.88 s |
+| `t_attn` | 30.98 s | 19.63 s |
+| `t_head` | 19.93 s | 6.94 s |
+| Phase total | ~701 s | ~208 s |
 
-Circa 1,7 s per token contro circa 7 s, quindi un fattore 4. La ragione strutturale è la
-copertura della cache: 4 slot per layer valgono il 3% di 128 expert nel 120B ma una quota
-molto maggiore dei 32 expert del 20B.
+About 1.7 s per token versus about 7 s, so a factor of 4. The structural reason is
+cache coverage: 4 slots per layer are worth 3% of 128 experts in the 120B but a
+much larger share of the 32 experts in the 20B.
 
-Effetto della dimensione della cache sul 20B, con parte densa 3,14 GB e 8,37 GB di RAM
-libera misurata:
+Effect of cache size on the 20B, with a 3.14 GB dense part and 8.37 GB of measured
+free RAM:
 
-| `PIN_GB` | slot/layer | cache | hit | disco | totale fasi |
+| `PIN_GB` | slots/layer | cache | hit | disk | phase total |
 |---|---|---|---|---|---|
-| 3 | 10 | 3,0 GB | 56,7% | 97,83 s | ~208 s |
-| 4 | 14 | 4,2 GB | 67,1% | 76,75 s | ~190 s |
+| 3 | 10 | 3.0 GB | 56.7% | 97.83 s | ~208 s |
+| 4 | 14 | 4.2 GB | 67.1% | 76.75 s | ~190 s |
 
-Oltre `PIN_GB=4` il totale residente supererebbe la RAM libera e causerebbe paging.
+Beyond `PIN_GB=4` the resident total would exceed free RAM and cause paging.
 
-**SIMD.** Come per OpenMP, i percorsi AVX2 di `quant.h` sono protetti da `#ifdef __AVX2__`
-e la build non passava flag di architettura, quindi i kernel usavano solo lo scalare.
-Aggiunti `-mavx2 -mfma`; il binario richiede una CPU con AVX2. FMA cambia l'ordine di
-arrotondamento, ma le suite tiny F32 e INT4 restano entro tolleranza con errore massimo
-`3,73e-08`.
+**SIMD.** As with OpenMP, the AVX2 paths in `quant.h` are guarded by
+`#ifdef __AVX2__` and the build passed no architecture flags, so the kernels used
+only scalar code. Added `-mavx2 -mfma`; the binary requires a CPU with AVX2. FMA
+changes the rounding order, but the tiny F32 and INT4 suites stay within tolerance
+with a maximum error of `3.73e-08`.
 
-Effetto sul 20B a `PIN_GB=4`, stesso prompt e stesso output di 43 token:
+Effect on the 20B at `PIN_GB=4`, same prompt and same 43-token output:
 
-| Metrica | Senza SIMD | Con SIMD |
+| Metric | Without SIMD | With SIMD |
 |---|---|---|
-| `t_moe` | 162,70 s | 88,49 s |
-| `t_attn` | 20,55 s | 13,93 s |
-| `t_head` | 6,91 s | 1,33 s |
-| disco | 76,75 s | 71,14 s |
-| totale fasi | ~190 s | ~104 s |
+| `t_moe` | 162.70 s | 88.49 s |
+| `t_attn` | 20.55 s | 13.93 s |
+| `t_head` | 6.91 s | 1.33 s |
+| disk | 76.75 s | 71.14 s |
+| phase total | ~190 s | ~104 s |
 
-Il calcolo al netto del disco scende da circa 113 s a circa 32,6 s, e il MoE puro da
-circa 85,9 s a circa 17,4 s. Il collo di bottiglia torna quindi l'I/O, che pesa 71 s su
-104, cioè il 68%: i prossimi interventi utili sono più RAM per la cache expert, il
-modello su NVMe interno e un prefetch che popoli direttamente la cache LRU.
+Computation net of disk drops from about 113 s to about 32.6 s, and the pure MoE
+from about 85.9 s to about 17.4 s. The bottleneck therefore returns to I/O, which
+weighs 71 s out of 104, i.e. 68%: the next useful interventions are more RAM for
+the expert cache, the model on internal NVMe, and a prefetch that populates the LRU
+cache directly.
 
-**Lezione di metodo.** Due dei guadagni maggiori non sono venuti da nuovo codice ma da
-flag di compilazione mancanti, `-fopenmp` e `-mavx2 -mfma`, con gli avvisi silenziati.
-Prima di ottimizzare, verificare che il codice esistente sia realmente compilato.
+**Methodological lesson.** Two of the biggest gains came not from new code but from
+missing compilation flags, `-fopenmp` and `-mavx2 -mfma`, with the warnings
+silenced. Before optimizing, verify that the existing code is actually compiled.
 
-**Campionamento e uso conversazionale.** La decodifica greedy, usata per il determinismo
-delle validazioni, può entrare in cicli: su una domanda aperta il 20B ha consumato 200
-token nel canale `analysis` senza raggiungere `final`. Con `--temperature 0.7` la stessa
-domanda ha prodotto una risposta corretta. `chat.py` espone quindi `--temperature`,
-`--top-p`, `--top-k` e `--seed`, mantenendo il default greedy per non alterare i test.
+**Sampling and conversational use.** Greedy decoding, used for the determinism of
+validations, can enter loops: on an open-ended question the 20B consumed 200 tokens
+in the `analysis` channel without reaching `final`. With `--temperature 0.7` the
+same question produced a correct answer. `chat.py` therefore exposes
+`--temperature`, `--top-p`, `--top-k`, and `--seed`, keeping the greedy default so
+as not to alter the tests.
 
-Conversazione reale a due turni sul 20B: il secondo turno ha riusato 279 posizioni su
-294, cioè il 95%, elaborandone solo 15, e la risposta era corretta. La cache hit sale con
-l'uso grazie all'hot-store, dal 67,1% al 79,2% nella stessa sessione.
+Real two-turn conversation on the 20B: the second turn reused 279 of 294 positions,
+i.e. 95%, processing only 15, and the answer was correct. The cache hit rises with
+use thanks to the hot-store, from 67.1% to 79.2% in the same session.
 
-**Posizione del modello.** La copia del container dall'SSD esterno ha misurato 52,7 MB/s
-sequenziali, valore compatibile con un collegamento USB 2.0 e non con le prestazioni del
-supporto. Spostando il 20B sull'NVMe interno, a parità di tutto il resto (stessi 120
-forward, 43 token e 67,1% di cache hit):
+**Model location.** Copying the container from the external SSD measured 52.7 MB/s
+sequential, a value consistent with a USB 2.0 link and not with the drive's
+performance. Moving the 20B to the internal NVMe, all else equal (same 120 forwards,
+43 tokens, and 67.1% cache hit):
 
-| Metrica | SSD USB | NVMe interno |
+| Metric | USB SSD | Internal NVMe |
 |---|---|---|
-| disco | 71,14 s | 37,22 s |
-| `t_moe` | 88,49 s | 55,35 s |
-| totale fasi | ~104 s | ~73,5 s |
-| caricamento | 8,4 s | 4,3 s |
+| disk | 71.14 s | 37.22 s |
+| `t_moe` | 88.49 s | 55.35 s |
+| phase total | ~104 s | ~73.5 s |
+| load | 8.4 s | 4.3 s |
 
-Il MoE al netto del disco resta invariato, circa 18 s, quindi il guadagno è interamente
-di I/O. Il disco scende dal 68% al 51% del tempo. Riepilogo del percorso sul 20B: da
-~208 s (senza SIMD, su USB) a ~73,5 s, quindi 2,8×. Con 768 expert totali, circa 9,5 GB, la residenza
-completa è raggiungibile con più RAM, condizione in cui il disco esce dal percorso
-critico. La risposta del 20B termina con `RETURN`, quindi il ciclo Harmony completo,
-terminatore incluso, è verificato sul modello reale.
+The MoE net of disk stays unchanged, about 18 s, so the gain is entirely I/O. The
+disk drops from 68% to 51% of the time. Summary of the 20B path: from ~208 s
+(without SIMD, on USB) to ~73.5 s, i.e. 2.8×. With 768 total experts, about 9.5 GB,
+full residency is reachable with more RAM, a condition in which the disk leaves the
+critical path. The 20B response ends with `RETURN`, so the full Harmony loop,
+terminator included, is verified on the real model.
 
-### 0.11 Read expert paralleli (queue depth > 1)
+### 0.11 Parallel expert reads (queue depth > 1)
 
-Il caricamento degli expert da disco era interamente seriale: sia il decode
-(`moe_forward`) sia il prefill (`forward_prefill`) leggevano un expert alla volta,
-tenendo la coda del disco a profondità 1. Introdotto un percorso di lettura parallela:
+Loading experts from disk was entirely serial: both decode (`moe_forward`) and
+prefill (`forward_prefill`) read one expert at a time, keeping the disk queue at
+depth 1. A parallel read path was introduced:
 
-- `st.h` usa handle per-thread (TLS) su Windows, così più `ReadFile` concorrenti sono
-  sicuri; il thread principale conserva l'handle sequenziale per il caricamento denso.
-  Su POSIX `pread` su fd condiviso è già thread-safe.
-- `cache_load_batch` risolve prima gli hit (marcandoli come usati, così non vengono
-  sfrattati), riserva serialmente uno slot per ogni miss, poi legge i miss in parallelo
-  con OpenMP. Stessa matematica, stessi byte negli stessi slot: cambia solo l'ordine
-  concorrente delle letture. Controlli: `IO_THREADS` (default 4), `PIPE=0` forza il
-  seriale, `ECAP` override degli slot per layer.
+- `st.h` uses per-thread (TLS) handles on Windows, so multiple concurrent
+  `ReadFile` calls are safe; the main thread keeps the sequential handle for dense
+  loading. On POSIX, `pread` on a shared fd is already thread-safe.
+- `cache_load_batch` first resolves the hits (marking them as used, so they are not
+  evicted), serially reserves one slot for each miss, then reads the misses in
+  parallel with OpenMP. Same math, same bytes in the same slots: only the
+  concurrent order of the reads changes. Controls: `IO_THREADS` (default 4),
+  `PIPE=0` forces serial, `ECAP` overrides the slots per layer.
 
-Validato token-exact sulle suite tiny F32/INT4 (anche sotto eviction con `ECAP=4`) e sul
-GPT-OSS-20B reale (stesso identico numero di read, 1355, in ogni configurazione).
+Validated token-exact on the tiny F32/INT4 suites (even under eviction with
+`ECAP=4`) and on the real GPT-OSS-20B (the exact same number of reads, 1355, in
+every configuration).
 
-Benchmark warm-vs-warm, 3 coppie, prompt Harmony di 71 token, 6 generati, greedy:
+Warm-vs-warm benchmark, 3 pairs, 71-token Harmony prompt, 6 generated, greedy:
 
-| Disco | Attesa disco seriale | Attesa disco parallela | t_moe seriale | t_moe parallela |
+| Disk | Serial disk wait | Parallel disk wait | serial t_moe | parallel t_moe |
 |---|---|---|---|---|
-| SSD USB (JMicron) | ~54,7 s | ~49,3 s (−10%) | ~68,6 s | ~63,4 s |
-| NVMe (Kingston) | ~27,5 s | ~23,4 s (−15%) | ~41,7 s | ~38,2 s |
+| USB SSD (JMicron) | ~54.7 s | ~49.3 s (−10%) | ~68.6 s | ~63.4 s |
+| NVMe (Kingston) | ~27.5 s | ~23.4 s (−15%) | ~41.7 s | ~38.2 s |
 
-Il parallelismo rende di più su NVMe (−15% vs −10%): il vero command queuing beneficia
-di QD>1, il bridge SATA-USB no. Il guadagno resta però limitato perché il workload è
-**bandwidth-bound**: ~1355 miss × ~13 MB ≈ 17,6 GB letti a ~320 MB/s (USB) o ~494 MB/s
-(NVMe), cioè al soffitto sequenziale dei rispettivi dischi. Ridurre i *byte* letti conta
-quindi più che parallelizzarli o coalescerli — vedi lo sweep di `PIN_GB` sotto.
+Parallelism pays off more on NVMe (−15% vs −10%): real command queuing benefits
+from QD>1, the SATA-USB bridge does not. The gain remains limited, however, because
+the workload is **bandwidth-bound**: ~1355 misses × ~13 MB ≈ 17.6 GB read at
+~320 MB/s (USB) or ~494 MB/s (NVMe), i.e. at the sequential ceiling of the
+respective disks. Reducing the *bytes* read therefore matters more than
+parallelizing or coalescing them — see the `PIN_GB` sweep below.
 
-### 0.12 RSS reale su Windows e sweep di PIN_GB
+### 0.12 Real RSS on Windows and PIN_GB sweep
 
-`rss_gb` restituiva 0 su Windows, la piattaforma primaria: la taratura di `PIN_GB` era
-cieca. Con `GetProcessMemoryInfo` (WorkingSetSize) la misura è ora reale, e ha rivelato
-che le stime storiche sovrastimavano di molto la residenza. In particolare l'affermazione
-in §0.8 secondo cui `PIN_GB=3` avrebbe causato paging era basata sulla misura rotta: sul
-20B la RSS resta ampiamente sotto i 15,83 GB fisici anche a cache molto più grandi.
+`rss_gb` returned 0 on Windows, the primary platform: the tuning of `PIN_GB` was
+blind. With `GetProcessMemoryInfo` (WorkingSetSize) the measurement is now real,
+and it revealed that the historical estimates greatly overstated residency. In
+particular the claim in §0.8 that `PIN_GB=3` would cause paging was based on the
+broken measurement: on the 20B the RSS stays well below the 15.83 GB physical even
+with much larger caches.
 
-Sweep misurato sul 20B (D=2880, 24 layer, 32 expert/layer), stesso prompt greedy, la
-metrica pulita è il numero di miss (deterministico, indipendente dal page cache OS):
+Measured sweep on the 20B (D=2880, 24 layers, 32 experts/layer), same greedy
+prompt; the clean metric is the number of misses (deterministic, independent of the
+OS page cache):
 
-| PIN_GB | slot/layer | RSS | hit % | disk reads |
+| PIN_GB | slots/layer | RSS | hit % | disk reads |
 |---|---|---|---|---|
-| 4 (vecchio default) | 14 | 7,2 GB | 81,7% | 1355 |
-| 5 | 17 | 8,4 GB | 85,6% | 1065 |
-| 6 | 21 | 9,3 GB | 88,9% | 821 |
-| 7 | 25 | 9,2 GB | 90,7% | 684 |
-| 8 | 28 | 8,5 GB | 91,2% | 648 |
-| **9** | **32 (pieno)** | **7,7 GB** | **91,4%** | **634** |
-| 10–12 | 35–43 | ~7,5 GB | 91,4% | 634 |
+| 4 (old default) | 14 | 7.2 GB | 81.7% | 1355 |
+| 5 | 17 | 8.4 GB | 85.6% | 1065 |
+| 6 | 21 | 9.3 GB | 88.9% | 821 |
+| 7 | 25 | 9.2 GB | 90.7% | 684 |
+| 8 | 28 | 8.5 GB | 91.2% | 648 |
+| **9** | **32 (full)** | **7.7 GB** | **91.4%** | **634** |
+| 10–12 | 35–43 | ~7.5 GB | 91.4% | 634 |
 
-Da `PIN_GB=4` a `9` i miss crollano del 53% (1355→634). Il plateau è a `PIN_GB=9`, dove
-la cache tiene tutti i 32 expert/layer: oltre, gli slot in più restano vuoti perché gli
-expert per layer sono solo 32. Il pavimento a 634 read è il costo incomprimibile del
-cold-load di ogni expert instradato una volta; si ammortizza solo mantenendo il processo
-vivo (modalità SERVICE multi-turn), dove i turni successivi vanno verso il 100% di hit.
+From `PIN_GB=4` to `9` the misses collapse by 53% (1355→634). The plateau is at
+`PIN_GB=9`, where the cache holds all 32 experts/layer: beyond that, the extra slots
+stay empty because there are only 32 experts per layer. The floor of 634 reads is
+the incompressible cost of the cold-load of each expert routed once; it is amortized
+only by keeping the process alive (multi-turn SERVICE mode), where subsequent turns
+approach 100% hit.
 
-Correzioni adottate: il default di `PIN_GB` è ora **adattivo alla RAM fisica**
-(`GlobalMemoryStatusEx` su Windows, `sysconf` su Linux). Senza override si assegna agli
-expert tutta la RAM tranne una riserva di 6 GB per densa/KV/OS; la cache si autolimita a
-`n_experts` slot per layer (mai più slot che expert). Su questa macchina (15,83 GiB) il
-budget risulta ~10,6 GB → 32 slot/layer, cioè **residenza piena del 20B automaticamente**,
-con RSS ~6,6 GB. Scala su macchine più grandi e si abbassa da solo su quelle piccole;
-`PIN_GB` esplicito resta rispettato per il tuning.
+Adopted fixes: the `PIN_GB` default is now **adaptive to physical RAM**
+(`GlobalMemoryStatusEx` on Windows, `sysconf` on Linux). Without an override,
+experts get all the RAM except a 6 GB reserve for dense/KV/OS; the cache
+self-limits to `n_experts` slots per layer (never more slots than experts). On this
+machine (15.83 GiB) the budget comes out to ~10.6 GB → 32 slots/layer, i.e. **full
+residency of the 20B automatically**, with RSS ~6.6 GB. It scales up on larger
+machines and lowers itself on small ones; an explicit `PIN_GB` is still honored for
+tuning.
 
-**Scaling.** Lo streaming esiste perché il modello non entra in RAM; è quindi il *caso
-difficile*, non un limite dell'architettura. Su hardware migliore ogni asse migliora in
-modo indipendente: più RAM alza l'hit (per il 120B, ~66 GB di expert, servono 64–128 GB
-per avvicinarsi al 95%+ stimato in §7.2); un NVMe Gen4/5 (5–7 GB/s vs ~320 MB/s dell'USB)
-abbatte i cold-load residui di 15–20×; più core scalano il calcolo; il tier GPU (§5) è
-previsto. Le dimensioni sono lette da `config.json`: 20B e 120B girano con lo stesso
-codice.
+**Scaling.** Streaming exists because the model does not fit in RAM; it is
+therefore the *hard case*, not a limit of the architecture. On better hardware every
+axis improves independently: more RAM raises the hit rate (for the 120B, ~66 GB of
+experts, 64–128 GB is needed to approach the 95%+ estimated in §7.2); a Gen4/5 NVMe
+(5–7 GB/s vs ~320 MB/s of USB) cuts the residual cold-loads by 15–20×; more cores
+scale computation; the GPU tier (§5) is planned. Dimensions are read from
+`config.json`: 20B and 120B run with the same code.
 
-### 0.13 Prefetch → LRU: predizione, meccanismo e risultati
+### 0.13 Prefetch → LRU: prediction, mechanism, and results
 
-Il vecchio PILOT scaldava solo la cache dell'OS (doppia lettura, −11% con poca RAM). È
-stato riscritto per **popolare direttamente la LRU**, con un design single-writer che
-evita ogni race: il thread principale (unico a mutare la LRU) predice gli expert del
-layer L+1, riserva gli slot e li affida a un thread che li legge da disco durante
-l'attention di L+1; `slot->loading` (release/acquire) sincronizza buffer e visibilità.
-`prefetch_issue` riserva al più `ecap − topk` slot, così restano sempre abbastanza slot
-non-loading per il routing reale. Attivo con `PREFETCH=1` (default off), token-exact
-verificato vs prefetch spento sulle suite tiny F32/INT4, anche sotto eviction.
+The old PILOT only warmed the OS cache (double read, −11% with little RAM). It was
+rewritten to **populate the LRU directly**, with a single-writer design that avoids
+any race: the main thread (the only one that mutates the LRU) predicts the experts
+of layer L+1, reserves the slots, and hands them to a thread that reads them from
+disk during the attention of L+1; `slot->loading` (release/acquire) synchronizes
+the buffer and its visibility. `prefetch_issue` reserves at most `ecap − topk`
+slots, so there are always enough non-loading slots for the real routing. Enabled
+with `PREFETCH=1` (default off), verified token-exact vs prefetch off on the tiny
+F32/INT4 suites, even under eviction.
 
-**Accuratezza della predizione** (`PREDICT_PROBE=1`, risponde alla domanda aperta §0.8).
-Predicendo il top-4 di L+1 dallo stato nascosto di L, misurato sul 20B (8372 campioni,
-casuale ~12,5%): proxy A (norm pre-MoE di L) **81,1%**, proxy B (stato post-MoE di L
-normalizzato col post_ln di L+1, manca solo l'attention di L+1) **89,4%**. Si usa il
-proxy B: ~3,58 expert su 4 corretti, ~10% di read sprecate.
+**Prediction accuracy** (`PREDICT_PROBE=1`, answers the open question in §0.8).
+Predicting the top-4 of L+1 from the hidden state of L, measured on the 20B (8,372
+samples, random ~12.5%): proxy A (pre-MoE norm of L) **81.1%**, proxy B (post-MoE
+state of L normalized with the post_ln of L+1, missing only the attention of L+1)
+**89.4%**. Proxy B is used: ~3.58 of 4 experts correct, ~10% of reads wasted.
 
-**Risultati sul decode** (20B, `PIN_GB=4`, cache vincolata, greedy). Le metriche di
-contabilità migliorano molto — hit 83→94%, `t_edisk` sul main da 50 a 19 s (USB) e da 26
-a 8 s (NVMe) — perché i read migrano sul thread di prefetch. Ma il **wall-clock `t_moe`
-non segue**:
+**Results on decode** (20B, `PIN_GB=4`, constrained cache, greedy). The accounting
+metrics improve a lot — hit 83→94%, `t_edisk` on the main thread from 50 to 19 s
+(USB) and from 26 to 8 s (NVMe) — because the reads migrate to the prefetch thread.
+But the **wall-clock `t_moe` does not follow**:
 
-| Disco | `t_moe` OFF | `t_moe` ON |
+| Disk | `t_moe` OFF | `t_moe` ON |
 |---|---|---|
-| SSD USB | ~64 s | ~68 s (peggio, +6%) |
-| NVMe | ~42,9 s | ~37–43 s (0 a −14%) |
+| USB SSD | ~64 s | ~68 s (worse, +6%) |
+| NVMe | ~42.9 s | ~37–43 s (0 to −14%) |
 
-Due cause strutturali: (1) nel **decode l'attention di un singolo token è troppo breve**
-per nascondere un load da ~13 MB, quindi il main attende comunque (`slot_wait_ready`) e
-l'attesa resta nel wall-clock; (2) su **USB single-queue** i due lettori concorrenti si
-ostacolano (penalità), mentre su NVMe la coda reale la annulla (neutro/leggero guadagno).
-Il meccanismo è quindi corretto e sicuro, ma il suo valore sul decode è limitato dalle
-finestre di overlap corte, su entrambi i dischi.
+Two structural causes: (1) in **decode the attention of a single token is too
+short** to hide a ~13 MB load, so the main thread waits anyway (`slot_wait_ready`)
+and the wait stays in the wall-clock; (2) on **single-queue USB** the two concurrent
+readers get in each other's way (penalty), whereas on NVMe the real queue cancels it
+(neutral/slight gain). The mechanism is therefore correct and safe, but its value on
+decode is limited by the short overlap windows, on both disks.
 
-**Dove si sblocca il valore: il prefill.** Il prefill elabora molte posizioni per layer →
-finestre di overlap grandi. Inoltre l'insieme di expert del layer (`uniq[]`) è **noto
-prima** di caricarli: il prefetch è quindi ESATTO, senza predizione. `forward_prefill`
-usa ora un pipeline a doppio buffer: blocchi dimezzati (due in cache), e mentre si calcola
-il blocco corrente (matmul su n posizioni, disco idle) il blocco successivo viene caricato
-dal thread di prefetch (con parallelismo IO_THREADS interno). Token-exact vs prefetch
-spento sulle suite tiny (anche sotto eviction, blocchi multipli).
+**Where the value is unlocked: prefill.** Prefill processes many positions per layer
+→ large overlap windows. Moreover the set of experts of the layer (`uniq[]`) is
+**known before** loading them: the prefetch is therefore EXACT, without prediction.
+`forward_prefill` now uses a double-buffer pipeline: halved blocks (two in cache),
+and while the current block is being computed (matmul over n positions, disk idle)
+the next block is loaded by the prefetch thread (with internal IO_THREADS
+parallelism). Token-exact vs prefetch off on the tiny suites (even under eviction,
+multiple blocks).
 
-Misura sul 20B, prompt di 108 token, `ECAP=8` (cache vincolata, proxy della pressione del
-120B), `REP=1`, **su disco USB**:
+Measurement on the 20B, 108-token prompt, `ECAP=8` (constrained cache, a proxy for
+the 120B's pressure), `REP=1`, **on USB disk**:
 
 | | t_moe (≈ prefill) | disk reads (main) |
 |---|---|---|
-| prefetch OFF | ~47,2 s | 1084 |
-| prefetch ON  | ~40,2 s (**−15%**) | ~535 |
+| prefetch OFF | ~47.2 s | 1084 |
+| prefetch ON  | ~40.2 s (**−15%**) | ~535 |
 
-Guadagno consistente (entrambi i run ON sotto entrambi gli OFF) **anche su USB**, al
-contrario del decode: nel prefill la finestra di calcolo per blocco è grande abbastanza da
-nascondere il carico del blocco successivo. Il floor teorico è `max(disco, compute)`; il
-pipeline a un livello ne cattura una parte, con margine per approfondirlo.
+Consistent gain (both ON runs below both OFF runs) **even on USB**, unlike decode:
+in prefill the compute window per block is large enough to hide the load of the next
+block. The theoretical floor is `max(disk, compute)`; the single-level pipeline
+captures part of it, with room to go deeper.
 
-**Nota.** Il prefill batched (e quindi il pipeline) si attiva solo con `REP=1`: con la
-repetition penalty di default (1,1) il prefill ricade sul percorso sequenziale. La penalty
-non ha effetto sull'encoding di un prompt fisso, quindi abilitare il batched anche con
-penalty attiva è un'ottimizzazione futura. Sul 120B (128 expert, ecap piccolo → molti
-blocchi) questo pipeline è il candidato principale per abbattere il prefill da ~930 s.
+**Note.** Batched prefill (and therefore the pipeline) is enabled only with `REP=1`:
+with the default repetition penalty (1.1) prefill falls back to the sequential path.
+The penalty has no effect on the encoding of a fixed prompt, so enabling batched
+even with the penalty active is a future optimization. On the 120B (128 experts,
+small ecap → many blocks) this pipeline is the primary candidate to bring down the
+~930 s prefill.
 
-L'altra leva che aggira il muro della banda su qualsiasi disco resta **ridurre i byte
-letti** (cold-expert in formato più compresso).
+The other lever that gets around the bandwidth wall on any disk remains **reducing
+the bytes read** (cold experts in a more compressed format).
 
 ---
 
-## 1. Analisi dell'architettura GPT-OSS-120B
+## 1. Analysis of the GPT-OSS-120B architecture
 
-### 1.1 Numeri fondamentali
+> **Historical note (v0.1).** Sections 1–10 are the original founding document.
+> Several figures below are *early estimates* made before the real `config.json`
+> was read and are now known to be wrong (e.g. hidden size is 2880, not 6144;
+> experts are ~12.4 MB, not ~113 MB). They are kept for the historical record; the
+> authoritative numbers are in Section 0.
 
-| Proprietà                    | Valore                          |
-|------------------------------|---------------------------------|
-| Parametri totali             | 116.8B                          |
-| Parametri attivi per token   | 5.1B                            |
-| Layer                        | 36                              |
-| Expert totali per layer MoE  | 128                             |
-| Expert attivi per token      | 4                               |
-| Hidden dimension (D)         | 6144 (stimato da param count)   |
-| Intermediate MoE (I_moe)     | ~12288 (stimato, 2×D)           |
-| Intermediate Dense (I_dense) | ~24576 (stimato, 4×D)           |
-| Attention heads              | 48 (stimato)                    |
-| GQA groups                   | 8                               |
-| KV heads                     | 6 (48/8)                        |
-| Head dim                     | 128 (stimato, D/heads)          |
-| Context length               | 128K                            |
-| Vocabolario                  | ~200K (o200k_harmony)           |
-| Quantizzazione nativa        | MXFP4 (MoE), BF16 (resto)      |
+### 1.1 Fundamental numbers
 
-> **Nota:** le dimensioni esatte (hidden, heads, intermediate) verranno lette
-> dal `config.json` del modello a runtime, come fa Colibri. I valori sopra
-> sono stime ragionevoli basate sul parameter count e la documentazione.
+| Property                      | Value                            |
+|-------------------------------|----------------------------------|
+| Total parameters              | 116.8B                           |
+| Active parameters per token   | 5.1B                             |
+| Layers                        | 36                               |
+| Total experts per MoE layer   | 128                              |
+| Active experts per token      | 4                                |
+| Hidden dimension (D)          | 6144 (estimated from param count)|
+| MoE intermediate (I_moe)      | ~12288 (estimated, 2×D)          |
+| Dense intermediate (I_dense)  | ~24576 (estimated, 4×D)          |
+| Attention heads               | 48 (estimated)                   |
+| GQA groups                    | 8                                |
+| KV heads                      | 6 (48/8)                         |
+| Head dim                      | 128 (estimated, D/heads)         |
+| Context length                | 128K                             |
+| Vocabulary                    | ~200K (o200k_harmony)            |
+| Native quantization           | MXFP4 (MoE), BF16 (rest)         |
 
-### 1.2 Struttura dei layer
+> **Note:** the exact dimensions (hidden, heads, intermediate) are read from the
+> model's `config.json` at runtime, as Colibri does. The values above are
+> reasonable estimates based on the parameter count and the documentation.
 
-GPT-OSS-120B usa un'architettura con **alternanza di layer densi e MoE**.
-I primi N layer sono densi (FFN classica), i restanti sono MoE.
-Dalla documentazione, il pattern di attention alterna tra:
+### 1.2 Layer structure
+
+GPT-OSS-120B uses an architecture with **alternating dense and MoE layers**.
+The first N layers are dense (classic FFN), the rest are MoE.
+From the documentation, the attention pattern alternates between:
 - **Dense attention** (full causal)
-- **Locally banded sparse attention** (finestra locale)
+- **Locally banded sparse attention** (local window)
 
-Questo è simile a GPT-3 e diverso da GLM-5.2 (che usa MLA + DSA).
+This is similar to GPT-3 and different from GLM (which uses MLA + DSA).
 
-### 1.3 Attenzione: GQA (non MLA)
+### 1.3 Attention: GQA (not MLA)
 
-A differenza di GLM-5.2 che usa Multi-head Latent Attention (MLA) con compressione
-KV a 576 float/token, GPT-OSS usa **Grouped Query Attention** standard:
+Unlike GLM which uses Multi-head Latent Attention (MLA) with KV compression to 576
+float/token, GPT-OSS uses standard **Grouped Query Attention**:
 - 48 query heads
 - 6 KV heads (group size 8)
 - Head dim 128
-- RoPE standard (non interleaved)
+- Standard RoPE (not interleaved)
 
-**KV-cache per token:** 2 × 6 × 128 = 1536 float × 36 layer = 55.296 float
-A BF16: 55.296 × 2 byte = ~110 KB/token. Per 4K token: ~430 MB.
-Per 128K: ~13.5 GB (significativo — serve gestione oculata).
+**KV-cache per token:** 2 × 6 × 128 = 1536 float × 36 layers = 55,296 float
+At BF16: 55,296 × 2 bytes = ~110 KB/token. For 4K tokens: ~430 MB.
+For 128K: ~13.5 GB (significant — careful management needed).
 
-### 1.4 Formato pesi MXFP4
+### 1.4 MXFP4 weight format
 
-I pesi MoE usano **MXFP4** (Microscaling FP4, standard OCP):
-- Ogni valore è un FP4 (4 bit: 1 sign + 2 exp + 1 mantissa), range ±6.0
-- 2 valori impacchettati per byte (`tensor.blocks`, uint8)
-- Scala condivisa per blocco di 32 elementi (`tensor.scales`, E8M0 o FP8)
-- La scala è lungo l'ultima dimensione
+The MoE weights use **MXFP4** (Microscaling FP4, OCP standard):
+- Each value is an FP4 (4 bits: 1 sign + 2 exp + 1 mantissa), range ±6.0
+- 2 values packed per byte (`tensor.blocks`, uint8)
+- A scale shared per block of 32 elements (`tensor.scales`, E8M0 or FP8)
+- The scale is along the last dimension
 
-Questo è diverso dall'INT4 simmetrico di Colibri (che usa range [-8,7] con offset).
-Servono kernel di dequantizzazione MXFP4 dedicati.
+This differs from Colibri's symmetric INT4 (which uses the range [-8,7] with an
+offset). Dedicated MXFP4 dequantization kernels are needed.
 
-**Alternativa:** convertire MXFP4 → INT4 simmetrico a tempo di conversione,
-perdendo ~0.1-0.3% di qualità ma riusando i kernel veloci di Colibri.
-Questa è la scelta raccomandata per la prima versione.
+**Alternative:** convert MXFP4 → symmetric INT4 at conversion time, losing
+~0.1-0.3% of quality but reusing Colibri's fast kernels. This is the recommended
+choice for the first version.
 
-### 1.5 Dimensione degli expert
+### 1.5 Expert size
 
-Un expert MoE ha 3 matrici (gate_proj, up_proj, down_proj):
+An MoE expert has 3 matrices (gate_proj, up_proj, down_proj):
 - gate: [I_moe, D] = [12288, 6144]
 - up:   [I_moe, D] = [12288, 6144]
 - down: [D, I_moe] = [6144, 12288]
 
-Parametri per expert: 3 × 12288 × 6144 = ~226M parametri.
-A INT4 (0.5 byte/param): ~113 MB per expert.
-A MXFP4 (0.5 byte/param + scale): ~113 MB + scale.
+Parameters per expert: 3 × 12288 × 6144 = ~226M parameters.
+At INT4 (0.5 byte/param): ~113 MB per expert.
+At MXFP4 (0.5 byte/param + scale): ~113 MB + scale.
 
-**Expert totali su disco:** 128 expert × ~30 layer MoE × 113 MB ≈ **430 GB** a MXFP4.
+**Total experts on disk:** 128 experts × ~30 MoE layers × 113 MB ≈ **430 GB** at
+MXFP4.
 
-> Se la dimensione dell'intermediate MoE è più piccola (es. 8192), gli expert
-> scendono a ~75 MB ciascuno e il totale a ~290 GB. Il config.json lo dirà.
+> If the MoE intermediate dimension is smaller (e.g. 8192), the experts drop to
+> ~75 MB each and the total to ~290 GB. The config.json will tell.
 
-### 1.6 Parte densa residente
+### 1.6 Resident dense part
 
-La parte densa include:
-- Embedding + lm_head: ~200K × 6144 × 2 ≈ 2.4B param
-- Attention per 36 layer: Q/K/V/O projections
-- Layer densi (FFN classica nei primi layer)
-- Shared experts (se presenti — da verificare nel config)
+The dense part includes:
+- Embedding + lm_head: ~200K × 6144 × 2 ≈ 2.4B params
+- Attention for 36 layers: Q/K/V/O projections
+- Dense layers (classic FFN in the first layers)
+- Shared experts (if present — to be verified in the config)
 - LayerNorm / RMSNorm weights
 
-Stima a INT4: **~3-5 GB** residenti in RAM.
-A BF16: **~8-10 GB**.
+Estimate at INT4: **~3-5 GB** resident in RAM.
+At BF16: **~8-10 GB**.
 
 ---
 
-## 2. Architettura del motore
+## 2. Engine architecture
 
-### 2.1 Gerarchia di memoria (come Colibri)
+### 2.1 Memory hierarchy (like Colibri)
 
 ```
 ┌─────────────┐
-│   GPU VRAM   │  Tier 0: expert "caldissimi" + densa (opzionale)
+│   GPU VRAM   │  Tier 0: "hottest" experts + dense (optional)
 ├─────────────┤
-│   RAM        │  Tier 1: densa residente + cache LRU expert
+│   RAM        │  Tier 1: resident dense + expert LRU cache
 ├─────────────┤
-│   NVMe/SSD   │  Tier 2: tutti gli expert (cold storage, streaming)
+│   NVMe/SSD   │  Tier 2: all experts (cold storage, streaming)
 └─────────────┘
 ```
 
-**Politica fondamentale (da Colibri):** il placement decide SOLO la velocità,
-mai la precisione o la semantica del routing. L'output è identico
-indipendentemente da dove risiedono gli expert.
+**Fundamental policy (from Colibri):** placement decides ONLY speed, never the
+precision or the routing semantics. The output is identical regardless of where the
+experts reside.
 
-### 2.2 Pipeline per-token
+### 2.2 Per-token pipeline
 
 ```
-Per ogni layer l in [0, N_layers):
+For each layer l in [0, N_layers):
   1. RMSNorm(input)
   2. GQA Attention
      a. Q = x @ Wq               (48 heads × 128 dim)
      b. K = x @ Wk               (6 KV heads × 128 dim)
      c. V = x @ Wv               (6 KV heads × 128 dim)
      d. RoPE(Q, K, pos)
-     e. Aggiorna KV-cache[l]
+     e. Update KV-cache[l]
      f. scores = Q @ K^T / sqrt(128)
-     g. Se layer sparse: applica banded mask
+     g. If sparse layer: apply banded mask
      h. attn = softmax(scores) @ V
      i. out = attn @ Wo
   3. Residual: h = h + out
   4. RMSNorm(h)
-  5. Se layer DENSO:
+  5. If DENSE layer:
      a. FFN: SiLU(gate(x)) * up(x) → down → out
-  6. Se layer MoE:
-     a. ROUTE: router(x) → top-4 expert con pesi
-     b. UNION: raccogli set unico di expert (per batch)
-     c. PLACE: cerca in VRAM → RAM cache → disco
-     d. LOAD: carica expert mancanti (pread coalescente)
-     e. COMPUTE: SiLU(gate_e(x)) * up_e(x) → down_e → pesato
-     f. SHARED: shared expert (se presente) sempre residente
-     g. out = somma pesata expert + shared
+  6. If MoE layer:
+     a. ROUTE: router(x) → top-4 experts with weights
+     b. UNION: gather unique set of experts (per batch)
+     c. PLACE: look up in VRAM → RAM cache → disk
+     d. LOAD: load missing experts (coalesced pread)
+     e. COMPUTE: SiLU(gate_e(x)) * up_e(x) → down_e → weighted
+     f. SHARED: shared expert (if present) always resident
+     g. out = weighted sum of experts + shared
   7. Residual: h = h + out
 
-Testa finale:
+Final head:
   RMSNorm(h) → lm_head → logits → sampling
 ```
 
-### 2.3 Prefetch pilotato (PILOT)
+### 2.3 Piloted prefetch (PILOT)
 
-Come Colibri, un thread separato esegue il routing del layer L+1
-mentre il layer L sta calcolando, e lancia `pread`/`posix_fadvise`
-sugli expert predetti. Con 4 expert attivi per token (vs 8 di GLM),
-la prevedibilità potrebbe essere diversa — da misurare.
+Like Colibri, a separate thread runs the routing of layer L+1 while layer L is
+computing, and issues `pread`/`posix_fadvise` on the predicted experts. With 4
+active experts per token (vs 8 in GLM), predictability may differ — to be measured.
 
-### 2.4 Cache LRU per-layer
+### 2.4 Per-layer LRU cache
 
-Ogni layer MoE ha un pool di `ESlot` (slot expert) riusabili.
-La politica è LRU: l'expert meno recentemente usato viene evictato.
-In aggiunta, un hot-store "appreso" (.picchio_usage) tiene traccia
-della frequenza per expert e pinna automaticamente i più caldi.
+Each MoE layer has a pool of reusable `ESlot`s (expert slots). The policy is LRU:
+the least recently used expert is evicted. In addition, a "learned" hot-store
+(.picchio_usage) tracks per-expert frequency and automatically pins the hottest
+ones.
 
 ### 2.5 Dual-SSD
 
-Stesso concetto di Colibri: se c'è un secondo SSD, gli expert vengono
-distribuiti tra i due drive con hash deterministico pesato per bandwidth.
+Same concept as Colibri: if there is a second SSD, the experts are distributed
+across the two drives with a deterministic hash weighted by bandwidth.
 
 ---
 
-## 3. Strutture dati principali (C)
+## 3. Main data structures (C)
 
 ```c
-/* ── Configurazione (letta da config.json) ── */
+/* ── Configuration (read from config.json) ── */
 typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, n_experts, topk;
     int moe_inter, dense_inter, head_dim;
-    int first_dense;          /* primi N layer densi (senza MoE) */
+    int first_dense;          /* first N dense layers (no MoE) */
     int vocab;
     int ctx_len;              /* max context (128K) */
     int stop_ids[8], n_stop;
     float eps, theta;         /* RMSNorm epsilon, RoPE theta */
-    float routed_scale;       /* fattore di scala per expert routing */
+    float routed_scale;       /* scale factor for expert routing */
     int8_t attn_type[128];    /* per layer: 0=dense, 1=banded sparse */
 } Cfg;
 
-/* ── Tensore quantizzato [O, I] ── */
+/* ── Quantized tensor [O, I] ── */
 /* fmt: 0=F32, 1=INT8, 2=INT4, 3=MXFP4, 4=BF16 */
 typedef struct {
     int fmt;
     float *qf;               /* F32 data */
     int8_t *q8;              /* INT8 data */
     uint8_t *q4;             /* INT4/MXFP4 packed data */
-    float *s;                /* scale per riga (INT8/INT4) o per blocco (MXFP4) */
-    int O, I;                /* dimensioni output × input */
-    int block_size;          /* MXFP4: dimensione blocco scale (32) */
+    float *s;                /* scale per row (INT8/INT4) or per block (MXFP4) */
+    int O, I;                /* output × input dimensions */
+    int block_size;          /* MXFP4: scale block size (32) */
 } QT;
 
 /* ── Layer ── */
@@ -692,43 +724,43 @@ typedef struct {
     float *in_ln, *post_ln;  /* RMSNorm weights */
 
     /* GQA Attention */
-    QT wq, wk, wv, wo;      /* proiezioni Q/K/V/O */
+    QT wq, wk, wv, wo;      /* Q/K/V/O projections */
 
-    int sparse;              /* 0=layer denso, 1=layer MoE */
+    int sparse;              /* 0=dense layer, 1=MoE layer */
 
-    /* FFN densa (sparse==0) */
+    /* Dense FFN (sparse==0) */
     QT gate_proj, up_proj, down_proj;
 
     /* MoE (sparse==1) */
     float *router;           /* router weights [n_experts, D] */
-    float *router_bias;      /* bias di correzione (se presente) */
-    QT sh_gate, sh_up, sh_down; /* shared expert (se presente) */
+    float *router_bias;      /* correction bias (if present) */
+    QT sh_gate, sh_up, sh_down; /* shared expert (if present) */
 } Layer;
 
-/* ── Slot Expert (riusabile, cache LRU) ── */
+/* ── Expert slot (reusable, LRU cache) ── */
 typedef struct {
-    int eid;                 /* ID expert (-1 = vuoto) */
+    int eid;                 /* expert ID (-1 = empty) */
     QT g, u, d;             /* gate/up/down projections */
-    uint8_t *slab;           /* buffer coalescente per pread */
-    float *fslab;            /* buffer scale */
+    uint8_t *slab;           /* coalesced buffer for pread */
+    float *fslab;            /* scale buffer */
     int64_t slab_cap;
-    uint64_t last_used;      /* timestamp per LRU */
+    uint64_t last_used;      /* timestamp for LRU */
 } ESlot;
 
 /* ── KV-Cache ── */
 typedef struct {
-    /* GQA: K e V per ogni KV head, per layer */
+    /* GQA: K and V for each KV head, per layer */
     /* K[layer][pos][kv_head * head_dim] */
     /* V[layer][pos][kv_head * head_dim] */
     float **K, **V;          /* [n_layers][max_pos * n_kv_heads * head_dim] */
-    int max_pos;             /* posizioni allocate */
-    int cur_pos;             /* posizione corrente */
+    int max_pos;             /* allocated positions */
+    int cur_pos;             /* current position */
 } KVCache;
 
-/* ── Modello ── */
+/* ── Model ── */
 typedef struct {
     Cfg c;
-    /* shards S; */          /* reader safetensors */
+    /* shards S; */          /* safetensors reader */
 
     QT embed, lm_head;
     float *final_norm;
@@ -736,21 +768,21 @@ typedef struct {
 
     KVCache kv;
 
-    /* Cache expert per-layer */
+    /* Per-layer expert cache */
     ESlot **ecache;          /* [n_layers][ecap] */
-    int *ecn;                /* expert cached per layer */
-    int ecap;                /* capacità cache per layer */
+    int *ecn;                /* experts cached per layer */
+    int ecap;                /* cache capacity per layer */
 
-    /* Hot-store appreso */
-    ESlot **pin;             /* expert pinnati per layer */
+    /* Learned hot-store */
+    ESlot **pin;             /* pinned experts per layer */
     int *npin;
-    uint32_t **eusage;       /* contatori persistenti */
-    uint32_t **eheat;        /* calore recente */
+    uint32_t **eusage;       /* persistent counters */
+    uint32_t **eheat;        /* recent heat */
 
-    /* Working set corrente */
-    ESlot ws[32];            /* max topk * batch expert in flight */
+    /* Current working set */
+    ESlot ws[32];            /* max topk * batch experts in flight */
 
-    /* Statistiche */
+    /* Statistics */
     uint64_t eclock, hits, miss, ereq;
     uint64_t n_fw, n_emit;
     double t_edisk, t_emm, t_attn, t_head;
@@ -760,26 +792,26 @@ typedef struct {
 
 ---
 
-## 4. Layout dei file del modello convertito
+## 4. File layout of the converted model
 
 ```
 /path/to/gptoss_i4/
-├── config.json              ← copiato dall'originale
+├── config.json              ← copied from the original
 ├── tokenizer.json           ← o200k_harmony
-├── params.json              ← metadati di conversione
+├── params.json              ← conversion metadata
 │
-├── dense.safetensors        ← embed + lm_head + attention + FFN densa
-│                               (tutti a INT4 o BF16, ~4 GB)
+├── dense.safetensors        ← embed + lm_head + attention + dense FFN
+│                               (all at INT4 or BF16, ~4 GB)
 │
-├── experts-00.safetensors   ← expert del layer 0..5 (shardati per parallelismo)
-├── experts-01.safetensors   ← expert del layer 6..11
-├── ...                      ← ~6 shard da ~50-70 GB
+├── experts-00.safetensors   ← experts of layers 0..5 (sharded for parallelism)
+├── experts-01.safetensors   ← experts of layers 6..11
+├── ...                      ← ~6 shards of ~50-70 GB
 │
-├── .picchio_usage           ← contatori di routing (aggiornato ogni turno)
-└── .picchio_kv              ← KV-cache persistente (opzionale)
+├── .picchio_usage           ← routing counters (updated every turn)
+└── .picchio_kv              ← persistent KV-cache (optional)
 ```
 
-Ogni expert è memorizzato come 3 tensori contigui:
+Each expert is stored as 3 contiguous tensors:
 ```
 model.layers.{L}.mlp.experts.{E}.gate_proj.weight     → uint8 packed
 model.layers.{L}.mlp.experts.{E}.gate_proj.weight.qs   → float32 scale
@@ -789,35 +821,41 @@ model.layers.{L}.mlp.experts.{E}.down_proj.weight      → uint8 packed
 model.layers.{L}.mlp.experts.{E}.down_proj.weight.qs   → float32 scale
 ```
 
-La contiguità nel file è cruciale: una singola `pread` carica tutto l'expert.
+Contiguity in the file is crucial: a single `pread` loads the whole expert.
 
 ---
 
-## 5. Moduli del progetto
+## 5. Project modules
+
+> **Historical note.** The tree below is the original v0.1 plan. The real project
+> is a flatter layout (see the "Files in this repository" section of `README.md`);
+> several files listed here (`tier.h`, `attn.h`, `pilot.h`, `backend_cuda.*`, the
+> `web/` dashboard) were never split out — their logic lives inside `picchio.c` —
+> or remain unbuilt future work.
 
 ```
 picchio/
-├── DESIGN.md                ← questo documento
+├── DESIGN.md                ← this document
 ├── Makefile                 ← build + check + clean
 ├── c/
-│   ├── picchio.c            ← motore principale (forward pass, MoE loop, decode)
-│   ├── st.h                 ← reader safetensors (come Colibri)
-│   ├── tok.h                ← tokenizer o200k_harmony
-│   ├── json.h               ← parser JSON minimale
-│   ├── tier.h               ← gerarchia VRAM/RAM/disco, LRU, hot-store
-│   ├── quant.h              ← kernel quantizzazione: INT4, INT8, MXFP4, IDOT
+│   ├── picchio.c            ← main engine (forward pass, MoE loop, decode)
+│   ├── st.h                 ← safetensors reader (like Colibri)
+│   ├── tok.h                ← o200k_harmony tokenizer
+│   ├── json.h               ← minimal JSON parser
+│   ├── tier.h               ← VRAM/RAM/disk hierarchy, LRU, hot-store
+│   ├── quant.h              ← quantization kernels: INT4, INT8, MXFP4, IDOT
 │   ├── attn.h               ← GQA attention + RoPE + KV-cache
-│   ├── simd.h               ← primitive SIMD: AVX2, AVX-512, NEON
-│   ├── pilot.h              ← prefetch pilotato (thread separato)
-│   ├── backend_cuda.h/.cu   ← tier VRAM opzionale
-│   ├── convert.py           ← conversione HF MXFP4 → INT4 container
-│   ├── openai_server.py     ← gateway API OpenAI-compatible
+│   ├── simd.h               ← SIMD primitives: AVX2, AVX-512, NEON
+│   ├── pilot.h              ← piloted prefetch (separate thread)
+│   ├── backend_cuda.h/.cu   ← optional VRAM tier
+│   ├── convert.py           ← HF MXFP4 → INT4 container conversion
+│   ├── openai_server.py     ← OpenAI-compatible API gateway
 │   ├── setup.sh             ← build + self-test
 │   └── tests/
-│       ├── test_matmul.c    ← validazione kernel vs reference float
-│       ├── test_attn.c      ← validazione GQA vs torch
-│       └── oracle.py        ← genera reference tokens da transformers
-├── web/                     ← dashboard browser (opzionale, fase 2)
+│       ├── test_matmul.c    ← kernel validation vs float reference
+│       ├── test_attn.c      ← GQA validation vs torch
+│       └── oracle.py        ← generates reference tokens from transformers
+├── web/                     ← browser dashboard (optional, phase 2)
 └── docs/
     ├── benchmarks.md
     └── tuning.md
@@ -825,155 +863,163 @@ picchio/
 
 ---
 
-## 6. Piano di sviluppo incrementale
+## 6. Incremental development plan
 
-### Fase 1: "Token corretto" (settimane 1-3)
-- [ ] Reader safetensors (`st.h`) — riusabile da Colibri con adattamenti
-- [ ] Parser config.json → struct `Cfg`
-- [ ] Tokenizer o200k_harmony (wrapper del .json con BPE)
-- [ ] Caricamento parte densa (embed, attention, FFN) a BF16/INT4
-- [ ] Forward pass densa: RMSNorm → GQA → FFN → residual
-- [ ] KV-cache GQA
-- [ ] RoPE standard
-- [ ] Validazione: token-exact vs `transformers` su un prompt di test
-- [ ] **Milestone:** genera il primo token corretto
+### Phase 1: "Correct token" (weeks 1-3)
+- [ ] safetensors reader (`st.h`) — reusable from Colibri with adaptations
+- [ ] config.json parser → `Cfg` struct
+- [ ] o200k_harmony tokenizer (wrapper of the .json with BPE)
+- [ ] Load dense part (embed, attention, FFN) at BF16/INT4
+- [ ] Dense forward pass: RMSNorm → GQA → FFN → residual
+- [ ] GQA KV-cache
+- [ ] Standard RoPE
+- [ ] Validation: token-exact vs `transformers` on a test prompt
+- [ ] **Milestone:** generate the first correct token
 
-### Fase 2: "MoE funzionante" (settimane 3-5)
+### Phase 2: "Working MoE" (weeks 3-5)
 - [ ] Router: top-4 expert selection (sigmoid/softmax + top-k)
-- [ ] Expert loading da disco (`pread` coalescente)
-- [ ] Cache LRU per-layer
-- [ ] Shared expert residente (se il modello ne ha)
-- [ ] Validazione MoE: expert routing identico a transformers
-- [ ] **Milestone:** genera testo coerente (anche se lento)
+- [ ] Expert loading from disk (coalesced `pread`)
+- [ ] Per-layer LRU cache
+- [ ] Resident shared expert (if the model has one)
+- [ ] MoE validation: expert routing identical to transformers
+- [ ] **Milestone:** generate coherent text (even if slow)
 
-### Fase 3: "Velocità" (settimane 5-8)
-- [ ] Kernel SIMD: AVX2/NEON per matmul INT4/INT8
-- [ ] IDOT (dot-product intero: quantizza attivazioni → int8)
-- [ ] Prefetch pilotato (PILOT thread)
-- [ ] I/O asincrono (PIPE: pool di thread per pread parallele)
-- [ ] Batch-union (ogni expert unico letto una sola volta per batch)
-- [ ] O_DIRECT opzionale
-- [ ] Hot-store appreso (.picchio_usage)
-- [ ] **Milestone:** >0.5 tok/s su NVMe consumer
+### Phase 3: "Speed" (weeks 5-8)
+- [ ] SIMD kernels: AVX2/NEON for INT4/INT8 matmul
+- [ ] IDOT (integer dot-product: quantize activations → int8)
+- [ ] Piloted prefetch (PILOT thread)
+- [ ] Asynchronous I/O (PIPE: thread pool for parallel pread)
+- [ ] Batch-union (each unique expert read only once per batch)
+- [ ] Optional O_DIRECT
+- [ ] Learned hot-store (.picchio_usage)
+- [ ] **Milestone:** >0.5 tok/s on consumer NVMe
 
-### Fase 4: "Produzione" (settimane 8-12)
-- [ ] Convertitore MXFP4 → INT4 (Python, shard-by-shard)
-- [ ] Server API OpenAI-compatible
+### Phase 4: "Production" (weeks 8-12)
+- [ ] MXFP4 → INT4 converter (Python, shard-by-shard)
+- [ ] OpenAI-compatible API server
 - [ ] Sampling: temperature, top-p, top-k, repetition penalty
-- [ ] Chat template harmony
-- [ ] KV-cache persistente su disco
+- [ ] Harmony chat template
+- [ ] Persistent KV-cache on disk
 - [ ] Dual-SSD
-- [ ] Profiling e tuning dashboard
-- [ ] **Milestone:** demo end-to-end, chat interattiva
+- [ ] Profiling and tuning dashboard
+- [ ] **Milestone:** end-to-end demo, interactive chat
 
-### Fase 5: "GPU e oltre" (opzionale)
-- [ ] Tier VRAM con backend CUDA
-- [ ] Expert residenti in GPU
-- [ ] Metal backend per Apple Silicon
-- [ ] Speculative decoding (se il modello ha una draft head)
+### Phase 5: "GPU and beyond" (optional)
+- [ ] VRAM tier with CUDA backend
+- [ ] Experts resident in GPU
+- [ ] Metal backend for Apple Silicon
+- [ ] Speculative decoding (if the model has a draft head)
 
 ---
 
-## 7. Stime di performance
+## 7. Performance estimates
+
+> **Historical note.** These estimates use the early (wrong) ~113 MB expert size.
+> With the real ~12.4 MB experts the I/O per token is roughly 9× smaller; see
+> Section 0 for measured numbers.
 
 ### 7.1 Scenario: Desktop 32 GB RAM, NVMe 3.5 GB/s
 
-**Parte densa residente:** ~4 GB (INT4), lascia ~25 GB per cache expert.
-**Expert per token:** 4 expert × ~113 MB = ~452 MB per layer MoE.
-**Layer MoE:** ~30. Expert unici per token: fino a 4×30 = 120 (ma con overlap).
+**Resident dense part:** ~4 GB (INT4), leaves ~25 GB for expert cache.
+**Experts per token:** 4 experts × ~113 MB = ~452 MB per MoE layer.
+**MoE layers:** ~30. Unique experts per token: up to 4×30 = 120 (but with overlap).
 
-Caso freddo (tutto da disco):
-- 120 expert × 113 MB = ~13.5 GB di letture per token
-- A 3.5 GB/s: ~3.9 secondi per token → **~0.26 tok/s**
+Cold case (everything from disk):
+- 120 experts × 113 MB = ~13.5 GB of reads per token
+- At 3.5 GB/s: ~3.9 seconds per token → **~0.26 tok/s**
 
-Caso tiepido (50% cache hit):
-- ~6.8 GB di letture → ~1.9 s/tok → **~0.5 tok/s**
+Warm case (50% cache hit):
+- ~6.8 GB of reads → ~1.9 s/tok → **~0.5 tok/s**
 
-Caso caldo (90% cache hit, dopo warm-up):
-- ~1.35 GB di letture → ~0.4 s/tok → **~2.5 tok/s**
+Hot case (90% cache hit, after warm-up):
+- ~1.35 GB of reads → ~0.4 s/tok → **~2.5 tok/s**
 
-Con prefetch PILOT e I/O asincrono: +30-50% → **~1-3.5 tok/s**
+With PILOT prefetch and asynchronous I/O: +30-50% → **~1-3.5 tok/s**
 
-### 7.2 Scenario: 64 GB RAM, tutto pinned
+### 7.2 Scenario: 64 GB RAM, everything pinned
 
-Expert totali per 30 layer MoE × 128 = 3840 expert × 113 MB = ~430 GB.
-Non ci stanno tutti, ma con 60 GB disponibili si pinnano ~530 expert (i più caldi).
-Se il routing è concentrato (come misurato per GLM: pochi expert dominanti),
-il cache hit rate può superare il 95% → **3-5 tok/s CPU-only**.
+Total experts for 30 MoE layers × 128 = 3840 experts × 113 MB = ~430 GB.
+They don't all fit, but with 60 GB available ~530 experts (the hottest) are pinned.
+If the routing is concentrated (as measured for GLM: a few dominant experts), the
+cache hit rate can exceed 95% → **3-5 tok/s CPU-only**.
 
 ### 7.3 Scenario: GPU RTX 4090 (24 GB VRAM) + 32 GB RAM
 
-~210 expert in VRAM + densa su GPU.
-Per la maggior parte dei token: 0 accessi a disco → **5-10 tok/s** (stimato).
+~210 experts in VRAM + dense on GPU.
+For most tokens: 0 disk accesses → **5-10 tok/s** (estimated).
 
-### 7.4 Confronto con GLM-5.2 (Colibri)
+### 7.4 Comparison with GLM (Colibri)
 
-GPT-OSS-120B è molto più favorevole per lo streaming:
-- Expert ~7× più piccoli (113 MB vs 19 MB — da verificare con dim reali)
-- Solo 4 expert attivi vs ~8
-- Meno layer MoE (~30 vs 75)
-- **Cache miss ~15× più economico** in termini di I/O
+GPT-OSS-120B is much more favorable for streaming:
+- Experts ~7× smaller (113 MB vs 19 MB — to be verified with real dims)
+- Only 4 active experts vs ~8
+- Fewer MoE layers (~30 vs 75)
+- **Cache miss ~15× cheaper** in terms of I/O
 
-> Se le dimensioni reali dell'intermediate MoE sono ~8192 invece di 12288,
-> gli expert scendono a ~75 MB e tutto migliora ulteriormente.
+> If the real MoE intermediate dimensions are ~8192 instead of 12288, the experts
+> drop to ~75 MB and everything improves further.
 
 ---
 
-## 8. Differenze chiave rispetto a Colibri
+## 8. Key differences from Colibri
 
-| Aspetto | Colibri (GLM-5.2) | Picchio (GPT-OSS-120B) |
+| Aspect | Colibri (GLM) | Picchio (GPT-OSS-120B) |
 |---|---|---|
-| Attenzione | MLA (KV compressa, 576 float/tok) | GQA standard (1536 float/tok) |
-| KV-cache | Ultra-compressa, ricostruzione al volo | Standard GQA, più grande ma più semplice |
-| RoPE | Interleaved parziale | Standard |
-| Router | Sigmoid + noaux_tc + bias | Da determinare (probabilmente softmax top-k) |
-| Expert/token | ~8 | 4 |
-| Expert/layer | 256 | 128 |
-| Formato pesi | INT4 simmetrico per-riga | MXFP4 nativo (convertiremo a INT4) |
-| Speculative | MTP head nativa | Da verificare (potrebbe non averne) |
-| Sparse attention | DSA lightning indexer | Banded (finestra locale, più semplice) |
-| Dimensione modello | ~370 GB (int4) | ~60-430 GB (dipende da intermediate dim) |
+| Attention | MLA (compressed KV, 576 float/tok) | Standard GQA (1536 float/tok) |
+| KV-cache | Ultra-compressed, on-the-fly reconstruction | Standard GQA, larger but simpler |
+| RoPE | Partial interleaved | Standard |
+| Router | Sigmoid + noaux_tc + bias | To be determined (probably softmax top-k) |
+| Experts/token | ~8 | 4 |
+| Experts/layer | 256 | 128 |
+| Weight format | Symmetric INT4 per-row | Native MXFP4 (we'll convert to INT4) |
+| Speculative | Native MTP head | To be verified (may not have one) |
+| Sparse attention | DSA lightning indexer | Banded (local window, simpler) |
+| Model size | ~370 GB (int4) | ~60-430 GB (depends on intermediate dim) |
 
 ---
 
-## 9. Decisioni di design aperte
+## 9. Open design decisions
 
-1. **Formato di conversione:** MXFP4 nativo o INT4 simmetrico?
-   - Raccomandazione: INT4 per la v1 (riusa kernel Colibri), MXFP4 nativo per v2
+> **Historical note.** Most of these were resolved during development; see Section 0
+> for the actual architecture (hidden 2880, softmax-with-bias router, sliding-window
+> 128, Harmony chat, no shared expert relied upon).
 
-2. **Dimensioni reali del modello:** servono i numeri esatti dal config.json.
-   Scaricare e ispezionare `openai/gpt-oss-120b` su HuggingFace.
+1. **Conversion format:** native MXFP4 or symmetric INT4?
+   - Recommendation: INT4 for v1 (reuse Colibri kernels), native MXFP4 for v2
 
-3. **Shared expert:** GPT-OSS potrebbe non avere shared expert come GLM-5.2.
-   Da verificare nel model code.
+2. **Real model dimensions:** the exact numbers from config.json are needed.
+   Download and inspect `openai/gpt-oss-120b` on HuggingFace.
 
-4. **Router type:** sigmoid con bias (come GLM) o softmax classico?
-   Da leggere nel codice `gpt_oss/torch/model.py`.
+3. **Shared expert:** GPT-OSS may not have a shared expert like GLM. To be verified
+   in the model code.
 
-5. **Banded attention pattern:** qual è la window size? Alternanza esatta?
-   Impatta la KV-cache (possiamo scartare token oltre la finestra).
+4. **Router type:** sigmoid with bias (like GLM) or classic softmax? To be read in
+   the `gpt_oss/torch/model.py` code.
 
-6. **Chat format:** il modello richiede harmony encoding, servono
-   i template corretti per il prompt.
+5. **Banded attention pattern:** what is the window size? Exact alternation? Impacts
+   the KV-cache (we can discard tokens beyond the window).
+
+6. **Chat format:** the model requires harmony encoding; the correct prompt
+   templates are needed.
 
 ---
 
-## 10. Dipendenze e requisiti di build
+## 10. Dependencies and build requirements
 
-**Runtime (zero dipendenze):**
-- Compilatore C: gcc ≥ 9 o clang ≥ 12, con OpenMP
+**Runtime (zero dependencies):**
+- C compiler: gcc ≥ 9 or clang ≥ 12, with OpenMP
 - POSIX: pread, posix_fadvise, mmap, pthread
-- Opzionale: CUDA toolkit (per tier VRAM)
+- Optional: CUDA toolkit (for the VRAM tier)
 
 **Build-time:**
 - make
-- Python 3.10+ (solo per il convertitore e il server API)
+- Python 3.10+ (only for the converter and the API server)
 
-**Piattaforme target:**
-- Linux x86_64 (primaria)
+**Target platforms:**
+- Linux x86_64 (primary)
 - macOS arm64 (Apple Silicon, NEON)
-- Windows x86_64 (MinGW/MSVC, secondaria)
+- Windows x86_64 (MinGW/MSVC, secondary)
 
 ---
 
-*Documento fondativo v0.1 — Picchio Project, luglio 2026*
+*Founding document v0.1 — Picchio Project, July 2026*
