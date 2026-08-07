@@ -1,11 +1,11 @@
-/* json.h — Parser JSON minimale per Picchio.
+/* json.h — Minimal JSON parser for Picchio.
  *
- * Legge SOLO ciò che serve: scalari (int, float, string, bool)
- * e array di stringhe/interi. Niente allocazione dinamica per la struttura,
- * niente gestione completa dello standard JSON — solo il subset usato
- * da config.json di HuggingFace.
+ * Reads ONLY what is needed: scalars (int, float, string, bool)
+ * and arrays of strings/integers. No dynamic allocation for the structure,
+ * no full handling of the JSON standard — just the subset used
+ * by HuggingFace's config.json.
  *
- * Uso:
+ * Usage:
  *   char *buf = read_file("config.json");
  *   int hidden = json_int(buf, "hidden_size", 2880);
  *   float eps = json_float(buf, "rms_norm_eps", 1e-5f);
@@ -21,7 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ── Leggi file in un buffer NUL-terminato ── */
+/* ── Read a file into a NUL-terminated buffer ── */
 
 static char *json_read_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -37,18 +37,18 @@ static char *json_read_file(const char *path) {
     return buf;
 }
 
-/* ── Trova la chiave "key": nel JSON (livello top o nested) ── */
+/* ── Find the key "key": in the JSON (top level or nested) ── */
 
 static const char *json_find_key(const char *json, const char *key) {
     if (!json || !key) return NULL;
     size_t klen = strlen(key);
     const char *p = json;
     while ((p = strstr(p, key)) != NULL) {
-        /* Verifica che sia tra virgolette: "key" */
+        /* Check that it is quoted: "key" */
         if (p > json && p[-1] == '"') {
             const char *after = p + klen;
             if (*after == '"') {
-                /* Trova il ':' dopo */
+                /* Find the ':' after it */
                 after++;
                 while (*after && isspace((unsigned char)*after)) after++;
                 if (*after == ':') return after + 1;
@@ -66,7 +66,7 @@ static const char *json_skip_ws(const char *p) {
     return p;
 }
 
-/* ── Leggi un intero ── */
+/* ── Read an integer ── */
 
 static int json_int(const char *json, const char *key, int def) {
     const char *v = json_find_key(json, key);
@@ -76,7 +76,7 @@ static int json_int(const char *json, const char *key, int def) {
     return atoi(v);
 }
 
-/* ── Leggi un float ── */
+/* ── Read a float ── */
 
 static float json_float(const char *json, const char *key, float def) {
     const char *v = json_find_key(json, key);
@@ -86,7 +86,7 @@ static float json_float(const char *json, const char *key, float def) {
     return (float)atof(v);
 }
 
-/* ── Leggi un booleano ── */
+/* ── Read a boolean ── */
 
 static int json_bool(const char *json, const char *key, int def) {
     const char *v = json_find_key(json, key);
@@ -97,7 +97,7 @@ static int json_bool(const char *json, const char *key, int def) {
     return def;
 }
 
-/* ── Leggi una stringa (copia in dst, max dstlen) ── */
+/* ── Read a string (copy into dst, max dstlen) ── */
 
 static int json_str(const char *json, const char *key,
                     char *dst, int dstlen, const char *def) {
@@ -115,9 +115,9 @@ static int json_str(const char *json, const char *key,
     return 1;
 }
 
-/* ── Leggi un array di stringhe (es. layer_types) ── */
-/* Ritorna il numero di elementi letti.
- * Ogni stringa è troncata a maxstr chars. */
+/* ── Read an array of strings (e.g. layer_types) ── */
+/* Returns the number of elements read.
+ * Each string is truncated to maxstr chars. */
 
 static int json_str_array(const char *json, const char *key,
                           char (*dst)[64], int maxn) {
@@ -146,7 +146,7 @@ static int json_str_array(const char *json, const char *key,
     return n;
 }
 
-/* ── Leggi un array di interi ── */
+/* ── Read an array of integers ── */
 
 static int json_int_array(const char *json, const char *key,
                           int *dst, int maxn) {

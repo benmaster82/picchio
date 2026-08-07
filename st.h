@@ -1,17 +1,17 @@
-/* st.h — Reader safetensors per Picchio.
+/* st.h — safetensors reader for Picchio.
  *
- * Il formato safetensors è semplice:
- *   [8 byte LE]  lunghezza header JSON
- *   [header]     JSON con metadati tensori: {nome: {dtype, shape, offsets}}
- *   [dati]       tensori contigui, offset relativo alla fine dell'header
+ * The safetensors format is simple:
+ *   [8 bytes LE]  JSON header length
+ *   [header]      JSON with tensor metadata: {name: {dtype, shape, offsets}}
+ *   [data]        contiguous tensors, offset relative to the end of the header
  *
- * Questo reader:
- *   1. Apre il file e legge l'header JSON
- *   2. Parsa l'header per trovare offset e shape di ogni tensore
- *   3. Espone pread() diretto o mmap per accesso ai dati
- *   4. NON carica mai tutto il file — solo ciò che serve, quando serve
+ * This reader:
+ *   1. Opens the file and reads the JSON header
+ *   2. Parses the header to find the offset and shape of each tensor
+ *   3. Exposes direct pread() or mmap for data access
+ *   4. NEVER loads the whole file — only what is needed, when it is needed
  *
- * Ispirato a Colibri st.h, adattato per il layout GPT-OSS.
+ * Inspired by Colibri's st.h, adapted for the GPT-OSS layout.
  */
 
 #ifndef PICCHIO_ST_H
@@ -32,13 +32,13 @@
 #include <sys/mman.h>
 #endif
 
-/* ── Costanti ── */
+/* ── Constants ── */
 
-#define ST_MAX_TENSORS  32768   /* max tensori per file (GPT-OSS ha ~1300/shard × 15) */
-#define ST_MAX_NAME     256    /* max lunghezza nome tensore */
-#define ST_MAX_FILES    64     /* max file (shard) aperti */
+#define ST_MAX_TENSORS  32768   /* max tensors per file (GPT-OSS has ~1300/shard × 15) */
+#define ST_MAX_NAME     256    /* max tensor name length */
+#define ST_MAX_FILES    64     /* max open files (shards) */
 
-/* ── Tipi dtype ── */
+/* ── dtype types ── */
 
 typedef enum {
     ST_F32  = 0,
@@ -77,19 +77,19 @@ static StDtype st_parse_dtype(const char *s) {
     return ST_UNKNOWN;
 }
 
-/* ── Tensore nel file ── */
+/* ── Tensor in the file ── */
 
 typedef struct {
     char name[ST_MAX_NAME];
     StDtype dtype;
-    int64_t shape[4];      /* dimensioni (max 4D) */
+    int64_t shape[4];      /* dimensions (max 4D) */
     int ndim;
-    int64_t offset_start;  /* offset dall'inizio dei DATI (dopo header) */
+    int64_t offset_start;  /* offset from the start of the DATA (after header) */
     int64_t offset_end;
-    int file_idx;          /* indice del file shard */
+    int file_idx;          /* index of the shard file */
 } StTensor;
 
-/* ── File shard ── */
+/* ── Shard file ── */
 
 typedef struct {
     char path[512];
@@ -103,10 +103,10 @@ typedef struct {
     uint8_t *mmap_ptr;
     int64_t file_size;
 #endif
-    int64_t data_offset;   /* offset dove iniziano i dati (8 + header_len) */
+    int64_t data_offset;   /* offset where the data begins (8 + header_len) */
 } StFile;
 
-/* ── Database completo dei tensori ── */
+/* ── Complete tensor database ── */
 
 typedef struct {
     StFile files[ST_MAX_FILES];
@@ -115,14 +115,14 @@ typedef struct {
     int n_tensors;
 } StDB;
 
-/* ── Handle per-thread (TLS) per read paralleli sicuri ──
+/* ── Per-thread (TLS) handles for safe parallel reads ──
  *
- * Su Windows `st_read_raw` usa un handle sincrono con OVERLAPPED: due ReadFile
- * concorrenti sullo stesso handle non sono sicure. Ogni thread apre quindi il
- * proprio handle in modo lazy (FILE_FLAG_RANDOM_ACCESS, adatto ai read sparsi
- * degli expert). Il thread principale registra in st_open_file l'handle
- * SEQUENTIAL_SCAN già aperto, così il caricamento denso iniziale resta invariato.
- * Su POSIX i read usano pread su fd condiviso, già thread-safe: nessun TLS. */
+ * On Windows `st_read_raw` uses a synchronous handle with OVERLAPPED: two
+ * concurrent ReadFile calls on the same handle are not safe. Each thread
+ * therefore opens its own handle lazily (FILE_FLAG_RANDOM_ACCESS, suited to the
+ * scattered expert reads). The main thread registers, in st_open_file, the
+ * already-open SEQUENTIAL_SCAN handle, so the initial dense load is unchanged.
+ * On POSIX the reads use pread on a shared fd, already thread-safe: no TLS. */
 #ifdef _WIN32
 static __thread HANDLE st_tls_h[ST_MAX_FILES];
 static __thread int    st_tls_ready = 0;
@@ -142,15 +142,15 @@ static HANDLE st_win_handle(StFile *sf, int file_idx) {
 }
 #endif
 
-/* ── Inizializzazione ── */
+/* ── Initialization ── */
 
 static void st_init(StDB *db) {
     memset(db, 0, sizeof(*db));
     db->tensors = (StTensor *)calloc(ST_MAX_TENSORS, sizeof(StTensor));
 }
 
-/* ── Parser dell'header JSON per estrarre tensori ── */
-/* L'header ha il formato:
+/* ── JSON header parser to extract tensors ── */
+/* The header has the format:
  * {"tensor_name": {"dtype": "F32", "shape": [O, I], "data_offsets": [start, end]}, ...}
  */
 
@@ -160,14 +160,14 @@ static int st_parse_header(StDB *db, const char *header, int64_t header_len,
     const char *end = header + header_len;
     int count = 0;
 
-    /* Cerca ogni "nome": { ... } */
+    /* Look for each "name": { ... } */
     while (p < end && db->n_tensors < ST_MAX_TENSORS) {
-        /* Trova prossima stringa quotata (nome del tensore) */
+        /* Find the next quoted string (tensor name) */
         const char *q1 = memchr(p, '"', end - p);
         if (!q1) break;
         q1++;
 
-        /* Trova fine nome */
+        /* Find the end of the name */
         const char *q2 = memchr(q1, '"', end - q1);
         if (!q2) break;
 
@@ -175,7 +175,7 @@ static int st_parse_header(StDB *db, const char *header, int64_t header_len,
         size_t nlen = q2 - q1;
         if (nlen >= 10 && memcmp(q1, "__metadata__", 12) == 0) {
             p = q2 + 1;
-            /* Skip il valore (oggetto) */
+            /* Skip the value (object) */
             const char *brace = memchr(p, '{', end - p);
             if (brace) {
                 int depth = 1;
@@ -194,17 +194,17 @@ static int st_parse_header(StDB *db, const char *header, int64_t header_len,
         memset(t, 0, sizeof(*t));
         t->file_idx = file_idx;
 
-        /* Copia nome */
+        /* Copy name */
         if (nlen >= ST_MAX_NAME) nlen = ST_MAX_NAME - 1;
         memcpy(t->name, q1, nlen);
         t->name[nlen] = '\0';
 
-        /* Trova l'oggetto {} del tensore */
+        /* Find the tensor's {} object */
         p = q2 + 1;
         const char *obj = memchr(p, '{', end - p);
         if (!obj) break;
 
-        /* Trova fine oggetto (non nested) */
+        /* Find the end of the object (non-nested) */
         const char *obj_end = memchr(obj + 1, '}', end - obj - 1);
         if (!obj_end) break;
 
@@ -258,11 +258,11 @@ static int st_parse_header(StDB *db, const char *header, int64_t header_len,
     return count;
 }
 
-/* ── Apri un file safetensors ── */
+/* ── Open a safetensors file ── */
 
 static int st_open_file(StDB *db, const char *path) {
     if (db->n_files >= ST_MAX_FILES) {
-        fprintf(stderr, "st: troppi file aperti\n");
+        fprintf(stderr, "st: too many open files\n");
         return -1;
     }
 
@@ -275,7 +275,7 @@ static int st_open_file(StDB *db, const char *path) {
     sf->hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
                             NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (sf->hFile == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "st: impossibile aprire %s\n", path);
+        fprintf(stderr, "st: cannot open %s\n", path);
         return -1;
     }
     LARGE_INTEGER li;
@@ -284,7 +284,7 @@ static int st_open_file(StDB *db, const char *path) {
 #else
     sf->fd = open(path, O_RDONLY);
     if (sf->fd < 0) {
-        fprintf(stderr, "st: impossibile aprire %s\n", path);
+        fprintf(stderr, "st: cannot open %s\n", path);
         return -1;
     }
     struct stat st;
@@ -292,7 +292,7 @@ static int st_open_file(StDB *db, const char *path) {
     sf->file_size = st.st_size;
 #endif
 
-    /* Leggi lunghezza header (8 byte LE) */
+    /* Read the header length (8 bytes LE) */
     uint64_t header_len = 0;
     {
         uint8_t buf[8];
@@ -309,17 +309,17 @@ static int st_open_file(StDB *db, const char *path) {
     }
 
     if (header_len > 100 * 1024 * 1024) {
-        fprintf(stderr, "st: header troppo grande in %s (%llu)\n",
+        fprintf(stderr, "st: header too large in %s (%llu)\n",
                 path, (unsigned long long)header_len);
         return -1;
     }
 
     sf->data_offset = 8 + (int64_t)header_len;
 
-    /* Leggi e parsa l'header */
+    /* Read and parse the header */
     char *header = (char *)malloc(header_len + 1);
     if (!header) {
-        fprintf(stderr, "st: OOM per header (%llu bytes)\n",
+        fprintf(stderr, "st: OOM for header (%llu bytes)\n",
                 (unsigned long long)header_len);
         return -1;
     }
@@ -337,7 +337,7 @@ static int st_open_file(StDB *db, const char *path) {
     free(header);
 
 #ifdef _WIN32
-    /* Registra l'handle sequenziale come handle TLS del thread principale. */
+    /* Register the sequential handle as the main thread's TLS handle. */
     if (!st_tls_ready) {
         for (int i = 0; i < ST_MAX_FILES; i++) st_tls_h[i] = NULL;
         st_tls_ready = 1;
@@ -346,12 +346,12 @@ static int st_open_file(StDB *db, const char *path) {
 #endif
 
     db->n_files++;
-    fprintf(stderr, "  st: %s — %d tensori, %.1f GB\n",
+    fprintf(stderr, "  st: %s — %d tensors, %.1f GB\n",
             path, nt, sf->file_size / 1e9);
     return idx;
 }
 
-/* ── Trova un tensore per nome ── */
+/* ── Find a tensor by name ── */
 
 static StTensor *st_find(StDB *db, const char *name) {
     for (int i = 0; i < db->n_tensors; i++) {
@@ -361,14 +361,14 @@ static StTensor *st_find(StDB *db, const char *name) {
     return NULL;
 }
 
-/* Trova con prefisso (utile per expert: "model.layers.5.mlp.experts.") */
+/* Find by prefix (useful for experts: "model.layers.5.mlp.experts.") */
 static StTensor *st_find_prefix(StDB *db, const char *prefix, const char *suffix) {
     char full[ST_MAX_NAME];
     snprintf(full, sizeof(full), "%s%s", prefix, suffix);
     return st_find(db, full);
 }
 
-/* ── Leggi dati grezzi di un tensore (pread) ── */
+/* ── Read the raw data of a tensor (pread) ── */
 
 static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) {
     StFile *sf = &db->files[t->file_idx];
@@ -389,7 +389,7 @@ static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) 
 #endif
 }
 
-/* Leggi una porzione di un tensore a partire da byte_offset. */
+/* Read a portion of a tensor starting at byte_offset. */
 static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
                               void *dst, int64_t nbytes) {
     StFile *sf = &db->files[t->file_idx];
@@ -409,8 +409,8 @@ static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
 #endif
 }
 
-/* ── Leggi un tensore coalescente (offset_start di t1 fino a offset_end di t2) ── */
-/* Utile per leggere gate_up + down in una sola pread se contigui */
+/* ── Coalesced tensor read (offset_start of t1 through offset_end of t2) ── */
+/* Useful to read gate_up + down in a single pread if they are contiguous */
 
 static int64_t st_read_coalesced(StDB *db, StTensor *t_first, StTensor *t_last,
                                  void *dst, int64_t max_bytes) {
@@ -436,7 +436,7 @@ static int64_t st_read_coalesced(StDB *db, StTensor *t_first, StTensor *t_last,
 #endif
 }
 
-/* ── Numero di elementi di un tensore ── */
+/* ── Number of elements of a tensor ── */
 
 static int64_t st_numel(StTensor *t) {
     int64_t n = 1;
@@ -444,13 +444,13 @@ static int64_t st_numel(StTensor *t) {
     return n;
 }
 
-/* ── Bytes di un tensore ── */
+/* ── Bytes of a tensor ── */
 
 static int64_t st_bytes(StTensor *t) {
     return t->offset_end - t->offset_start;
 }
 
-/* ── Chiudi tutti i file ── */
+/* ── Close all files ── */
 
 static void st_close(StDB *db) {
     for (int i = 0; i < db->n_files; i++) {

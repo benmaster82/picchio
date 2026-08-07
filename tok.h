@@ -1,25 +1,25 @@
-/* tok.h — Tokenizer BPE minimale per Picchio.
+/* tok.h — Minimal BPE tokenizer for Picchio.
  *
- * Legge il formato HuggingFace tokenizer.json:
+ * Reads the HuggingFace tokenizer.json format:
  *   - "model.vocab": {"token": id, ...}
  *   - "model.merges": ["a b", "c d", ...]
  *
- * Implementa:
- *   - Decode: token_id → stringa UTF-8 (lookup diretto)
- *   - Encode: stringa UTF-8 → token_id[] (BPE greedy)
+ * Implements:
+ *   - Decode: token_id → UTF-8 string (direct lookup)
+ *   - Encode: UTF-8 string → token_id[] (greedy BPE)
  *
- * Il tokenizer di GPT-OSS è basato su o200k (200K+ token).
- * Vocabolario: ~201088 token.
+ * The GPT-OSS tokenizer is based on o200k (200K+ tokens).
+ * Vocabulary: ~201088 tokens.
  *
- * Strategia di encode semplificata:
- *   1. Split per whitespace/punteggiatura (pre-tokenizzazione grezza)
- *   2. Byte-fallback: ogni byte non riconosciuto → token byte (0x00..0xFF)
- *   3. BPE merge iterativo (longest match first)
+ * Simplified encode strategy:
+ *   1. Split by whitespace/punctuation (rough pre-tokenization)
+ *   2. Byte-fallback: each unrecognized byte → byte token (0x00..0xFF)
+ *   3. Iterative BPE merge (longest match first)
  *
- * Per la v1 usiamo un approccio "decode-only + byte-level encode":
- *   - Decode è banale (lookup table)
- *   - Encode usa longest-prefix match sulla vocab (greedy, non ottimale
- *     ma funzionante per la generazione dove serve solo encode del prompt)
+ * For v1 we use a "decode-only + byte-level encode" approach:
+ *   - Decode is trivial (lookup table)
+ *   - Encode uses longest-prefix match on the vocab (greedy, not optimal
+ *     but working for generation, where only the prompt encode is needed)
  */
 
 #ifndef PICCHIO_TOK_H
@@ -33,15 +33,15 @@
 #define TOK_MAX_VOCAB 210000
 #define TOK_MAX_TOKEN_LEN 256
 
-/* ── Struttura tokenizer ── */
+/* ── Tokenizer structure ── */
 
 typedef struct {
-    /* Vocabolario: id → stringa (per decode) */
-    char **vocab;         /* [vocab_size] puntatori a stringhe */
-    int *vocab_len;       /* [vocab_size] lunghezza di ogni token in bytes */
+    /* Vocabulary: id → string (for decode) */
+    char **vocab;         /* [vocab_size] pointers to strings */
+    int *vocab_len;       /* [vocab_size] length of each token in bytes */
     int vocab_size;
 
-    /* Hash table per encode: stringa → id */
+    /* Hash table for encode: string → id */
     /* Simple open-addressing hash table */
     uint32_t *ht_hash;   /* hash values */
     int *ht_id;           /* token ids (-1 = empty) */
@@ -94,31 +94,31 @@ static int tok_ht_lookup(Tokenizer *t, const char *s, int len) {
     return -1;
 }
 
-/* ── Decode un byte escape (es. "Ġ" → ' ', "Ċ" → '\n') ── */
-/* Il tokenizer HF/tiktoken usa una mappatura bytes-to-unicode:
+/* ── Decode a byte escape (e.g. "Ġ" → ' ', "Ċ" → '\n') ── */
+/* The HF/tiktoken tokenizer uses a bytes-to-unicode mapping:
  * byte 0x20 (space) → 'Ġ' (U+0120)
  * byte 0x0A (newline) → 'Ċ' (U+010A)
- * etc. Per il decode dobbiamo invertire questa mappatura. */
+ * etc. For decode we must invert this mapping. */
 
 static int tok_decode_byte_char(const char *s, int *advance) {
     /* UTF-8 decode */
     uint8_t c = (uint8_t)s[0];
     if (c < 0x80) {
         *advance = 1;
-        return c;  /* ASCII diretto (i byte 33-126 sono mappati a se stessi) */
+        return c;  /* direct ASCII (bytes 33-126 map to themselves) */
     }
     if ((c & 0xE0) == 0xC0 && s[1]) {
         /* 2-byte UTF-8 */
         int cp = ((c & 0x1F) << 6) | (s[1] & 0x3F);
         *advance = 2;
-        /* Mappa Unicode codepoint → byte originale */
-        /* La mappatura bytes_to_unicode di tiktoken:
+        /* Map Unicode codepoint → original byte */
+        /* tiktoken's bytes_to_unicode mapping:
          * byte 0..32 → U+0100..U+0120 (256+byte)
          * byte 127..160 → U+0121..U+014E
-         * etc. Approccio semplificato: */
+         * etc. Simplified approach: */
         if (cp >= 0x100 && cp <= 0x1FF) {
-            /* Questa è la mappatura inversa approssimata */
-            /* I byte 0-32, 127-160, 173 sono mappati a U+0100+ */
+            /* This is the approximate inverse mapping */
+            /* bytes 0-32, 127-160, 173 are mapped to U+0100+ */
             static const int byte_map[] = {
                 /* U+0100..U+010F → byte 0..15 */
                 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
@@ -130,10 +130,10 @@ static int tok_decode_byte_char(const char *s, int *advance) {
             };
             if (cp - 0x100 < (int)(sizeof(byte_map)/sizeof(byte_map[0])))
                 return byte_map[cp - 0x100];
-            /* Fallback per i byte alti (127-255) */
+            /* Fallback for the high bytes (127-255) */
             return cp - 0x100 + 0;
         }
-        return -1;  /* Non è un byte escape */
+        return -1;  /* Not a byte escape */
     }
     if ((c & 0xF0) == 0xE0 && s[1] && s[2]) {
         *advance = 3;
@@ -143,9 +143,9 @@ static int tok_decode_byte_char(const char *s, int *advance) {
     return -1;
 }
 
-/* ── Parse del tokenizer: formato binario Picchio (picchio_vocab.bin) ── */
-/* Molto più veloce del parsing JSON da 28 MB.
- * Generato da export_vocab.py. */
+/* ── Tokenizer parsing: Picchio binary format (picchio_vocab.bin) ── */
+/* Much faster than parsing the 28 MB JSON.
+ * Generated by export_vocab.py. */
 
 static int tok_load_binary(Tokenizer *t, const char *path) {
     FILE *f = fopen(path, "rb");
@@ -167,7 +167,7 @@ static int tok_load_binary(Tokenizer *t, const char *path) {
     t->pad_id = (int)pad_id;
     t->bos_id = -1;
 
-    /* Alloca */
+    /* Allocate */
     t->vocab = (char **)calloc(total, sizeof(char *));
     t->vocab_len = (int *)calloc(total, sizeof(int));
 
@@ -178,7 +178,7 @@ static int tok_load_binary(Tokenizer *t, const char *path) {
     t->ht_id = (int *)malloc(t->ht_cap * sizeof(int));
     for (int i = 0; i < t->ht_cap; i++) t->ht_id[i] = -1;
 
-    /* Leggi token */
+    /* Read tokens */
     for (uint32_t i = 0; i < total; i++) {
         uint16_t len;
         if (fread(&len, 2, 1, f) != 1) break;
@@ -192,7 +192,7 @@ static int tok_load_binary(Tokenizer *t, const char *path) {
     }
 
     fclose(f);
-    fprintf(stderr, "  tok: %d token caricati (binario, eos=%d)\n",
+    fprintf(stderr, "  tok: %d tokens loaded (binary, eos=%d)\n",
             t->vocab_size, t->eos_id);
     return 0;
 }
@@ -200,11 +200,11 @@ static int tok_load_binary(Tokenizer *t, const char *path) {
 static int tok_load(Tokenizer *t, const char *path) {
     memset(t, 0, sizeof(*t));
 
-    /* Prova prima il formato binario (veloce) */
+    /* Try the binary format first (fast) */
     {
-        /* Cerca picchio_vocab.bin nella stessa directory */
+        /* Look for picchio_vocab.bin in the same directory */
         char bin_path[512];
-        /* Estrai directory dal path */
+        /* Extract the directory from the path */
         strncpy(bin_path, path, sizeof(bin_path) - 1);
         char *last_sep = strrchr(bin_path, '/');
         if (!last_sep) last_sep = strrchr(bin_path, '\\');
@@ -213,25 +213,25 @@ static int tok_load(Tokenizer *t, const char *path) {
         } else {
             strcpy(bin_path, "picchio_vocab.bin");
         }
-        
+
         if (tok_load_binary(t, bin_path) == 0) return 0;
     }
 
-    /* Fallback: parse tokenizer.json (lento, supporto limitato) */
+    /* Fallback: parse tokenizer.json (slow, limited support) */
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "tok: impossibile aprire %s\n", path);
-        fprintf(stderr, "     Genera il vocab binario: python export_vocab.py\n");
+        fprintf(stderr, "tok: cannot open %s\n", path);
+        fprintf(stderr, "     Generate the binary vocab: python export_vocab.py\n");
         return -1;
     }
     fclose(f);
-    fprintf(stderr, "tok: tokenizer.json trovato ma serve il formato binario.\n");
-    fprintf(stderr, "     Esegui: python export_vocab.py %s\n", path);
+    fprintf(stderr, "tok: tokenizer.json found but the binary format is required.\n");
+    fprintf(stderr, "     Run: python export_vocab.py %s\n", path);
     return -1;
 }
 
-/* ── Decode: token_id → stringa UTF-8 ── */
-/* Ritorna puntatore alla stringa del token (non copiare, è nel vocab) */
+/* ── Decode: token_id → UTF-8 string ── */
+/* Returns a pointer to the token's string (do not copy, it lives in the vocab) */
 
 static const char *tok_decode(Tokenizer *t, int id) {
     if (id < 0 || id >= t->vocab_size || !t->vocab[id])
@@ -239,8 +239,8 @@ static const char *tok_decode(Tokenizer *t, int id) {
     return t->vocab[id];
 }
 
-/* Decode con conversione bytes-to-unicode inversa.
- * Scrive in dst (max dstlen), ritorna bytes scritti. */
+/* Decode with the inverse bytes-to-unicode conversion.
+ * Writes into dst (max dstlen), returns bytes written. */
 static int tok_decode_raw(Tokenizer *t, int id, char *dst, int dstlen) {
     const char *s = tok_decode(t, id);
     int slen = t->vocab_len[id];
@@ -253,7 +253,7 @@ static int tok_decode_raw(Tokenizer *t, int id, char *dst, int dstlen) {
             dst[out++] = (char)byte;
             i += adv;
         } else {
-            /* Copia UTF-8 char così com'è */
+            /* Copy the UTF-8 char as-is */
             uint8_t c = (uint8_t)s[i];
             if (c < 0x80) { dst[out++] = s[i]; i++; }
             else if ((c & 0xE0) == 0xC0) {
@@ -275,9 +275,9 @@ static int tok_decode_raw(Tokenizer *t, int id, char *dst, int dstlen) {
     return out;
 }
 
-/* ── Encode: stringa UTF-8 → token_id[] (greedy longest match) ── */
-/* Non è BPE ottimale, ma funziona per prompt encoding.
- * Ritorna il numero di token scritti in out_ids (max max_tokens). */
+/* ── Encode: UTF-8 string → token_id[] (greedy longest match) ── */
+/* Not optimal BPE, but works for prompt encoding.
+ * Returns the number of tokens written to out_ids (max max_tokens). */
 
 static int tok_encode(Tokenizer *t, const char *text, int *out_ids, int max_tokens) {
     int n = 0;
@@ -285,11 +285,11 @@ static int tok_encode(Tokenizer *t, const char *text, int *out_ids, int max_toke
     int pos = 0;
 
     while (pos < len && n < max_tokens) {
-        /* Trova il token più lungo che matcha a partire da pos */
+        /* Find the longest token that matches starting at pos */
         int best_len = 0;
         int best_id = -1;
 
-        /* Prova da lunghezza massima (TOK_MAX_TOKEN_LEN) in giù */
+        /* Try from the maximum length (TOK_MAX_TOKEN_LEN) downward */
         int max_try = len - pos;
         if (max_try > TOK_MAX_TOKEN_LEN) max_try = TOK_MAX_TOKEN_LEN;
 
@@ -306,9 +306,9 @@ static int tok_encode(Tokenizer *t, const char *text, int *out_ids, int max_toke
             out_ids[n++] = best_id;
             pos += best_len;
         } else {
-            /* Byte fallback: singolo byte come token */
-            /* I token byte in tiktoken/o200k sono i primi 256 ID
-             * oppure hanno una mappatura specifica. Per ora skip. */
+            /* Byte fallback: single byte as a token */
+            /* Byte tokens in tiktoken/o200k are the first 256 IDs
+             * or have a specific mapping. For now, skip. */
             pos++;
         }
     }

@@ -1,15 +1,15 @@
-/* quant.h — Kernel di quantizzazione e matmul per Picchio.
+/* quant.h — Quantization and matmul kernels for Picchio.
  *
- * Formati supportati:
- *   fmt=0  F32     (riferimento, nessuna quantizzazione)
- *   fmt=1  INT8    (per-riga, simmetrico, scala float32)
- *   fmt=2  INT4    (per-riga, 2 valori/byte, offset 8, scala float32)
- *   fmt=3  MXFP4   (per-blocco-32, OCP microscaling, scala E8M0)
+ * Supported formats:
+ *   fmt=0  F32     (reference, no quantization)
+ *   fmt=1  INT8    (per-row, symmetric, float32 scale)
+ *   fmt=2  INT4    (per-row, 2 values/byte, offset 8, float32 scale)
+ *   fmt=3  MXFP4   (per-block-32, OCP microscaling, E8M0 scale)
  *
- * Kernel SIMD: AVX2, AVX-512 VNNI, ARM NEON (+SDOT).
- * IDOT: dot-product intero (attivazioni quantizzate a int8 on-the-fly).
+ * SIMD kernels: AVX2, AVX-512 VNNI, ARM NEON (+SDOT).
+ * IDOT: integer dot-product (activations quantized to int8 on-the-fly).
  *
- * Ispirato ai kernel di Colibri (c/glm.c), adattato per GPT-OSS-120B.
+ * Inspired by Colibri's kernels (c/glm.c), adapted for GPT-OSS-120B.
  */
 
 #ifndef PICCHIO_QUANT_H
@@ -27,16 +27,16 @@
 #include <arm_neon.h>
 #endif
 
-/* ── Tensore quantizzato ── */
+/* ── Quantized tensor ── */
 
 typedef struct {
     int fmt;            /* 0=F32, 1=INT8, 2=INT4, 3=MXFP4 */
     float *qf;          /* F32 data (fmt==0) */
     int8_t *q8;         /* INT8 data (fmt==1) */
     uint8_t *q4;        /* INT4/MXFP4 packed (fmt==2,3) */
-    float *s;           /* scale: per-riga (fmt 1,2), per-blocco (fmt 3) */
-    int O, I;           /* dimensioni [O, I] */
-    int block_size;     /* MXFP4: elementi per blocco scale (tipicamente 32) */
+    float *s;           /* scale: per-row (fmt 1,2), per-block (fmt 3) */
+    int O, I;           /* dimensions [O, I] */
+    int block_size;     /* MXFP4: elements per scale block (typically 32) */
 } QT;
 
 static inline int64_t qt_bytes(const QT *t) {
@@ -55,11 +55,11 @@ static inline int64_t qt_bytes(const QT *t) {
     }
 }
 
-/* ── Allocazione ── */
+/* ── Allocation ── */
 
 static inline float *falloc(int64_t n) {
     if (n <= 0 || (uint64_t)n > SIZE_MAX / sizeof(float)) {
-        fprintf(stderr, "falloc: n=%lld fuori range\n", (long long)n);
+        fprintf(stderr, "falloc: n=%lld out of range\n", (long long)n);
         exit(1);
     }
     float *p = (float *)malloc((size_t)n * sizeof(float));
@@ -186,7 +186,7 @@ static void matmul_q8(float *y, const float *x, const int8_t *q,
 }
 
 /* ── Matmul INT4: y[S,O] = x[S,I] @ W_i4^T * scale ── */
-/* INT4 packed: 2 valori/byte, valore = nibble - 8 (range [-8, 7]) */
+/* INT4 packed: 2 values/byte, value = nibble - 8 (range [-8, 7]) */
 
 static void matmul_i4(float *y, const float *x, const uint8_t *q4,
                       const float *scale, int S, int I, int O) {
@@ -252,9 +252,9 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4,
     }
 }
 
-/* ── Matmul INT4 Group-Scaled (gs64): una scala ogni 64 valori ── */
-/* scale layout: [O, n_groups] dove n_groups = ceil(I / 64)
- * Packed data: identico a INT4 (2 nibble/byte, valore = nibble - 8) */
+/* ── Matmul INT4 Group-Scaled (gs64): one scale every 64 values ── */
+/* scale layout: [O, n_groups] where n_groups = ceil(I / 64)
+ * Packed data: identical to INT4 (2 nibbles/byte, value = nibble - 8) */
 
 static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
                          const float *scale, int S, int I, int O, int gs) {
@@ -318,25 +318,25 @@ static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
     }
 }
 
-/* ── Dispatcher: sceglie il kernel in base al formato ── */
+/* ── Dispatcher: picks the kernel based on the format ── */
 
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
     if (w->fmt == 0) { matmul_f32(y, x, w->qf, S, w->I, w->O); return; }
     if (w->fmt == 1) { matmul_q8(y, x, w->q8, w->s, S, w->I, w->O); return; }
     if (w->fmt == 2) {
-        /* Se block_size > 0, usa group-scaled */
+        /* If block_size > 0, use group-scaled */
         if (w->block_size > 0)
             matmul_i4_gs(y, x, w->q4, w->s, S, w->I, w->O, w->block_size);
         else
             matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
         return;
     }
-    /* fmt==3 MXFP4: TODO — per la v1 convertiamo a INT4 a tempo di build */
-    fprintf(stderr, "matmul_qt: formato %d non supportato\n", w->fmt);
+    /* fmt==3 MXFP4: TODO — for v1 we convert to INT4 at build time */
+    fprintf(stderr, "matmul_qt: format %d not supported\n", w->fmt);
     exit(1);
 }
 
-/* ── Quantizzazione runtime F32 → INT8 per-riga ── */
+/* ── Runtime quantization F32 → INT8 per-row ── */
 
 static void quantize_rows_i8(const float *w, int8_t *q, float *scale,
                              int O, int I) {
@@ -361,7 +361,7 @@ static void quantize_rows_i8(const float *w, int8_t *q, float *scale,
     }
 }
 
-/* ── Quantizzazione runtime F32 → INT4 packed ── */
+/* ── Runtime quantization F32 → INT4 packed ── */
 
 static void quantize_rows_i4(const float *w, uint8_t *q4, float *scale,
                              int O, int I) {
@@ -411,7 +411,7 @@ static void softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] /= s;
 }
 
-/* ── Attivazioni ── */
+/* ── Activations ── */
 
 static inline float siluf(float x) { return x / (1.f + expf(-x)); }
 static inline float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
