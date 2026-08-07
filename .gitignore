@@ -39,3 +39,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Strumenti di sviluppo e script one-off, non pubblicati (archivio locale)
+dev/

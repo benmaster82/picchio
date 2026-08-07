@@ -15,7 +15,9 @@ REM -fopenmp e' necessario: senza di esso i #pragma omp dei kernel matmul in qua
 REM vengono ignorati e tutto il calcolo resta su un solo core.
 REM -mavx2 -mfma attivano i percorsi SIMD di quant.h, protetti da #ifdef __AVX2__:
 REM senza questi flag i kernel usano solo lo scalare. Richiede una CPU con AVX2.
-"%GCC%" -O2 -Wall -fopenmp -mavx2 -mfma -Wno-misleading-indentation -Wno-unused-function -Wl,--stack,8388608 -o picchio.exe picchio.c -lm -lpsapi
+REM -static produce un eseguibile autosufficiente: non richiede libgomp-1.dll ne'
+REM libwinpthread-1.dll a runtime, quindi picchio.exe gira anche senza MinGW nel PATH.
+"%GCC%" -O2 -Wall -fopenmp -mavx2 -mfma -Wno-misleading-indentation -Wno-unused-function -static -Wl,--stack,8388608 -o picchio.exe picchio.c -lm -lpsapi
 if %ERRORLEVEL% NEQ 0 (
     echo Errore di compilazione.
     exit /b 1

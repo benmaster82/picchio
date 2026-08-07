@@ -1,229 +1,502 @@
 # Picchio 🪶
 
-Motore MoE streaming per **GPT-OSS** (120B e 20B) su hardware consumer.
+**A streaming Mixture-of-Experts (MoE) inference engine for the GPT-OSS models
+(20B and 120B), written in pure C, that runs models larger than your RAM on
+ordinary consumer hardware.**
 
-Il 20B è la configurazione consigliata con 16 GB di RAM: modello convertito ~14 GB,
-cache hit ~57% e circa 4× più veloce del 120B sullo stesso hardware, senza modifiche
-al codice (layer, expert e attention sono letti da `config.json`).
+Most of a MoE model's weight is in its *experts*, and only a handful of experts
+are used for each token. Picchio keeps only the small "dense" part of the model
+permanently in memory and **streams the experts from disk on demand**, caching
+the ones it has recently used. This is what lets a 14 GB model (20B) run
+comfortably on a 16 GB laptop, and makes the 66 GB model (120B) runnable at all
+without a datacenter GPU.
 
-Ispirato a [Colibri](https://github.com/JustVugg/colibri) (GLM-5.2), adattato per GPT-OSS.
+Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
+GPT-OSS architecture.
 
-## Quick Start
+> **New to this?** Read the sections in order. Every command below is complete —
+> nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
+> equivalents are given where they differ.
 
-### 1. Test senza compilatore (Python oracle)
+---
+
+## Table of contents
+
+1. [What you need (hardware & software)](#1-what-you-need)
+2. [Install the toolchain](#2-install-the-toolchain)
+3. [Build the engine](#3-build-the-engine)
+4. [Download and convert a model](#4-download-and-convert-a-model)
+5. [Run it — the chat bridge (recommended)](#5-run-it--the-chat-bridge-recommended)
+6. [Run it — as an OpenAI-compatible API server](#6-run-it--as-an-openai-compatible-api-server)
+7. [Running the big model (120B)](#7-running-the-big-model-120b)
+8. [Tuning & environment variables](#8-tuning--environment-variables)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Verifying correctness (optional)](#10-verifying-correctness-optional)
+11. [How it works & project layout](#11-how-it-works--project-layout)
+12. [License](#12-license)
+
+---
+
+## 1. What you need
+
+### Hardware
+
+| Resource | Minimum | Recommended (20B) | Notes |
+|---|---|---|---|
+| **CPU** | x86-64 **with AVX2** | 6+ cores with AVX2/FMA | Almost every desktop/laptop CPU since ~2013 has AVX2. Without it the build fails or runs very slowly. |
+| **RAM** | 8 GB | 16 GB | The 20B needs ~3 GB always resident + expert cache. More RAM = more cache = less disk reading = faster. |
+| **Disk** | ~30 GB free | SSD/NVMe, ~30 GB free | The model is read from disk **constantly**, so an internal SSD matters a lot. A USB drive roughly doubles the I/O time. |
+
+The 120B model additionally needs ~70 GB of free disk and benefits from as much
+RAM as you can give it (see [section 7](#7-running-the-big-model-120b)).
+
+### Software
+
+- A **C compiler** (GCC or Clang). On Windows this means MSYS2/MinGW.
+- **Python 3.9+** (for converting the model and for the chat/server bridges).
+- An internet connection to download the model once from Hugging Face.
+
+---
+
+## 2. Install the toolchain
+
+### Windows
+
+**a) Install MSYS2 (provides the GCC compiler).**
+
+1. Download and run the installer from <https://www.msys2.org>.
+2. Accept the default install location `C:\msys64`.
+3. Open the **"MSYS2 MinGW 64-bit"** terminal from the Start menu and install GCC:
+   ```bash
+   pacman -S mingw-w64-x86_64-gcc make
+   ```
+4. `build.bat` expects the compiler at `C:\msys64\mingw64\bin\gcc.exe` (the
+   default). If you installed elsewhere, edit the `GCC=` line in `build.bat`.
+
+**b) Install Python** from <https://www.python.org/downloads/> (tick
+"Add Python to PATH" during setup).
+
+### Linux
 
 ```bash
-pip install safetensors numpy
-python make_test_model.py        # genera mini-modello (~900 KB)
-python test_forward.py test_model  # valida il forward pass
+sudo apt install build-essential python3 python3-pip   # Debian/Ubuntu
 ```
 
-### 2. Compila il motore C
+### macOS
 
-Su Linux/macOS:
+```bash
+xcode-select --install          # gives you clang + make
+brew install python             # if you don't already have Python 3
+```
+
+---
+
+## 3. Build the engine
+
+From the project folder (`C:\picchio` or wherever you cloned it):
+
+### Windows
+
+```powershell
+.\build.bat
+```
+
+This produces a **self-contained `picchio.exe`** (statically linked — it does not
+need any MinGW DLLs and runs from anywhere).
+
+Or compile by hand from the MSYS2 MinGW terminal:
+```bash
+gcc -O2 -Wall -fopenmp -mavx2 -mfma -Wno-misleading-indentation \
+    -Wno-unused-function -static -Wl,--stack,8388608 \
+    -o picchio.exe picchio.c -lm -lpsapi
+```
+
+### Linux / macOS
+
 ```bash
 make
-./picchio --self-test
 ```
 
-Su Windows (MinGW):
-```bash
-gcc -O2 -Wall -o picchio.exe picchio.c -lm
-picchio.exe --self-test
+### Why these flags (don't skip them)
+
+- `-fopenmp` — enables multi-core. **Without it, all matmuls run on one core** and
+  everything is several times slower.
+- `-mavx2 -mfma` — enables the SIMD kernels. Without them the math falls back to
+  slow scalar code. Your CPU must support AVX2.
+- `-static` (Windows) — bakes the OpenMP/pthread runtime into the exe so you don't
+  need `libgomp-1.dll` / `libwinpthread-1.dll` next to it.
+
+### Verify the build
+
+```powershell
+.\picchio.exe --self-test        # Windows
+./picchio --self-test            # Linux/macOS
 ```
 
-### 3. Testa con il mini-modello
+This runs the full forward pass on a tiny synthetic model — **no model download
+needed**. You should see `── self-test SUPERATO ──` ("self-test passed"). If you
+do, the engine works.
 
-```bash
-./picchio test_model
+---
+
+## 4. Download and convert a model
+
+GPT-OSS ships in a format Picchio can't read directly (MXFP4). You convert it
+**once** into Picchio's INT4 format. We'll use the **20B model**, which is the
+recommended choice for 16 GB machines.
+
+### a) Install the conversion dependencies
+
+```powershell
+pip install torch safetensors numpy huggingface_hub
 ```
 
-### 4. Modello reale
-
-GPT-OSS-20B, consigliato con 16 GB di RAM (~14 GB convertiti):
+### b) Download + convert in one step
 
 ```powershell
 python convert.py --model openai/gpt-oss-20b --output D:\gptoss20b_i4 --download
+```
+
+- `--model` — the Hugging Face repo id (`openai/gpt-oss-20b`).
+- `--output` — a folder **you choose** where the converted model will be written.
+  Put it on your fastest internal disk. Use any path you like (e.g.
+  `C:\models\gptoss20b_i4` or `~/gptoss20b_i4`).
+- `--download` — fetch the model from Hugging Face automatically. Omit this if you
+  already downloaded the raw model yourself and pointed `--model` at a local
+  folder.
+
+This downloads several GB and writes a converted model of about **14 GB** to the
+output folder. It only needs to be done once.
+
+> **Hugging Face access:** the GPT-OSS models are openly licensed and normally
+> download without an account. If you ever get a `401`/gated error, run
+> `pip install huggingface_hub` and `huggingface-cli login` once with a free
+> token from <https://huggingface.co/settings/tokens>.
+
+### c) Build the tokenizer file
+
+Picchio needs a small binary tokenizer file next to the model:
+
+```powershell
 python export_vocab.py D:\gptoss20b_i4\tokenizer.json D:\gptoss20b_i4\picchio_vocab.bin
-python chat.py "Ciao" --model D:\gptoss20b_i4 --pin-gb 4 --ctx 512
 ```
 
-GPT-OSS-120B (~66,65 GB convertiti, richiede il sidecar dei bias):
+(The two arguments are: the `tokenizer.json` that came with the model, and the
+output path for the binary vocab. `export_vocab.py` has no dependencies.)
 
-```bash
-python convert.py --model openai/gpt-oss-120b --output /nvme/gptoss_i4
-MODEL=/nvme/gptoss_i4 ./picchio
-```
+Your model folder is now ready to use.
 
-Nota: il download da Hugging Face include anche la cartella `original/`, che è lo stesso
-modello in formato alternativo e non serve. Conviene interromperla o rimuoverla per non
-occupare spazio inutilmente.
+---
 
-## Architettura GPT-OSS-120B
+## 5. Run it — the chat bridge (recommended)
 
-| Proprietà | Valore |
-|---|---|
-| Parametri totali | 116.8B |
-| Parametri attivi/token | 5.1B |
-| Hidden size | 2880 |
-| Layer | 36 (tutti MoE) |
-| Attention | GQA: 64 Q heads, 8 KV heads, head_dim=64 |
-| Expert/layer | 128 |
-| Expert attivi/token | 4 (top-4) |
-| Expert size (INT4) | ~12.4 MB |
-| Modello convertito corrente (INT4 gs64 + parte densa F32) | ~66,65 GB |
-| Context | 131K (sliding window 128 + full, alternati) |
+`chat.py` is the **recommended way to talk to the model**. It uses OpenAI's
+official "Harmony" library to format the conversation exactly the way GPT-OSS
+expects, so the output is correct token-for-token.
 
-## Requisiti hardware (16 GB RAM)
-
-- Parte densa residente misurata: ~4,46 GB
-- KV-cache iniziale configurabile con `CTX` (default 512 posizioni)
-- Cache expert: `PIN_GB` ha default **adattivo alla RAM fisica** (assegna agli expert la
-  RAM meno una riserva di ~6 GB per densa/KV/OS). Più cache = più hit = meno I/O, il collo
-  di bottiglia reale. Su 16 GB il 20B raggiunge la residenza piena (32 expert/layer)
-  automaticamente. Sweep: da `PIN_GB=4` a pieno i miss calano del 53% (vedi DESIGN §0.12).
-  Un valore esplicito `PIN_GB=N` resta rispettato. La RSS è ora misurata anche su Windows
-- La build **deve** usare `-fopenmp` e `-mavx2 -mfma`: senza questi flag i kernel matmul
-  restano su un solo core e in versione scalare
-- Prestazione misurata sul 20B (6 core, `PIN_GB=4`, modello su NVMe): ~0,6 s per token
-- Tenere il modello su un disco interno: da un box USB 2.0 il tempo di I/O raddoppia
-- `PILOT=1` è sconsigliato con poca RAM libera: misurato ~11% più lento
-- Il modello convertito occupa circa 66,65 GB
-
-Con uno shard su C: e gli altri su D:, usare PowerShell:
+### a) Install the chat dependency
 
 ```powershell
-$env:MODEL_AUX='C:\picchio\expert_biases.safetensors;C:\picchio\model-00012.safetensors'
-$env:OMP_NUM_THREADS='6'
-$env:PIN_GB='1'
-.\picchio.exe D:\gptoss_i4
+pip install -r requirements-chat.txt
 ```
 
-`expert_biases.safetensors` contiene i bias F32 originali. Si rigenera senza scaricare
-il modello completo con `python download_expert_biases.py`.
+(That installs `openai-harmony`, the only extra package needed to chat.)
 
-## Chat token-exact
-
-Il bridge Python usa Harmony ufficiale e passa al runtime soltanto ID raw; non usa
-l'encode approssimato di `tok.h`:
+### b) Ask a single question
 
 ```powershell
-python -m pip install -r requirements-chat.txt
-python chat.py "Scrivi un saluto breve in italiano" --max-tokens 64
+python chat.py "Write a short greeting in English." --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024
 ```
 
-Chat multi-turn nello stesso processo, con modello e KV-cache mantenuti in memoria:
+- **`--model`** — the folder you converted in step 4. **You must pass this**
+  (the built-in default points at a 120B path and won't match your setup).
+- **`--pin-gb`** — how many GB of RAM to spend on the expert cache. More = faster
+  (fewer disk reads). `4` is a good start on a 16 GB machine.
+- **`--ctx`** — context window in tokens (how much conversation history fits).
+  `1024` is fine to start.
+
+### c) Interactive multi-turn chat
+
+Omit the prompt to get a chat loop that keeps the model and its cache in memory
+between turns:
 
 ```powershell
 python chat.py --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
 ```
 
-Usare `--temperature 0.7` per l'uso conversazionale: in modalità greedy (`0`, il default,
-utile per i confronti riproducibili) il modello può ciclare nel canale `analysis` senza
-emettere la risposta finale. Altre opzioni: `--top-p`, `--top-k`, `--seed`,
-`--show-analysis`, `--json`, `--no-reasoning` (salta il canale analysis, risposta diretta).
+Type your message after `Tu:`. Type `/exit` or `/quit` to leave.
 
-`chat.py` imposta `REP=1`, quindi il **prefill batched** (batch-union degli expert, un
-expert letto una sola volta invece di una per token) è sempre attivo nel percorso chat.
-Con `PREFETCH=1` si abilita anche il pipeline a doppio buffer che sovrappone il caricamento
-del blocco successivo al calcolo del corrente: misurato −15% sul prefill del 20B con cache
-vincolata, su disco USB (vedi DESIGN §0.13). Il gate resta sul `picchio.exe` invocato a
-mano, dove il default `REP=1.1` forza il prefill sequenziale per coerenza con la penalty.
+### Useful chat options
 
-Importante: la conversione mantiene `embed_tokens` e `lm_head` a **INT8**, non INT4, come
-richiede la lista di esclusione ufficiale del modello. A INT4 la testa di uscita ha un
-errore dell'11% e cambia il token più probabile in un caso su quattro, con generazioni
-lunghe che degenerano. I container prodotti prima di questa correzione vanno riconvertiti.
+| Option | What it does |
+|---|---|
+| `--temperature 0.7` | Randomness. **Use ~0.7 for normal conversation.** The default `0` (greedy) is deterministic but can make the model loop in its "thinking" channel without answering. |
+| `--max-tokens 200` | Maximum length of the reply. |
+| `--no-reasoning` | Skip the internal "analysis" (chain-of-thought) and answer directly. Faster. |
+| `--show-analysis` | Show the model's private reasoning instead of only the final answer. |
+| `--top-p`, `--top-k`, `--seed` | Standard sampling controls. |
+| `--reasoning low\|medium\|high` | How much the model thinks before answering. |
+| `--json` | Print the structured reply as JSON. |
+| `--dry-run` | Show the exact tokens that would be sent, without loading the model (handy for debugging). |
 
-Tra turni viene riusato il prefisso comune della KV-cache (tipicamente circa l'88%),
-perché il re-render Harmony scarta l'analysis e trasforma `<|return|>` in `<|end|>`.
+### The bare-metal path (advanced / quick test)
 
-Per controllare prompt e ID senza caricare il modello da 66,65 GB:
+You can run the engine directly without Python. This uses a **built-in
+approximate tokenizer** (not token-exact — prefer `chat.py` for real use):
 
 ```powershell
-python chat.py "Ciao" --dry-run
+$env:MODEL = "D:\gptoss20b_i4"
+$env:INPUT = "The capital of Italy is"
+$env:MAX   = "40"
+.\picchio.exe
 ```
 
-Il bridge rileva automaticamente lo shard 12 e il sidecar bias nelle posizioni correnti.
-`--model-aux` sovrascrive esplicitamente `MODEL_AUX`. `tok.h` resta un fallback
-interattivo, ma non è dichiarato token-exact.
+On Linux/macOS:
+```bash
+MODEL=~/gptoss20b_i4 INPUT="The capital of Italy is" MAX=40 ./picchio
+```
 
-## Server API OpenAI-compatible
+---
 
-`server.py` espone Picchio come API HTTP compatibile con OpenAI, riusando la
-stessa infrastruttura token-exact di `chat.py` (Harmony ufficiale + processo
-SERVICE persistente con riuso del prefisso KV). Solo stdlib, nessuna dipendenza
-oltre a `openai-harmony`.
+## 6. Run it — as an OpenAI-compatible API server
+
+`server.py` exposes the model over HTTP with the same API shape as OpenAI, so any
+OpenAI-compatible client or tool can talk to it. It uses only the Python standard
+library plus `openai-harmony` (already installed in step 5a).
+
+### Start the server
 
 ```powershell
 python server.py --model D:\gptoss20b_i4 --port 8000 --pin-gb 4 --ctx 1024
 ```
 
-Endpoint: `POST /v1/chat/completions` (streaming SSE e non), `GET /v1/models`,
-`GET /health`. Funziona drop-in col client `openai` ufficiale:
+It prints `[server in ascolto su http://127.0.0.1:8000 ...]` when ready.
+
+### Endpoints
+
+- `POST /v1/chat/completions` — streaming (SSE) and non-streaming.
+- `GET  /v1/models`
+- `GET  /health`
+
+### Use it from the official OpenAI Python client
 
 ```python
 from openai import OpenAI
-c = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
-r = c.chat.completions.create(model="gptoss20b",
-        messages=[{"role": "user", "content": "Ciao"}], max_tokens=64)
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
+
+resp = client.chat.completions.create(
+    model="gptoss20b",
+    messages=[{"role": "user", "content": "Say hello in one sentence."}],
+    max_tokens=64,
+    temperature=0.7,
+)
+print(resp.choices[0].message.content)
 ```
 
-Il modello è un unico processo con una sola KV-cache: le richieste vengono
-**serializzate** con un lock. Il riuso del prefisso lavora sui token, quindi fra
-richieste diverse recupera comunque l'overlap e ricalcola solo alla divergenza.
-Il canale `analysis` viene esposto in `reasoning_content`, la risposta in
-`content`. Parametri per-richiesta: `max_tokens`, `temperature`, `top_p`,
-`top_k`, `reasoning_effort` (`low`/`medium`/`high`) e `no_reasoning` (via
-`extra_body`). temperature/top-p/top-k viaggiano nell'header `TURN` esteso
-(`TURN <max_new> <keep> <temp> <top_p> <top_k> <n_ids> ...`), quindi cambiano
-a ogni richiesta senza riavviare il server; se omessi si usano i default passati
-all'avvio.
+### Use it with `curl`
 
-## File
-
-```
-picchio.c        — motore principale (include la modalità SERVICE persistente)
-chat.py           — chat Harmony ufficiale ↔ ID raw, multi-turn
-server.py         — API HTTP OpenAI-compatible (streaming SSE, /v1/chat/completions)
-test_service.py   — equivalenza riuso prefisso vs prefill completo
-check_harmony_delta.py — verifica prefix-preserving del render Harmony
-requirements-chat.txt — dipendenza Harmony fissata
-quant.h          — kernel matmul (F32, INT8, INT4) + SIMD
-json.h           — parser config.json
-st.h             — reader safetensors
-convert.py       — conversione MXFP4 → INT4
-make_test_model.py — genera mini-modello per test
-test_forward.py  — oracle Python per validazione
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gptoss20b","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-## Stato
+**Per-request options** (in the JSON body): `temperature`, `top_p`, `top_k`,
+`max_tokens`, `reasoning_effort` (`"low"`/`"medium"`/`"high"`), and
+`no_reasoning: true`.
 
-- [x] Forward pass completo (attention + MoE + routing)
-- [x] GQA con sliding/full attention, attention sinks e YaRN
-- [x] Clipped SwiGLU GPT-OSS e gate/up interleaved
-- [x] Bias attention ed expert aggregati
-- [x] INT4 group-scaled, embedding e lm-head inclusi
-- [x] Cache LRU expert, hot-store e sampling
-- [x] Reader safetensors multi-shard e `MODEL_AUX` multi-disco
-- [x] Oracle Transformers sul checkpoint `tiny-random/gpt-oss`
-- [x] Equivalenza F32 e INT4 layer-by-layer, 32 token greedy e posizione 130
-- [x] Forward e generazione autoregressiva del GPT-OSS-120B senza NaN/Inf
-- [x] Bridge chat con rendering/parsing Harmony ufficiale e trasporto ID raw
-- [x] Sessione persistente multi-turn con riuso del prefisso KV
-- [ ] Tokenizer o200k_harmony nativo C token-exact (`tok.h` resta approssimato)
-- [ ] Prestazioni: prefill e I/O expert sono il collo di bottiglia (~0,09 token/s)
-- [x] Kernel matmul realmente paralleli (OpenMP abilitato): ~1,7× sul turno completo
-- [x] Read expert paralleli (queue depth > 1) su decode e prefill: slot LRU
-      riservati in modo seriale, poi letti in parallelo. Token-exact vs seriale
-      sulle suite tiny F32/INT4, anche sotto eviction. Controllo con `IO_THREADS`
-      (default 4, `PIPE=0` forza seriale); `ECAP` regola gli slot per layer
-- [ ] PILOT prefetch utile: va riscritto per popolare direttamente la cache LRU
-- [x] Server API OpenAI-compatible (`server.py`): `/v1/chat/completions` streaming
-      SSE e non, `/v1/models`, `/health`. Drop-in col client `openai` ufficiale;
-      richieste serializzate su un'unica sessione con riuso del prefisso KV.
-      Sampling (temperature/top-p/top-k) per-richiesta via header `TURN` esteso
+**Note:** the model is a single process with one KV-cache, so requests are handled
+**one at a time** (serialized). This is meant for personal/local use, not for
+serving many users concurrently.
 
-## Licenza
+---
 
-Apache 2.0
+## 7. Running the big model (120B)
+
+The 120B is ~66 GB converted. It runs on the same machine as the 20B — just more
+slowly, because more must be streamed from disk.
+
+### Download + convert shard by shard
+
+Downloading and converting all 66 GB at once needs a lot of temporary disk.
+`convert_streaming.py` does it **one shard at a time**, never keeping more than
+one raw shard on disk:
+
+```powershell
+$env:PYTHONUTF8 = "1"                       # so progress symbols print correctly
+$env:HF_HUB_ENABLE_HF_TRANSFER = "1"        # faster downloads (optional)
+python convert_streaming.py
+```
+
+Output/paths are set at the top of `convert_streaming.py` (`OUTPUT`, `RAW_DIR`,
+`REPO`); edit them if you want different locations. The process is
+**resumable** — already-converted shards are skipped if you re-run it.
+
+> **Slow download?** Hugging Face can be throttled on some connections. A regional
+> mirror is often much faster — set `$env:HF_ENDPOINT = "https://hf-mirror.com"`
+> before running. The conversion resumes wherever it left off.
+
+### Expert bias sidecar
+
+The 120B needs a small extra file of expert biases. Regenerate it (without
+re-downloading the whole model) with:
+
+```powershell
+python download_expert_biases.py
+```
+
+This writes `expert_biases.safetensors`, which you pass to the engine via
+`MODEL_AUX` (see below).
+
+### Spreading the model across two disks
+
+If the model doesn't fit on one drive, put some shards on another and list the
+extra files in `MODEL_AUX` (semicolon-separated):
+
+```powershell
+$env:MODEL_AUX = "C:\picchio\expert_biases.safetensors;C:\picchio\model-00012.safetensors"
+$env:OMP_NUM_THREADS = "6"
+$env:PIN_GB = "1"
+.\picchio.exe D:\gptoss_i4
+```
+
+`chat.py` and `server.py` auto-detect the bias sidecar and shard 12 in the current
+folder; `--model-aux` overrides this explicitly.
+
+---
+
+## 8. Tuning & environment variables
+
+Picchio is configured through environment variables (the `chat.py`/`server.py`
+flags map onto these). The most useful:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MODEL` | — | Path to the converted model folder (or pass it as the first argument). |
+| `PIN_GB` | **auto** | GB of RAM for the expert cache. **The single biggest performance knob.** By default it's sized automatically from your physical RAM (all RAM minus a ~6 GB reserve). A bigger cache means fewer disk reads. Setting a value overrides the auto-sizing. |
+| `CTX` | 512 | KV-cache size in tokens (max prompt+generation length). |
+| `OMP_NUM_THREADS` | all cores | Number of CPU threads for the matmuls. |
+| `MAX` | 128 | Max tokens to generate (bare-metal run only). |
+| `TEMPERATURE` | 1.0 | Sampling temperature (`0` = greedy). |
+| `TOPP` / `TOPK` | 0.95 / 50 | Nucleus / top-k sampling. |
+| `SEED` | fixed | RNG seed for reproducible sampling. |
+| `IO_THREADS` | 4 | Threads used for reading experts from disk in parallel. |
+| `MODEL_AUX` | — | Extra model files on other disks (semicolon-separated). |
+
+Performance notes:
+
+- On the 20B (6 cores, model on NVMe) expect roughly **~0.6 s per token**.
+- Keep the model on an **internal SSD**. From USB the I/O time roughly doubles.
+- More RAM devoted to `PIN_GB` is almost always the best speedup: going from a
+  small cache to full residency on the 20B cut disk reads by ~53% in testing.
+
+For the design rationale and measurements, see [`DESIGN.md`](DESIGN.md).
+
+---
+
+## 9. Troubleshooting
+
+**`picchio.exe` exits immediately / "libgomp-1.dll not found".**
+You built without `-static`. Either rebuild with `.\build.bat` (which uses
+`-static`), or run from the MSYS2 MinGW terminal / add `C:\msys64\mingw64\bin` to
+your PATH.
+
+**"Illegal instruction" crash on startup.**
+Your CPU lacks AVX2, or you built for a different CPU. Rebuild on the machine you
+run on. AVX2 is required.
+
+**The model keeps "thinking" and never gives an answer.**
+You're in greedy mode. Add `--temperature 0.7` (chat) or set `TEMPERATURE=0.7`.
+
+**Output is gibberish / degenerates in long replies.**
+Make sure you converted with the current `convert.py` (it keeps the embedding and
+output head at INT8 as required). Models converted with older code must be
+reconverted.
+
+**Out of memory / very slow.**
+Lower `PIN_GB` (e.g. `--pin-gb 2`) and/or lower `--ctx`. Streaming still works with
+a small cache; it just reads from disk more often.
+
+**Conversion download is extremely slow (120B).**
+See the mirror tip in [section 7](#7-running-the-big-model-120b)
+(`HF_ENDPOINT=https://hf-mirror.com`).
+
+**Garbled accented characters in terminal output (Windows).**
+Set `PYTHONUTF8=1` before running Python scripts.
+
+---
+
+## 10. Verifying correctness (optional)
+
+If you want to confirm the math matches a reference implementation, there's a
+lightweight numeric oracle (needs only `numpy` and `safetensors`):
+
+```powershell
+pip install safetensors numpy
+python make_test_model.py            # writes a tiny synthetic model to ./test_model
+python test_forward.py test_model    # validates the forward pass against the oracle
+```
+
+The built-in `picchio --self-test` (section 3) is the quickest sanity check and
+needs nothing at all.
+
+---
+
+## 11. How it works & project layout
+
+**The idea in one paragraph:** the dense weights (attention, router, embedding,
+output head) stay resident in RAM. For each token the router picks the top-4 of
+128 experts per layer; Picchio loads just those experts, computing them while an
+LRU cache keeps recently-used experts around and a learned hot-store keeps the
+most frequently used ones pinned. Because only a few experts are touched per
+token, total disk traffic is a fraction of the model size.
+
+### Architecture (GPT-OSS)
+
+| Property | 20B | 120B |
+|---|---|---|
+| Total parameters | 21 B | 117 B |
+| Active per token | ~3.6 B | ~5.1 B |
+| Hidden size | 2880 | 2880 |
+| Layers (all MoE) | 24 | 36 |
+| Experts / layer | 32 | 128 |
+| Active experts / token | 4 (top-4) | 4 (top-4) |
+| Attention | GQA (64 Q / 8 KV heads), sliding-window + full, attention sinks, YaRN | same |
+| Converted size | ~14 GB | ~66 GB |
+
+Quantization: experts are INT4 (group-scaled, 64), the embedding and output head
+are INT8, attention is F32.
+
+### Files in this repository
+
+```
+picchio.c              The engine (single translation unit)
+quant.h                Quantized matmul kernels (F32 / INT8 / INT4) with AVX2/NEON
+st.h                   safetensors reader (multi-shard, multi-disk)
+json.h                 config.json parser
+tok.h                  Built-in approximate tokenizer (fallback for bare-metal runs)
+Makefile / build.bat   Build for Linux/macOS and Windows
+
+convert.py             Convert a GPT-OSS model (MXFP4/BF16 -> INT4) for Picchio
+convert_streaming.py   Shard-by-shard download+convert for the 120B
+export_vocab.py        Build the binary tokenizer file
+download_expert_biases.py  Regenerate the 120B expert-bias sidecar
+
+chat.py                Token-exact chat bridge (Harmony), single-turn and multi-turn
+server.py              OpenAI-compatible HTTP API server
+requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
+
+make_test_model.py     Generate a tiny synthetic model for validation
+test_forward.py        Numeric oracle to validate the forward pass
+
+DESIGN.md              Design notes, rationale, and measurements
+```
+
+For a much deeper dive into the numerics, the streaming/caching design, the
+service protocol, and the measured results, read [`DESIGN.md`](DESIGN.md).
+
+---
+
+## 12. License
+
+Apache 2.0.
