@@ -1533,6 +1533,10 @@ static int cmp_desc(const void *a, const void *b) {
     float fb = ((const IdxVal *)b)->val;
     return (fa < fb) - (fa > fb);
 }
+static int cmp_desc_f(const void *a, const void *b) {
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa < fb) - (fa > fb);
+}
 
 static int sample_logits(float *logits, int vocab) {
     /* 1. Repetition penalty */
@@ -1561,35 +1565,20 @@ static int sample_logits(float *logits, int vocab) {
     float inv_temp = 1.0f / g_temperature;
     for (int i = 0; i < vocab; i++) logits[i] *= inv_temp;
 
-    /* 3. Top-K: tieni solo i K logits più alti */
-    int effective_k = vocab;
-    if (g_top_k > 0 && g_top_k < vocab) {        /* Trova il K-esimo valore più grande (selezione parziale) */
-        /* Per efficienza usiamo un approccio semplificato:
-         * trova la soglia con un passaggio lineare */
-        float threshold = -1e30f;
-        
-        /* Prova veloce: se K è piccolo, trova i top-K */
-        if (g_top_k <= 256) {
-            float tops[256];
-            for (int i = 0; i < g_top_k; i++) tops[i] = -1e30f;
-            for (int i = 0; i < vocab; i++) {
-                if (logits[i] > tops[g_top_k - 1]) {
-                    tops[g_top_k - 1] = logits[i];
-                    /* Bubble up */
-                    for (int j = g_top_k - 2; j >= 0; j--) {
-                        if (tops[j + 1] > tops[j]) {
-                            float tmp = tops[j]; tops[j] = tops[j + 1]; tops[j + 1] = tmp;
-                        } else break;
-                    }
-                }
-            }
-            threshold = tops[g_top_k - 1];
+    /* 3. Top-K: tieni solo i K logits più alti.
+     * La soglia è il K-esimo valore più grande, trovato ordinando una copia
+     * dei logits (O(vocab·log vocab), indipendente da K: nessun tetto su K).
+     * Gli eventuali pareggi sulla soglia restano inclusi, come di consueto. */
+    if (g_top_k > 0 && g_top_k < vocab) {
+        float *scratch = (float *)malloc((size_t)vocab * sizeof(float));
+        if (scratch) {
+            memcpy(scratch, logits, (size_t)vocab * sizeof(float));
+            qsort(scratch, vocab, sizeof(float), cmp_desc_f);
+            float threshold = scratch[g_top_k - 1];
+            free(scratch);
+            for (int i = 0; i < vocab; i++)
+                if (logits[i] < threshold) logits[i] = -1e30f;
         }
-        
-        /* Azzera tutto sotto la soglia */
-        for (int i = 0; i < vocab; i++)
-            if (logits[i] < threshold) logits[i] = -1e30f;
-        effective_k = g_top_k;
     }
 
     /* 4. Softmax */
