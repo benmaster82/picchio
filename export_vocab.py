@@ -80,6 +80,6 @@ def export_vocab(tokenizer_path: str, output_path: str):
 
 
 if __name__ == '__main__':
-    tok_path = sys.argv[1] if len(sys.argv) > 1 else 'D:/gptoss_i4/tokenizer.json'
-    out_path = sys.argv[2] if len(sys.argv) > 2 else 'D:/gptoss_i4/picchio_vocab.bin'
+    tok_path = sys.argv[1] if len(sys.argv) > 1 else 'C:/models/gptoss_i4/tokenizer.json'
+    out_path = sys.argv[2] if len(sys.argv) > 2 else 'C:/models/gptoss_i4/picchio_vocab.bin'
     export_vocab(tok_path, out_path)

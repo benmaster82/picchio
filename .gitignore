@@ -1,9 +1,9 @@
-# Binari
+# Binaries
 *.exe
 *.o
 *.obj
 
-# Directory modello (60+ GB)
+# Model directories (60+ GB)
 /model-*.safetensors
 /expert_biases.safetensors
 test_model/
@@ -22,13 +22,13 @@ gptoss_raw/
 gptoss20b_i4/
 gptoss120b_meta/
 
-# File temporanei
+# Temporary files
 *.log
 *.tmp
 __pycache__/
 do.sh
 
-# Hot-store (generato a runtime)
+# Hot-store (generated at runtime)
 .picchio_usage
 .picchio_kv
 
@@ -40,5 +40,5 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Strumenti di sviluppo e script one-off, non pubblicati (archivio locale)
+# Development tools and one-off scripts, not published (local archive)
 dev/

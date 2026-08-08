@@ -16,8 +16,8 @@ Estimated output: ~57 GB (INT4 for everything).
 RAM required: ~4 GB (one shard at a time).
 
 Usage:
-  python convert.py --model openai/gpt-oss-120b --output D:/gptoss_i4
-  python convert.py --model D:/gptoss_orig --output D:/gptoss_i4  # from local
+  python convert.py --model openai/gpt-oss-120b --output C:/models/gptoss_i4
+  python convert.py --model C:/models/gptoss_orig --output C:/models/gptoss_i4  # from local
 
 Requirements:
   pip install safetensors numpy torch huggingface_hub

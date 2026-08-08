@@ -180,7 +180,7 @@ class HarmonyChat:
 def resolve_aux(model, override):
     if override is not None:
         return override
-    if model != Path(r"D:\gptoss_i4").resolve():
+    if model != Path(r"C:\models\gptoss_i4").resolve():
         return None
     root = Path(__file__).resolve().parent
     candidates = [root / "expert_biases.safetensors", root / "model-00012.safetensors"]
@@ -190,7 +190,7 @@ def resolve_aux(model, override):
 def main():
     parser = argparse.ArgumentParser(description="GPT-OSS chat with Picchio")
     parser.add_argument("prompt", nargs="?", help="single question; omit to start the chat")
-    parser.add_argument("--model", default=r"D:\gptoss_i4")
+    parser.add_argument("--model", default=r"C:\models\gptoss_i4")
     parser.add_argument("--exe", default="picchio.exe")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--ctx", type=int, default=512)

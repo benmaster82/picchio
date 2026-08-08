@@ -298,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="OpenAI-compatible API server for Picchio")
-    ap.add_argument("--model", default=r"D:\gptoss20b_i4")
+    ap.add_argument("--model", default=r"C:\models\gptoss20b_i4")
     ap.add_argument("--exe", default="picchio.exe")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)

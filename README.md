@@ -159,7 +159,7 @@ pip install torch safetensors numpy huggingface_hub
 ### b) Download + convert in one step
 
 ```powershell
-python convert.py --model openai/gpt-oss-20b --output D:\gptoss20b_i4 --download
+python convert.py --model openai/gpt-oss-20b --output C:\models\gptoss20b_i4 --download
 ```
 
 - `--model`: the Hugging Face repo id (`openai/gpt-oss-20b`).
@@ -183,7 +183,7 @@ output folder. It only needs to be done once.
 Picchio needs a small binary tokenizer file next to the model:
 
 ```powershell
-python export_vocab.py D:\gptoss20b_i4\tokenizer.json D:\gptoss20b_i4\picchio_vocab.bin
+python export_vocab.py C:\models\gptoss20b_i4\tokenizer.json C:\models\gptoss20b_i4\picchio_vocab.bin
 ```
 
 (The two arguments are: the `tokenizer.json` that came with the model, and the
@@ -210,7 +210,7 @@ pip install -r requirements-chat.txt
 ### b) Ask a single question
 
 ```powershell
-python chat.py "Write a short greeting in English." --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024
+python chat.py "Write a short greeting in English." --model C:\models\gptoss20b_i4 --pin-gb 4 --ctx 1024
 ```
 
 - **`--model`**: the folder you converted in step 4. **You must pass this**
@@ -226,7 +226,7 @@ Omit the prompt to get a chat loop that keeps the model and its cache in memory
 between turns:
 
 ```powershell
-python chat.py --model D:\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
+python chat.py --model C:\models\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
 ```
 
 Type your message after `Tu:`. Type `/exit` or `/quit` to leave.
@@ -250,7 +250,7 @@ You can run the engine directly without Python. This uses a **built-in
 approximate tokenizer** (not token-exact; prefer `chat.py` for real use):
 
 ```powershell
-$env:MODEL = "D:\gptoss20b_i4"
+$env:MODEL = "C:\models\gptoss20b_i4"
 $env:INPUT = "The capital of Italy is"
 $env:MAX   = "40"
 .\picchio.exe
@@ -272,7 +272,7 @@ library plus `openai-harmony` (already installed in step 5a).
 ### Start the server
 
 ```powershell
-python server.py --model D:\gptoss20b_i4 --port 8000 --pin-gb 4 --ctx 1024
+python server.py --model C:\models\gptoss20b_i4 --port 8000 --pin-gb 4 --ctx 1024
 ```
 
 It prints `[server in ascolto su http://127.0.0.1:8000 ...]` when ready.
@@ -362,7 +362,7 @@ extra files in `MODEL_AUX` (semicolon-separated):
 $env:MODEL_AUX = "C:\picchio\expert_biases.safetensors;C:\picchio\model-00012.safetensors"
 $env:OMP_NUM_THREADS = "6"
 $env:PIN_GB = "1"
-.\picchio.exe D:\gptoss_i4
+.\picchio.exe C:\models\gptoss_i4
 ```
 
 `chat.py` and `server.py` auto-detect the bias sidecar and shard 12 in the current

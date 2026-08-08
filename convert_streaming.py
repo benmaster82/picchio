@@ -11,8 +11,8 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 REPO = "openai/gpt-oss-120b"
-OUTPUT = "D:/gptoss_i4"
-RAW_DIR = "D:/gptoss_tmp"
+OUTPUT = "C:/models/gptoss_i4"
+RAW_DIR = "C:/models/gptoss_tmp"
 N_SHARDS = 15  # model-00000-of-00014 to model-00014-of-00014
 
 os.makedirs(OUTPUT, exist_ok=True)
