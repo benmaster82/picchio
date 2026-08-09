@@ -10,9 +10,14 @@ from convert import *
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 
-REPO = "openai/gpt-oss-120b"
-OUTPUT = "C:/models/gptoss_i4"
-RAW_DIR = "C:/models/gptoss_tmp"
+# Paths and repo are overridable via environment (handy for a different disk):
+#   PICCHIO_OUTPUT  where the converted shards go
+#   PICCHIO_RAW     scratch dir for the one raw shard at a time
+#   PICCHIO_REPO    Hugging Face repo id
+# Downloads honour HF_ENDPOINT (e.g. https://hf-mirror.com) for a faster mirror.
+REPO = os.environ.get("PICCHIO_REPO", "openai/gpt-oss-120b")
+OUTPUT = os.environ.get("PICCHIO_OUTPUT", "C:/models/gptoss_i4")
+RAW_DIR = os.environ.get("PICCHIO_RAW", "C:/models/gptoss_tmp")
 N_SHARDS = 15  # model-00000-of-00014 to model-00014-of-00014
 
 os.makedirs(OUTPUT, exist_ok=True)
