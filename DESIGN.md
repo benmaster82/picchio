@@ -1,6 +1,6 @@
-# Picchio — Streaming MoE Engine for GPT-OSS-120B
+# Picchio: Streaming MoE Engine for GPT-OSS-120B
 
-> *The woodpecker (picchio) drums a hundred times a second on a huge trunk —
+> *The woodpecker (picchio) drums a hundred times a second on a huge trunk,
 > we drum 128 experts on a huge disk.*
 
 **Goal:** run GPT-OSS-120B (117B parameters, MoE) on consumer hardware
@@ -40,20 +40,20 @@ not yet token-exact and remain a separate suite.
 
 ### 0.2 Three levels of validation
 
-**L0 — Container-exact.** The converter must produce a manifest with name, dtype,
+**L0: Container-exact.** The converter must produce a manifest with name, dtype,
 shape, byte count, quantization scheme, group size, and hash. Every mandatory
 weight, including expert biases and attention sinks, must exist. Packed INT4,
 scales, and sample dequantized rows must match between Python and C within the
 declared tolerance. A short read, an unexpected shape, or a silent fallback are
 fatal errors.
 
-**L1 — Implementation-exact.** Picchio C is compared against a Python oracle that
+**L1: Implementation-exact.** Picchio C is compared against a Python oracle that
 reads the same Picchio-converted files and reproduces the same dequantization.
 The top-k indices and argmax must be identical; for F32 tensors we record max-abs,
 max-rel, and cosine error. This level separates runtime bugs from the effects of
 lossy quantization.
 
-**L2 — Transformers token-exact.** With the same input IDs, Picchio is compared
+**L2: Transformers token-exact.** With the same input IDs, Picchio is compared
 against Transformers on the original checkpoint. Greedy IDs must match. Because
 MXFP4/BF16 → INT4 gs64 is lossy, an L2 mismatch after L0 and L1 have passed must
 also report top-1/top-2 margin and logit difference: on its own it does not prove
@@ -401,7 +401,7 @@ from QD>1, the SATA-USB bridge does not. The gain remains limited, however, beca
 the workload is **bandwidth-bound**: ~1355 misses × ~13 MB ≈ 17.6 GB read at
 ~320 MB/s (USB) or ~494 MB/s (NVMe), i.e. at the sequential ceiling of the
 respective disks. Reducing the *bytes* read therefore matters more than
-parallelizing or coalescing them — see the `PIN_GB` sweep below.
+parallelizing or coalescing them; see the `PIN_GB` sweep below.
 
 ### 0.12 Real RSS on Windows and PIN_GB sweep
 
@@ -469,8 +469,8 @@ state of L normalized with the post_ln of L+1, missing only the attention of L+1
 **89.4%**. Proxy B is used: ~3.58 of 4 experts correct, ~10% of reads wasted.
 
 **Results on decode** (20B, `PIN_GB=4`, constrained cache, greedy). The accounting
-metrics improve a lot — hit 83→94%, `t_edisk` on the main thread from 50 to 19 s
-(USB) and from 26 to 8 s (NVMe) — because the reads migrate to the prefetch thread.
+metrics improve a lot: hit 83→94%, `t_edisk` on the main thread from 50 to 19 s
+(USB) and from 26 to 8 s (NVMe), because the reads migrate to the prefetch thread.
 But the **wall-clock `t_moe` does not follow**:
 
 | Disk | `t_moe` OFF | `t_moe` ON |
@@ -572,7 +572,7 @@ float/token, GPT-OSS uses standard **Grouped Query Attention**:
 
 **KV-cache per token:** 2 × 6 × 128 = 1536 float × 36 layers = 55,296 float
 At BF16: 55,296 × 2 bytes = ~110 KB/token. For 4K tokens: ~430 MB.
-For 128K: ~13.5 GB (significant — careful management needed).
+For 128K: ~13.5 GB (significant, careful management needed).
 
 ### 1.4 MXFP4 weight format
 
@@ -612,7 +612,7 @@ The dense part includes:
 - Embedding + lm_head: ~200K × 6144 × 2 ≈ 2.4B params
 - Attention for 36 layers: Q/K/V/O projections
 - Dense layers (classic FFN in the first layers)
-- Shared experts (if present — to be verified in the config)
+- Shared experts (if present, to be verified in the config)
 - LayerNorm / RMSNorm weights
 
 Estimate at INT4: **~3-5 GB** resident in RAM.
@@ -675,7 +675,7 @@ Final head:
 
 Like Colibri, a separate thread runs the routing of layer L+1 while layer L is
 computing, and issues `pread`/`posix_fadvise` on the predicted experts. With 4
-active experts per token (vs 8 in GLM), predictability may differ — to be measured.
+active experts per token (vs 8 in GLM), predictability may differ, to be measured.
 
 ### 2.4 Per-layer LRU cache
 
@@ -830,7 +830,7 @@ Contiguity in the file is crucial: a single `pread` loads the whole expert.
 > **Historical note.** The tree below is the original v0.1 plan. The real project
 > is a flatter layout (see the "Files in this repository" section of `README.md`);
 > several files listed here (`tier.h`, `attn.h`, `pilot.h`, `backend_cuda.*`, the
-> `web/` dashboard) were never split out — their logic lives inside `picchio.c` —
+> `web/` dashboard) were never split out (their logic lives inside `picchio.c`)
 > or remain unbuilt future work.
 
 ```
@@ -866,7 +866,7 @@ picchio/
 ## 6. Incremental development plan
 
 ### Phase 1: "Correct token" (weeks 1-3)
-- [ ] safetensors reader (`st.h`) — reusable from Colibri with adaptations
+- [ ] safetensors reader (`st.h`): reusable from Colibri with adaptations
 - [ ] config.json parser → `Cfg` struct
 - [ ] o200k_harmony tokenizer (wrapper of the .json with BPE)
 - [ ] Load dense part (embed, attention, FFN) at BF16/INT4
@@ -951,7 +951,7 @@ For most tokens: 0 disk accesses → **5-10 tok/s** (estimated).
 ### 7.4 Comparison with GLM (Colibri)
 
 GPT-OSS-120B is much more favorable for streaming:
-- Experts ~7× smaller (113 MB vs 19 MB — to be verified with real dims)
+- Experts ~7× smaller (113 MB vs 19 MB, to be verified with real dims)
 - Only 4 active experts vs ~8
 - Fewer MoE layers (~30 vs 75)
 - **Cache miss ~15× cheaper** in terms of I/O
@@ -1022,4 +1022,4 @@ GPT-OSS-120B is much more favorable for streaming:
 
 ---
 
-*Founding document v0.1 — Picchio Project, July 2026*
+*Founding document v0.1, Picchio Project, July 2026*
