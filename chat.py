@@ -255,13 +255,10 @@ class HarmonyChat:
 
 
 def resolve_aux(model, override):
-    if override is not None:
-        return override
-    if model != Path(r"C:\models\gptoss_i4").resolve():
-        return None
-    root = Path(__file__).resolve().parent
-    candidates = [root / "expert_biases.safetensors", root / "model-00012.safetensors"]
-    return ";".join(str(path) for path in candidates if path.is_file())
+    # Fresh conversions bake the expert biases into the shards, so no auxiliary
+    # files are needed. Pass extra files explicitly with --model-aux when the
+    # model is split across disks (or needs a legacy bias sidecar).
+    return override
 
 
 def main():

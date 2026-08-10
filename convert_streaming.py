@@ -14,7 +14,9 @@ from huggingface_hub import hf_hub_download
 #   PICCHIO_OUTPUT  where the converted shards go
 #   PICCHIO_RAW     scratch dir for the one raw shard at a time
 #   PICCHIO_REPO    Hugging Face repo id
-# Downloads honour HF_ENDPOINT (e.g. https://hf-mirror.com) for a faster mirror.
+# For faster downloads set HF_HUB_ENABLE_HF_TRANSFER=1 (multi-connection).
+# Do NOT use an HF mirror (HF_ENDPOINT): it serves the small config files but
+# fails on the large LFS shards.
 REPO = os.environ.get("PICCHIO_REPO", "openai/gpt-oss-120b")
 OUTPUT = os.environ.get("PICCHIO_OUTPUT", "C:/models/gptoss_i4")
 RAW_DIR = os.environ.get("PICCHIO_RAW", "C:/models/gptoss_tmp")
