@@ -1,4 +1,4 @@
-# Picchio: Streaming MoE Engine for GPT-OSS-120B
+# Picchio: Streaming MoE Engine for GPT-OSS (20B/120B)
 
 > *The woodpecker (picchio) drums a hundred times a second on a huge trunk,
 > we drum 128 experts on a huge disk.*
