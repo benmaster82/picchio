@@ -318,55 +318,78 @@ serving many users concurrently.
 
 ## 7. Running the big model (120B)
 
-The 120B is ~66 GB converted. It runs on the same machine as the 20B, just more
-slowly, because more must be streamed from disk.
+The 120B converts to about 66 GB and runs on the same machine as the 20B, only
+much more slowly, because far more must be streamed from disk. On 16 GB RAM
+expect roughly 0.05 to 0.1 tokens/s: it is a "works, with patience" model, not a
+daily driver. For everyday use the 20B is the better choice.
 
-### Download + convert shard by shard
+### Before you start
 
-Downloading and converting all 66 GB at once needs a lot of temporary disk.
-`convert_streaming.py` does it **one shard at a time**, never keeping more than
-one raw shard on disk:
+- **Disk space:** you need about **70 GB free** on the output drive.
+  On Windows, "used space" can be inflated by hidden shadow copies (System
+  Restore) under `System Volume Information`: if a drive looks full but your files
+  don't add up, reclaim it with Disk Cleanup, or from an **Administrator** prompt:
+  `vssadmin delete shadows /for=D: /all`.
+- **Dependencies** (same as section 4, plus the fast downloader):
+  ```powershell
+  pip install torch safetensors numpy huggingface_hub hf_transfer
+  ```
+
+### Download + convert, shard by shard
+
+`convert_streaming.py` downloads and converts **one shard at a time**, never
+keeping more than one raw shard (~4.6 GB) on disk. `hf_transfer` makes the
+download several times faster (multi-connection: ~5 MB/s vs ~0.7 MB/s in testing):
 
 ```powershell
-$env:PYTHONUTF8 = "1"                       # so progress symbols print correctly
-$env:HF_HUB_ENABLE_HF_TRANSFER = "1"        # faster downloads (optional)
+$env:PYTHONUTF8 = "1"                  # progress symbols print correctly
+$env:HF_HUB_ENABLE_HF_TRANSFER = "1"   # multi-connection downloads (much faster)
+$env:PICCHIO_OUTPUT = "D:\gptoss120b_i4"   # where the converted shards go (~66 GB)
+$env:PICCHIO_RAW    = "D:\gptoss_tmp"       # scratch for the single raw shard
 python convert_streaming.py
 ```
 
-Output/paths are set at the top of `convert_streaming.py` (`OUTPUT`, `RAW_DIR`,
-`REPO`); edit them if you want different locations. The process is
-**resumable**: already-converted shards are skipped if you re-run it.
+- `PICCHIO_OUTPUT`, `PICCHIO_RAW`, and `PICCHIO_REPO` are read from the
+  environment; point them at a disk with room (defaults are set in the script).
+- **Resumable:** already-converted shards are skipped, so if the download drops
+  or you stop it, just run the same command again and it continues.
+- **Do not use an HF mirror here.** `HF_ENDPOINT=hf-mirror.com` serves the small
+  config files but **fails on the large LFS shards**. Download from Hugging Face
+  directly (the default).
 
-> **Slow download?** Hugging Face can be throttled on some connections. A regional
-> mirror is often much faster; set `$env:HF_ENDPOINT = "https://hf-mirror.com"`
-> before running. The conversion resumes wherever it left off.
+When it finishes, the output folder holds `model-00000.safetensors` through
+`model-00014.safetensors`, plus `config.json`, `tokenizer.json`, and
+`picchio_vocab.bin` (the vocab is generated for you). The expert biases are
+baked into the shards (F32), so **no separate sidecar is needed**.
 
-### Expert bias sidecar
+### Run it
 
-The 120B needs a small extra file of expert biases. Regenerate it (without
-re-downloading the whole model) with:
-
-```powershell
-python download_expert_biases.py
-```
-
-This writes `expert_biases.safetensors`, which you pass to the engine via
-`MODEL_AUX` (see below).
-
-### Spreading the model across two disks
-
-If the model doesn't fit on one drive, put some shards on another and list the
-extra files in `MODEL_AUX` (semicolon-separated):
+Keep the context and cache modest on 16 GB (the dense part alone is ~5 GB):
 
 ```powershell
-$env:MODEL_AUX = "C:\picchio\expert_biases.safetensors;C:\picchio\model-00012.safetensors"
-$env:OMP_NUM_THREADS = "6"
-$env:PIN_GB = "1"
-.\picchio.exe C:\models\gptoss_i4
+$env:PYTHONUTF8 = "1"
+python chat.py --model D:\gptoss120b_i4 --no-reasoning --ctx 1024 --pin-gb 6 --max-tokens 200 --temperature 0.7
 ```
 
-`chat.py` and `server.py` auto-detect the bias sidecar and shard 12 in the current
-folder; `--model-aux` overrides this explicitly.
+The first turn is slow (it streams every expert from disk); later turns reuse the
+KV prefix and the learned hot-store, so they speed up.
+
+### If it doesn't fit on one drive
+
+You can spread the shards across two disks and pass the ones on the second disk
+with `--model-aux` (semicolon-separated). For example, if the last shard lives on C::
+
+```powershell
+python chat.py --model D:\gptoss120b_i4 --model-aux "C:\gptoss120b_extra\model-00014.safetensors" --no-reasoning --ctx 1024 --pin-gb 6
+```
+
+`--model-aux` also carries any other loose files a model may need.
+
+> **Legacy note (bias sidecar).** Containers converted with older code quantized
+> the expert biases by mistake and needed a separate F32 sidecar
+> (`python download_expert_biases.py` writes `expert_biases.safetensors`, passed
+> via `--model-aux`). A fresh conversion with the current `convert.py` includes
+> the biases in the shards, so you can ignore this.
 
 ---
 
