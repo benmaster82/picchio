@@ -100,6 +100,24 @@ brew install python             # if you don't already have Python 3
 
 From the project folder (`C:\picchio` or wherever you cloned it):
 
+### Prebuilt binary (no compiler needed)
+
+If you would rather not build from source, download the prebuilt Windows binary
+from the [Releases page](https://github.com/benmaster82/picchio/releases/latest):
+
+- Save it as **`picchio.exe`**. If the asset has a versioned name (e.g.
+  `picchio-v0.5.0-win64-avx2.exe`), rename it to `picchio.exe`, or pass
+  `--exe <name>` to `chat.py` / `server.py`. Every command below assumes the file
+  is called `picchio.exe`.
+- It is a **static build**: no MinGW DLLs, runs from anywhere.
+- Requires **Windows x64 with an AVX2/FMA CPU** (2013 or newer). The binary is
+  unsigned, so Windows SmartScreen may warn on first run ("More info" then "Run
+  anyway").
+- Verify the download against the **SHA256** published on the release.
+
+Then skip to [section 4](#4-download-and-convert-a-model) to get a model. To
+compile it yourself instead (any OS), continue below.
+
 ### Windows
 
 ```powershell
