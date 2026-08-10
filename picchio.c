@@ -1936,8 +1936,17 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
 static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
     int batch = 64;
     { const char *v = getenv("PREFILL_BATCH"); if (v) batch = atoi(v); }
+    /* The repetition penalty no longer forces the slow sequential path. Prefill
+     * only ENCODES a fixed prompt — it never samples — so the penalty is
+     * irrelevant to the encoding itself. The only real difference was that the
+     * sequential path recorded, in g_history, the token PREDICTED at each prompt
+     * position (an arbitrary basis for the penalty), whereas the batched path
+     * samples only once. We therefore keep the batched path even under rep
+     * penalty and instead seed g_history with the ACTUAL prompt tokens — the
+     * standard behavior (penalize repeating the context) and arguably more
+     * correct than recording per-position predictions. */
     int sequential = g_oracle_dir || g_trace_numeric || g_predict_probe
-                     || g_rep_penalty > 1.0f || batch <= 1 || n <= 1;
+                     || batch <= 1 || n <= 1;
 
     int last = ids[0];
     if (sequential) {
@@ -1947,6 +1956,16 @@ static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
         }
         return last;
     }
+
+    /* Seed the repetition-penalty history with the real prompt tokens so decode
+     * penalizes repeating the context (only relevant when REP>1; harmless
+     * otherwise). forward_prefill still appends the sampled next-token per block. */
+    if (g_rep_penalty > 1.0f) {
+        for (int i = 0; i < n; i++)
+            if (g_history_len < 4096 && ids[i] >= 0 && ids[i] < m->c.vocab)
+                g_history[g_history_len++] = ids[i];
+    }
+
     for (int off = 0; off < n; off += batch) {
         int len = n - off < batch ? n - off : batch;
         last = forward_prefill(m, ids + off, len, pos_base + off);
