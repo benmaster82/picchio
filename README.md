@@ -319,9 +319,10 @@ serving many users concurrently.
 ## 7. Running the big model (120B)
 
 The 120B converts to about 66 GB and runs on the same machine as the 20B, only
-much more slowly, because far more must be streamed from disk. On 16 GB RAM
-expect roughly 0.05 to 0.1 tokens/s: it is a "works, with patience" model, not a
-daily driver. For everyday use the 20B is the better choice.
+much more slowly, because far more must be streamed from disk. It is a "works,
+with patience" model, not a daily driver: expect well under 1 token/s (see
+[Measured performance](#measured-performance-a-deliberate-worst-case) below for
+real numbers on consumer hardware). For everyday use the 20B is the better choice.
 
 ### Before you start
 
@@ -373,6 +374,47 @@ python chat.py --model D:\gptoss120b_i4 --no-reasoning --ctx 1024 --pin-gb 6 --m
 
 The first turn is slow (it streams every expert from disk); later turns reuse the
 KV prefix and the learned hot-store, so they speed up.
+
+### Measured performance (a deliberate worst case)
+
+The numbers below are a **deliberate stress test**: the whole point of Picchio is
+to prove a 117B-parameter MoE model can run *at all* on a consumer laptop with
+limited RAM, streaming the experts from an **external SSD**. This is the hardest
+case on purpose, not a representative one. On an internal NVMe drive, or with more
+RAM devoted to the expert cache (`--pin-gb`), the rates are higher.
+
+Test configuration:
+
+| | |
+|---|---|
+| Model | GPT-OSS-120B, INT4 (gs64) experts, F32 attention (~66 GB) |
+| Storage | external SSD (shards split across two drives via `--model-aux`) |
+| Launch | `--no-reasoning --ctx 4096 --pin-gb 6 --threads 6 --temperature 0` |
+| Expert cache | 6 GB pinned (`--pin-gb 6`), 4 parallel I/O threads |
+
+Three-turn chat, generating 16 tokens per turn:
+
+| Turn | KV reused | Prefill | Time-to-first-token | Decode rate | Overall rate |
+|-----:|----------:|--------:|--------------------:|------------:|-------------:|
+| 1 (cold) | 0 / 86 | 86 tok | 218 s | 0.22 tok/s | **0.038 tok/s** |
+| 2 (warm) | 95 / 110 | 15 tok | 37 s | 0.24 tok/s | **0.16 tok/s** |
+| 3 (warm) | 126 / 147 | 21 tok | 54 s | 0.29 tok/s | **0.15 tok/s** |
+
+Two things to read from this:
+
+- **Steady-state decode is stable at ~0.25 tok/s** and is the real hardware
+  ceiling: every token routes to 4 of 128 experts per layer, streamed from the
+  SSD. This barely changes turn to turn.
+- **Perceived (overall) speed depends almost entirely on the prefill.** The first
+  turn must process the entire prompt from scratch (86 tokens, 218 s before the
+  first token), so its overall rate collapses to ~0.04 tok/s. From the second turn
+  on, Picchio reuses the KV-cache prefix (95/110, 126/147 positions reused), so
+  only the small delta is re-processed and the overall rate jumps about **4x, to
+  ~0.15 tok/s**. Short, continuous turns stay close to the decode ceiling; long new
+  prompts pay the prefill cost up front.
+
+In short: on this hardware the 120B is usable for careful, patient exchanges, not
+interactive chat. If you want responsiveness, run the 20B.
 
 ### If it doesn't fit on one drive
 
