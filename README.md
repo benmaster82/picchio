@@ -395,8 +395,18 @@ $env:PYTHONUTF8 = "1"
 python chat.py --model D:\gptoss120b_i4 --no-reasoning --ctx 1024 --pin-gb 6 --max-tokens 200 --temperature 0.7
 ```
 
+On startup Picchio reads the architecture from `config.json`, opens all 15
+shards, and loads only the ~5 GB dense part into RAM; the experts stay on disk
+and are streamed on demand:
+
+![Picchio loading the 120B: reading config, opening all 15 shards, dense weights loaded at 5.04 GB resident](assets/screenshot-120b-startup.png)
+
 The first turn is slow (it streams every expert from disk); later turns reuse the
-KV prefix and the learned hot-store, so they speed up.
+KV prefix and the learned hot-store, so they speed up. You can see this in a real
+three-turn session: the `reused` counter on each stats line climbs from `0/82` to
+`169/187` to `291/307` as the KV-cache prefix is carried over between turns.
+
+![Picchio 120B multi-turn chat: three questions about Mixture-of-Experts, each answer followed by a stats line showing tokens, seconds, tok/s and a growing reused KV count](assets/screenshot-120b-chat.png)
 
 ### Measured performance (a deliberate worst case)
 
