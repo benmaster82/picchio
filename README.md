@@ -173,6 +173,11 @@ python convert.py --model openai/gpt-oss-20b --output C:\models\gptoss20b_i4 --d
 This downloads several GB and writes a converted model of about **14 GB** to the
 output folder. It only needs to be done once.
 
+> **Reclaim space after converting.** The raw Hugging Face download is left in a
+> sibling folder named `<output>_raw` (e.g. `C:\models\gptoss20b_i4_raw`). Only the
+> `--output` folder is needed to run Picchio, so once the conversion finishes you
+> can delete `<output>_raw` to free that extra space.
+
 > **Hugging Face access:** the GPT-OSS models are openly licensed and normally
 > download without an account. If you ever get a `401`/gated error, run
 > `pip install huggingface_hub` and `huggingface-cli login` once with a free
@@ -229,7 +234,7 @@ between turns:
 python chat.py --model C:\models\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
 ```
 
-Type your message after `Tu:`. Type `/exit` or `/quit` to leave.
+Type your message after the `you ❯` prompt. Type `/exit` or `/quit` to leave.
 
 ### Useful chat options
 
