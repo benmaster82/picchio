@@ -2817,7 +2817,9 @@ static int service_loop(Model *m, int cap) {
     Cfg *c = &m->c;
     int pos = 0;
 
-    printf("READY %d %d %d %d\n", cap, c->vocab, c->stop_ids[0], c->stop_ids[1]);
+    printf("READY %d %d", cap, c->vocab);
+    for (int si = 0; si < c->n_stop; si++) printf(" %d", c->stop_ids[si]);
+    printf("\n");
     fflush(stdout);
 
     char cmd[32];
@@ -2900,8 +2902,17 @@ static int service_loop(Model *m, int cap) {
             int following = forward_token(m, tok, pos);
             pos++;
             m->n_emit++;
-            if (tok == c->stop_ids[0]) { reason = "RETURN"; break; }
-            if (tok == c->stop_ids[1]) { reason = "CALL"; break; }
+            int stopped = 0;
+            for (int si = 0; si < c->n_stop; si++) {
+                if (tok == c->stop_ids[si]) {
+                    /* GPT-OSS distinguishes the two Harmony terminators; other
+                     * families (Qwen) have a single generic EOS. */
+                    reason = (c->n_stop >= 2) ? (si == 0 ? "RETURN" : "CALL") : "EOS";
+                    stopped = 1;
+                    break;
+                }
+            }
+            if (stopped) break;
             tok = (following < 0 || following >= c->vocab) ? 0 : following;
         }
         printf("DONE %s %d %d\n", reason, produced, pos);
