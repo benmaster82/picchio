@@ -79,6 +79,14 @@ typedef struct {
     int has_shared;       /* 1 if there are shared experts */
     int n_shared;         /* number of shared experts */
     int has_attn_bias;    /* 1 if attention uses bias (yes in GPT-OSS) */
+    /* Architecture family flags (derived from model_type). GPT-OSS keeps the
+     * original behaviour; Qwen3-MoE flips these. Everything is config-gated so
+     * the GPT-OSS path stays byte-identical. */
+    int qk_norm;          /* 1: RMSNorm on Q/K per head before RoPE (Qwen3) */
+    int swiglu_clipped;   /* 1: GPT-OSS clipped SwiGLU; 0: plain SiLU (Qwen3) */
+    int router_norm;      /* 0: softmax over top-k logits (GPT-OSS);
+                             1: softmax over all experts, renormalize top-k (Qwen3) */
+    int use_sinks;        /* 1: attention sinks are mandatory (GPT-OSS) */
     int8_t layer_type[128]; /* per layer: 0=sliding_attention, 1=full_attention */
 } Cfg;
 
@@ -102,6 +110,8 @@ typedef struct {
     float *bv;            /* [n_kv_heads * head_dim] */
     float *bo;            /* [D] */
     float *sinks;         /* [n_heads] attention sink logits */
+    float *q_norm;        /* [head_dim] QK-Norm weight for Q (Qwen3); NULL otherwise */
+    float *k_norm;        /* [head_dim] QK-Norm weight for K (Qwen3); NULL otherwise */
 
     int layer_type;       /* 0=sliding_attention, 1=full_attention */
 
@@ -358,14 +368,35 @@ static int cfg_load(Cfg *c, const char *model_path) {
 
     memset(c, 0, sizeof(*c));
 
+    /* ── Architecture family ────────────────────────────────────────────
+     * GPT-OSS is the default; Qwen3-MoE differs in a handful of numeric
+     * details (QK-Norm, plain SiLU, router normalization, no sinks, no
+     * sliding window). Detect it from model_type and flip the flags. */
+    char arch[64];
+    json_str(json, "model_type", arch, sizeof(arch), "gpt_oss");
+    int is_qwen = (strstr(arch, "qwen") != NULL) || (strstr(arch, "Qwen") != NULL);
+    c->qk_norm        = is_qwen ? 1 : 0;
+    c->swiglu_clipped = is_qwen ? 0 : 1;
+    c->router_norm    = is_qwen ? 1 : 0;
+    c->use_sinks      = is_qwen ? 0 : 1;
+
     c->hidden       = json_int(json, "hidden_size", 2880);
     c->n_layers     = json_int(json, "num_hidden_layers", 36);
     c->n_heads      = json_int(json, "num_attention_heads", 64);
     c->n_kv_heads   = json_int(json, "num_key_value_heads", 8);
     c->head_dim     = json_int(json, "head_dim", 64);
-    c->n_experts    = json_int(json, "num_local_experts", 128);
+    c->n_experts    = json_int(json, "num_local_experts",
+                               json_int(json, "num_experts", 128));
     c->topk         = json_int(json, "num_experts_per_tok", 4);
-    c->moe_inter    = json_int(json, "intermediate_size", 2880) * 2; /* gate+up fused */
+    /* Expert intermediate dim (gate+up fused, so ×2). Qwen3 sizes its experts
+     * with moe_intermediate_size; GPT-OSS reuses intermediate_size. */
+    if (is_qwen) {
+        int moe_i = json_int(json, "moe_intermediate_size",
+                             json_int(json, "intermediate_size", 768));
+        c->moe_inter = moe_i * 2;
+    } else {
+        c->moe_inter = json_int(json, "intermediate_size", 2880) * 2; /* gate+up fused */
+    }
     c->dense_inter  = json_int(json, "intermediate_size", 2880);
     c->vocab        = json_int(json, "vocab_size", 201088);
     c->ctx_len      = json_int(json, "max_position_embeddings", 131072);
@@ -401,16 +432,25 @@ static int cfg_load(Cfg *c, const char *model_path) {
             for (int i = n_types; i < c->n_layers; i++)
                 c->layer_type[i] = c->layer_type[i % n_types];
         }
+    } else if (is_qwen) {
+        /* Qwen3-MoE: every layer is full attention (no sliding window). */
+        for (int i = 0; i < c->n_layers; i++) c->layer_type[i] = 1;
     } else {
-        /* Default: alternate sliding/full */
+        /* GPT-OSS default: alternate sliding/full */
         for (int i = 0; i < c->n_layers; i++)
             c->layer_type[i] = (int8_t)(i % 2);
     }
 
-    /* Stop tokens: <|return|>=200002, <|call|>=200012 */
-    c->stop_ids[0] = 200002;  /* <|return|> */
-    c->stop_ids[1] = 200012;  /* <|call|> */
-    c->n_stop = 2;
+    /* Stop tokens. GPT-OSS uses the Harmony terminators; Qwen3 uses the ChatML
+     * end-of-turn id from config (eos_token_id, typically 151645 <|im_end|>). */
+    if (is_qwen) {
+        c->stop_ids[0] = json_int(json, "eos_token_id", 151645);
+        c->n_stop = 1;
+    } else {
+        c->stop_ids[0] = 200002;  /* <|return|> */
+        c->stop_ids[1] = 200012;  /* <|call|> */
+        c->n_stop = 2;
+    }
 
     free(json);
 
@@ -497,6 +537,18 @@ static void kv_store(KVCache *kv, int layer, int pos,
     memcpy(kv->V[layer] + (int64_t)pos * kv_dim, v, kv_dim * sizeof(float));
 }
 
+/* Per-head RMSNorm over head_dim, applied in place to a [nheads * hd] buffer.
+ * Used for Qwen3's QK-Norm (weight has length head_dim, shared across heads). */
+static void rmsnorm_heads(float *x, const float *w, int nheads, int hd, float eps) {
+    for (int h = 0; h < nheads; h++) {
+        float *v = x + (int64_t)h * hd;
+        float ss = 0.0f;
+        for (int i = 0; i < hd; i++) ss += v[i] * v[i];
+        float inv = 1.0f / sqrtf(ss / (float)hd + eps);
+        for (int i = 0; i < hd; i++) v[i] = v[i] * inv * w[i];
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════
  *  GQA ATTENTION (decode, single token)
  * ═══════════════════════════════════════════════════════════ */
@@ -536,6 +588,12 @@ static void gqa_attention(float *out, const float *x, Layer *l,
         snprintf(n, sizeof(n), "layer%d.q_bias", layer); oracle_dump(n, q, 3, sq);
         snprintf(n, sizeof(n), "layer%d.k_bias", layer); oracle_dump(n, k, 3, sk);
         snprintf(n, sizeof(n), "layer%d.v_bias", layer); oracle_dump(n, v, 3, sk);
+    }
+
+    /* QK-Norm (Qwen3): RMSNorm over head_dim on every Q and K head, before RoPE. */
+    if (c->qk_norm && l->q_norm && l->k_norm) {
+        rmsnorm_heads(q, l->q_norm, H, hd, c->eps);
+        rmsnorm_heads(k, l->k_norm, KVH, hd, c->eps);
     }
 
     /* RoPE / YaRN */
@@ -1306,6 +1364,24 @@ static void predict_topk_into(Model *m, int nl, const float *x,
     }
 }
 
+/* Turn the selected top-k router logits into mixture weights.
+ *   scores[]  : full router logits over E (may be overwritten in the Qwen path).
+ *   sel[]     : chosen expert ids (top-k).
+ *   weights[] : in/out. For GPT-OSS it already holds the top-k raw logits.
+ * GPT-OSS: softmax over the top-k logits. Qwen3: softmax over ALL experts, then
+ * renormalize the selected top-k probabilities to sum to 1 (norm_topk_prob). */
+static void router_weights(const Cfg *c, float *scores, const int *sel,
+                           float *weights, int K, int E) {
+    if (c->router_norm) {
+        softmax(scores, E);
+        float s = 0.0f;
+        for (int k = 0; k < K; k++) { weights[k] = scores[sel[k]]; s += weights[k]; }
+        if (s > 0.0f) for (int k = 0; k < K; k++) weights[k] /= s;
+    } else {
+        softmax(weights, K);
+    }
+}
+
 static void moe_forward(float *out, const float *x, Model *m,
                         int layer, const Cfg *c) {
     int D = c->hidden;
@@ -1351,8 +1427,8 @@ static void moe_forward(float *out, const float *x, Model *m,
         m->pred_total += K;
     }
 
-    /* 3. Normalize weights (softmax over the top-k) */
-    softmax(weights, K);
+    /* 3. Normalize weights (GPT-OSS: over top-k; Qwen3: over all, renorm top-k) */
+    router_weights(c, scores, sel, weights, K, E);
     if (g_trace_numeric) {
         fprintf(stderr, "  numeric route L=%d:", layer);
         for (int k = 0; k < K; k++)
@@ -1410,17 +1486,25 @@ static void moe_forward(float *out, const float *x, Model *m,
             int64_t sh[2] = {1, I}; oracle_dump(n, gu, 2, sh);
         }
 
-        /* Clipped SwiGLU GPT-OSS:
-         * gate=min(gate,limit), up=clamp(up,+/-limit),
-         * (up+1)*gate*sigmoid(alpha*gate). */
+        /* Activation over the interleaved (gate, up) pairs.
+         * GPT-OSS: clipped SwiGLU  (up+1)*gate*sigmoid(alpha*gate) with clamp.
+         * Qwen3:   plain SiLU gate * up = gate*sigmoid(gate) * up. */
         int half = I / 2;
-        for (int i = 0; i < half; i++) {
-            float gate = gu[2 * i];
-            float up = gu[2 * i + 1];
-            if (gate > c->swiglu_limit) gate = c->swiglu_limit;
-            if (up > c->swiglu_limit) up = c->swiglu_limit;
-            if (up < -c->swiglu_limit) up = -c->swiglu_limit;
-            gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+        if (c->swiglu_clipped) {
+            for (int i = 0; i < half; i++) {
+                float gate = gu[2 * i];
+                float up = gu[2 * i + 1];
+                if (gate > c->swiglu_limit) gate = c->swiglu_limit;
+                if (up > c->swiglu_limit) up = c->swiglu_limit;
+                if (up < -c->swiglu_limit) up = -c->swiglu_limit;
+                gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+            }
+        } else {
+            for (int i = 0; i < half; i++) {
+                float gate = gu[2 * i];
+                float up = gu[2 * i + 1];
+                gu[i] = gate * sigmoidf(gate) * up;
+            }
         }
         if (g_oracle_dir) {
             char n[128]; snprintf(n, sizeof(n), "layer%d.expert%d.activated", layer, k);
@@ -1775,12 +1859,19 @@ static void expert_apply(ESlot *es, const float *x, float *dst, float w,
     matmul_qt(gu, x, &es->gu, 1);
     if (es->gu_bias) for (int i = 0; i < I; i++) gu[i] += es->gu_bias[i];
 
-    for (int i = 0; i < half; i++) {
-        float gate = gu[2 * i], up = gu[2 * i + 1];
-        if (gate > c->swiglu_limit) gate = c->swiglu_limit;
-        if (up > c->swiglu_limit) up = c->swiglu_limit;
-        if (up < -c->swiglu_limit) up = -c->swiglu_limit;
-        gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+    if (c->swiglu_clipped) {
+        for (int i = 0; i < half; i++) {
+            float gate = gu[2 * i], up = gu[2 * i + 1];
+            if (gate > c->swiglu_limit) gate = c->swiglu_limit;
+            if (up > c->swiglu_limit) up = c->swiglu_limit;
+            if (up < -c->swiglu_limit) up = -c->swiglu_limit;
+            gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+        }
+    } else {
+        for (int i = 0; i < half; i++) {
+            float gate = gu[2 * i], up = gu[2 * i + 1];
+            gu[i] = gate * sigmoidf(gate) * up;
+        }
     }
 
     matmul_qt(eo, gu, &es->d, 1);
@@ -1851,7 +1942,7 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
                 }
                 sel[k] = best; wgt[k] = best_s;
             }
-            softmax(wgt, K);
+            router_weights(c, scores, sel, wgt, K, E);
             for (int k = 0; k < K; k++) {
                 if (m->eusage[l]) m->eusage[l][sel[k]]++;
                 if (m->eheat[l]) m->eheat[l][sel[k]]++;
@@ -2136,6 +2227,13 @@ static int self_test(void) {
     c->routed_scale = 1.0f;
     c->has_shared = 0;
     c->has_attn_bias = 1;
+    /* GPT-OSS architecture flags (this synthetic model mirrors GPT-OSS). */
+    c->swiglu_limit = 7.0f;
+    c->swiglu_alpha = 1.702f;
+    c->swiglu_clipped = 1;
+    c->use_sinks = 1;
+    c->router_norm = 0;
+    c->qk_norm = 0;
     c->layer_type[0] = 0;  /* sliding */
     c->layer_type[1] = 1;  /* full */
 
@@ -2617,20 +2715,38 @@ static int load_dense_weights(Model *m, StDB *db) {
             loaded += (H*hd + KVH*hd + KVH*hd + D) * 4;
         }
 
-        /* Attention sink logits (one per query head) */
+        /* QK-Norm weights (Qwen3): one [head_dim] vector shared across heads. */
+        if (c->qk_norm) {
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
+            ly->q_norm = load_f32_tensor(db, name, hd);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
+            ly->k_norm = load_f32_tensor(db, name, hd);
+            if (!ly->q_norm || !ly->k_norm) {
+                fprintf(stderr, "  error: QK-Norm weights missing at layer %d\n", l);
+                return -1;
+            }
+            loaded += 2 * hd * 4;
+        }
+
+        /* Attention sink logits (one per query head). Mandatory for GPT-OSS,
+         * absent in Qwen3 (the attention code guards on a NULL sinks pointer). */
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.sinks", l);
         ly->sinks = load_f32_tensor(db, name, H);
-        if (!ly->sinks) {
+        if (!ly->sinks && c->use_sinks) {
             fprintf(stderr, "  error: attention sinks missing at layer %d\n", l);
             return -1;
         }
-        loaded += H * 4;
+        if (ly->sinks) loaded += H * 4;
 
         /* Router weights + bias */
         snprintf(name, sizeof(name), "model.layers.%d.mlp.router.weight", l);
         ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
         if (!ly->router) {
-            /* Try an alternative name */
+            /* Qwen3-MoE names it mlp.gate.weight; Mixtral block_sparse_moe.gate. */
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", l);
+            ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
+        }
+        if (!ly->router) {
             snprintf(name, sizeof(name), "model.layers.%d.block_sparse_moe.gate.weight", l);
             ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
         }

@@ -26,6 +26,7 @@ Requirements:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -214,9 +215,9 @@ def dequant_mxfp4_fast(blocks: np.ndarray, scales: np.ndarray,
 # ── Main conversion ──
 
 def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
-                  stats: dict, dense_bits: int = 4):
+                  stats: dict, dense_bits: int = 4, is_qwen: bool = False):
     """Convert a single safetensors shard."""
-    
+
     D = cfg["hidden_size"]
     I = cfg["intermediate_size"]
     moe_inter = I * 2  # gate_up fused
@@ -281,6 +282,13 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                         # do not quantize them and do not produce .qs.
                         output_tensors[key] = tensor_np.astype(np.float32)
                         stats["bias"] += tensor_np.size * 4
+                    elif is_qwen and any(p in key for p in
+                                         ("gate_proj", "up_proj", "down_proj")):
+                        # Qwen3 experts arrive as three separate BF16 matrices per
+                        # expert. Keep them raw (F32) here; the post-pass fuses
+                        # gate+up interleaved and quantizes to INT4 (it needs gate
+                        # and up together, possibly across a shard boundary).
+                        output_tensors[key] = tensor_np.astype(np.float32)
                     elif "blocks" in key:
                         # MXFP4 blocks — dequantized with the associated scales
                         # Save temporarily, we will process it later with the scales
@@ -332,8 +340,43 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
         sys.exit(1)
 
 
+_QWEN_EXPERT_RE = re.compile(
+    r"^(model\.layers\.\d+\.mlp\.experts\.\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def interleave_qwen_experts(output_tensors: dict, pending: dict, stats: dict):
+    """Fuse Qwen3 per-expert gate/up into the interleaved gate_up_proj layout that
+    Picchio's runtime expects (gu[2i]=gate_i, gu[2i+1]=up_i), quantize gate_up and
+    down to group-scaled INT4, and emit them under the runtime's tensor names.
+
+    Raw gate/up/down halves are buffered in `pending` (keyed by the expert prefix)
+    so an expert split across two shards is still completed. A finished expert is
+    written into whichever shard's output_tensors is current when its last half
+    arrives; the multi-shard reader finds it regardless of placement."""
+    for k in [k for k in list(output_tensors.keys()) if _QWEN_EXPERT_RE.match(k)]:
+        m = _QWEN_EXPERT_RE.match(k)
+        base, proj = m.group(1), m.group(2)
+        pending.setdefault(base, {})[proj] = output_tensors.pop(k)
+
+    for base in [b for b, p in pending.items()
+                 if {"gate_proj", "up_proj", "down_proj"} <= set(p)]:
+        parts = pending.pop(base)
+        gate, up, down = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
+        moe_i, Dg = gate.shape
+        fused = np.empty((2 * moe_i, Dg), dtype=np.float32)
+        fused[0::2] = gate   # even rows → gate
+        fused[1::2] = up     # odd rows  → up
+        gp, gs = quantize_int4(fused)
+        output_tensors[base + ".gate_up_proj"] = gp
+        output_tensors[base + ".gate_up_proj.qs"] = gs
+        dp, ds = quantize_int4(down.reshape(-1, down.shape[-1]))
+        output_tensors[base + ".down_proj"] = dp
+        output_tensors[base + ".down_proj.qs"] = ds
+        stats["expert_i4"] += gp.nbytes + gs.nbytes + dp.nbytes + ds.nbytes
+
+
 def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
-    """Convert the GPT-OSS-120B model."""
+    """Convert a GPT-OSS (MXFP4) or Qwen3-MoE (BF16) model to Picchio INT4."""
 
     model_path = Path(model_path)
     output_path = Path(output_path)
@@ -352,11 +395,18 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
     with open(model_path / "config.json") as f:
         cfg = json.load(f)
 
-    print(f"\n  Model: GPT-OSS-120B")
+    model_type = str(cfg.get("model_type", "gpt_oss"))
+    is_qwen = "qwen" in model_type.lower()
+    # Experts-per-layer key differs across families.
+    n_exp = cfg.get("num_local_experts", cfg.get("num_experts", "?"))
+
+    print(f"\n  Model type: {model_type}" + (" (Qwen3-MoE)" if is_qwen else ""))
     print(f"  D={cfg['hidden_size']} L={cfg['num_hidden_layers']} "
-          f"E={cfg['num_local_experts']} top{cfg['num_experts_per_tok']}")
-    print(f"  Input format: MXFP4 (experts) + BF16 (dense)")
-    print(f"  Output format: per-row symmetric INT4")
+          f"E={n_exp} top{cfg['num_experts_per_tok']}")
+    print(f"  Input format: " +
+          ("BF16 (separate gate/up/down experts)" if is_qwen
+           else "MXFP4 (experts) + BF16 (dense)"))
+    print(f"  Output format: per-row/group symmetric INT4")
 
     # Find all safetensors files
     shard_files = sorted(model_path.glob("*.safetensors"))
@@ -380,13 +430,18 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
     
     total_output_bytes = 0
     t_start = time.time()
-    
+    qwen_pending = {}  # cross-shard buffer for half-seen Qwen3 experts
+
     for si, shard_path in enumerate(shard_files):
         print(f"\n  [{si+1}/{len(shard_files)}] {shard_path.name}...")
         t0 = time.time()
-        
+
         output_tensors = {}
-        convert_shard(str(shard_path), output_tensors, cfg, stats, dense_bits)
+        convert_shard(str(shard_path), output_tensors, cfg, stats, dense_bits, is_qwen)
+
+        # ── Qwen3: fuse gate+up and quantize experts to INT4 ──
+        if is_qwen:
+            interleave_qwen_experts(output_tensors, qwen_pending, stats)
         
         # ── Post-processing: dequantize MXFP4 blocks+scales → INT4 ──
         blocks_keys = [k for k in list(output_tensors.keys()) if k.endswith("_blocks")]
@@ -473,6 +528,12 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
         print(f"    → {out_name} ({shard_bytes/1e9:.2f} GB, "
               f"{len(output_tensors)} tensors, {elapsed:.1f}s)")
 
+    if is_qwen and qwen_pending:
+        print(f"\n  ✗ {len(qwen_pending)} Qwen3 experts were never completed "
+              f"(missing gate/up/down halves): {list(qwen_pending)[:3]} ...")
+        print(f"    The converted model would be incomplete. Aborting.")
+        sys.exit(1)
+
     total_elapsed = time.time() - t_start
 
     # Summary
@@ -529,10 +590,10 @@ def download_and_convert(repo_id: str, output_path: str, dense_bits: int = 4):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert GPT-OSS-120B from MXFP4/BF16 to INT4 for Picchio"
+        description="Convert GPT-OSS (MXFP4/BF16) or Qwen3-MoE (BF16) to INT4 for Picchio"
     )
     parser.add_argument("--model", required=True,
-                        help="Local path to the model or HuggingFace repo (e.g. openai/gpt-oss-120b)")
+                        help="Local path or HuggingFace repo (e.g. openai/gpt-oss-20b, Qwen/Qwen3-30B-A3B)")
     parser.add_argument("--output", required=True,
                         help="Output directory for the converted model")
     parser.add_argument("--dense-bits", type=int, default=4, choices=[4, 8],
@@ -542,7 +603,7 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"🪶 picchio convert — GPT-OSS-120B → INT4\n")
+    print(f"🪶 picchio convert — GPT-OSS / Qwen3-MoE → INT4\n")
     
     if args.download or "/" in args.model and not Path(args.model).exists():
         download_and_convert(args.model, args.output, args.dense_bits)
