@@ -16,7 +16,9 @@ Config via environment (defaults target D: without touching the 120B):
 """
 import json
 import os
+import pickle
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -28,6 +30,8 @@ OUTPUT = os.environ.get("PICCHIO_OUTPUT", "D:/qwen3_30b_i4")
 RAW_DIR = os.environ.get("PICCHIO_RAW", "D:/qwen_tmp")
 
 # Keep every byte of HF's cache on D: — C: has almost no free space.
+# Xet is the working fast path here (~5 MB/s); it occasionally drops a connection,
+# which the per-shard download retry below absorbs (Xet resumes by content chunks).
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ["HF_HOME"] = str(Path(RAW_DIR) / "hf_home")
 os.makedirs(OUTPUT, exist_ok=True)
@@ -47,6 +51,68 @@ def _reclaim(raw_path):
     except OSError:
         pass
     shutil.rmtree(Path(RAW_DIR) / ".cache", ignore_errors=True)
+
+
+# Two download backends. Xet is fast (~5 MB/s) but its CDN can fail/hang for a
+# whole session; the classic single-connection path is slow (~0.7 MB/s) but
+# reliable. We probe Xet first and fall back to classic per shard, re-probing Xet
+# on each new shard so the moment it recovers the rest go fast.
+_MODES = {
+    "xet":     {"HF_HUB_DISABLE_XET": "0", "HF_HUB_ENABLE_HF_TRANSFER": "1"},
+    "classic": {"HF_HUB_DISABLE_XET": "1", "HF_HUB_ENABLE_HF_TRANSFER": "0"},
+}
+
+
+def _dl(repo, fname, local_dir, stall=90, attempts=80):
+    """Adaptive-hybrid download with a stall-watchdog. Each attempt runs in a
+    subprocess (so a hung backend can be killed) while we watch the bytes grow.
+    A backend that isn't moving is swapped for the other; a backend that is
+    progressing (or merely dropped mid-stream) is retried in place."""
+    target = Path(local_dir) / fname
+    dlcache = Path(local_dir) / ".cache" / "huggingface" / "download"
+
+    def prog():
+        n = target.stat().st_size if target.exists() else 0
+        if dlcache.exists():
+            n += sum(f.stat().st_size for f in dlcache.glob("*.incomplete"))
+        return n
+
+    code = ("from huggingface_hub import hf_hub_download;"
+            f"hf_hub_download({repo!r},{fname!r},local_dir={local_dir!r})")
+    mode = "xet"                       # probe the fast path first
+    for attempt in range(1, attempts + 1):
+        if target.exists() and target.stat().st_size > 1e8:
+            return str(target)
+        env = os.environ.copy()
+        env.update(_MODES[mode])
+        start = prog()
+        proc = subprocess.Popen([sys.executable, "-c", code], env=env)
+        last, last_t = start, time.time()
+        while proc.poll() is None:
+            time.sleep(10)
+            cur = prog()
+            if cur > last:
+                last, last_t = cur, time.time()
+            elif time.time() - last_t > stall:
+                print(f"    [{mode}] stall at {cur/1e6:.0f} MB, restart", flush=True)
+                proc.kill()
+                break
+        proc.wait()
+        gained = prog() - start
+        if proc.returncode == 0 and target.exists():
+            print(f"    [{mode}] done", flush=True)
+            return str(target)
+        if gained < 5_000_000:          # this backend isn't moving → switch
+            nxt = "classic" if mode == "xet" else "xet"
+            print(f"    [{mode}] rc={proc.returncode} +{gained/1e6:.0f}MB "
+                  f"→ switch to {nxt}", flush=True)
+            mode = nxt
+            shutil.rmtree(dlcache, ignore_errors=True)  # formats differ; start clean
+        else:                           # progressing/dropped → resume same backend
+            print(f"    [{mode}] rc={proc.returncode} +{gained/1e6:.0f}MB "
+                  f"→ resume {mode}", flush=True)
+        time.sleep(5)
+    raise RuntimeError(f"download failed after {attempts} attempts: {fname}")
 
 
 def main():
@@ -73,7 +139,7 @@ def main():
           f"top{cfg['num_experts_per_tok']} moe_i={cfg.get('moe_intermediate_size')}")
 
     # ── shard list from the safetensors index ──
-    idx_path = hf_hub_download(REPO, "model.safetensors.index.json", local_dir=OUTPUT)
+    idx_path = _dl(REPO, "model.safetensors.index.json", OUTPUT)
     weight_map = json.load(open(idx_path))["weight_map"]
     shard_names = sorted(set(weight_map.values()))
     print(f"  {len(shard_names)} shards\n")
@@ -81,23 +147,28 @@ def main():
     stats = {"total_tensors": 0, "norms": 0, "bias": 0, "router": 0,
              "dense_i4": 0, "expert_i4": 0, "expert_blocks": 0,
              "expert_scales": 0, "other": 0}
-    pending = {}          # cross-shard buffer for half-seen experts (kept in RAM)
+    # Cross-shard buffer for half-seen experts, persisted so a resume after a
+    # crash restores the exact split-expert state (11 experts span a boundary).
+    pending_pkl = Path(OUTPUT) / ".pending.pkl"
+    pending = {}
+    if pending_pkl.exists():
+        with open(pending_pkl, "rb") as fh:
+            pending = pickle.load(fh)
+        print(f"  restored {len(pending)} pending expert halves from a previous run")
     t_total = time.time()
 
     for si, shard_name in enumerate(shard_names):
         out_path = Path(OUTPUT) / f"model-{si:05d}.safetensors"
-        # Resume: skip only if this shard left no expert half pending last time.
-        # (A completed run has empty `pending` at every boundary; the 11 split
-        # experts all resolve within the run.) If a skip ever strands a half,
-        # the final check below reports it and asks for a clean rerun.
-        if out_path.exists() and out_path.stat().st_size > 1e8 and not pending:
+        # Skip already-converted shards; restored `pending` carries the split
+        # halves, so skipping a done shard stays correct.
+        if out_path.exists() and out_path.stat().st_size > 1e8:
             print(f"  [{si+1}/{len(shard_names)}] {shard_name} — already converted, skip")
             continue
 
         print(f"  [{si+1}/{len(shard_names)}] {shard_name}")
         t0 = time.time()
         print("    downloading...", end="", flush=True)
-        raw_path = hf_hub_download(REPO, shard_name, local_dir=RAW_DIR)
+        raw_path = _dl(REPO, shard_name, RAW_DIR)
         raw_gb = Path(raw_path).stat().st_size / 1e9
         print(f" {raw_gb:.1f} GB in {time.time()-t0:.0f}s")
 
@@ -115,6 +186,8 @@ def main():
               f"pending={len(pending)}, {time.time()-t0:.0f}s")
 
         _reclaim(raw_path)
+        with open(pending_pkl, "wb") as fh:   # persist split-expert state
+            pickle.dump(pending, fh)
         del output_tensors
 
     if pending:
@@ -123,6 +196,7 @@ def main():
         print("    shard(s) and rerun to reprocess without skipping.")
         sys.exit(1)
 
+    pending_pkl.unlink(missing_ok=True)
     shutil.rmtree(RAW_DIR, ignore_errors=True)
     files = sorted(Path(OUTPUT).glob("model-*.safetensors"))
     total = sum(f.stat().st_size for f in files)
