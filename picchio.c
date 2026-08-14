@@ -3153,16 +3153,22 @@ int main(int argc, char **argv) {
     /* Load the hot-store from a previous session */
     hotstore_load(&m);
 
-    /* ── 4. Load the tokenizer ── */
+    /* ── 4. Load the tokenizer ──
+     * Only the bare-metal text path uses the built-in tokenizer. In SERVICE mode
+     * the Python bridge owns tokenization and exchanges raw token IDs, so skip it
+     * entirely (and don't print a misleading "not found" warning). */
     Tokenizer tok;
     int has_tokenizer = 0;
     {
-        char tok_path[512];
-        snprintf(tok_path, sizeof(tok_path), "%s/tokenizer.json", model_path);
-        if (tok_load(&tok, tok_path) == 0) {
-            has_tokenizer = 1;
-        } else {
-            fprintf(stderr, "  ⚠ tokenizer.json not found — raw token ID mode\n");
+        const char *svc = getenv("SERVICE");
+        if (!(svc && atoi(svc))) {
+            char tok_path[512];
+            snprintf(tok_path, sizeof(tok_path), "%s/tokenizer.json", model_path);
+            if (tok_load(&tok, tok_path) == 0) {
+                has_tokenizer = 1;
+            } else {
+                fprintf(stderr, "  ⚠ tokenizer.json not found — raw token ID mode\n");
+            }
         }
     }
 
