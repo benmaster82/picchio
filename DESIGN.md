@@ -517,6 +517,58 @@ small ecap → many blocks) this pipeline is the primary candidate to bring down
 The other lever that gets around the bandwidth wall on any disk remains **reducing
 the bytes read** (cold experts in a more compressed format).
 
+### 0.14 A second model family: Qwen3-MoE
+
+The engine was extended to run Qwen3-MoE checkpoints (validated on
+`Qwen3-30B-A3B-Instruct-2507`) without disturbing the GPT-OSS path. Every
+architectural difference is read from `config.json` and gated on `model_type`, so
+the GPT-OSS behavior is byte-for-byte unchanged and the tiny self-test still
+passes. Full detail is in `PORTING_QWEN3.md`; the essentials:
+
+**Numeric deltas (runtime).** Qwen3 adds QK-Norm, an RMSNorm over `head_dim`
+applied to each Q and K head before RoPE, which GPT-OSS does not have. Its experts
+use a plain SwiGLU (`silu(gate) * up`) rather than the clipped GPT-OSS variant.
+Its router normalizes with `norm_topk_prob`: softmax over all experts, then the
+selected top-k renormalized to sum to one, versus GPT-OSS's softmax over the raw
+top-k logits. The `router_weights` helper implements both and is shared by decode
+and batched prefill. Qwen3 also has no attention sinks, no sliding window (every
+layer is full attention), no attention bias, and QK-Norm weights per layer; the
+loader probes the family-specific tensor names (`mlp.gate.weight` for the router)
+quietly and only errors if a mandatory weight is truly absent. The stop token is
+the ChatML end-of-turn id from `eos_token_id` rather than the Harmony
+terminators, and the service protocol now emits and checks `n_stop` stop ids
+instead of a hardcoded two (a bug where a Qwen `stop_ids[1]` left at 0 from the
+memset would end generation on any token 0).
+
+**Conversion.** GPT-OSS ships fused MXFP4 `gate_up_proj` experts; Qwen3 ships
+three separate BF16 matrices per expert. The converter keeps the Qwen gate/up/down
+raw, then fuses gate and up into the interleaved layout the runtime expects
+(`gu[2i]` is gate, `gu[2i+1]` is up) and quantizes gate_up and down to
+group-scaled INT4. Because Hugging Face may split an expert across a shard
+boundary (11 of 6144 experts in the 30B), a persistent cross-shard buffer carries
+half-seen experts between shards, and its state is checkpointed so a resumed run
+stays correct.
+
+**Streaming download.** `convert_streaming_qwen.py` converts one shard at a time
+(only the ~20 GB INT4 output ever stays on disk, never the 61 GB of raw BF16). The
+downloader is adaptive: it probes Hugging Face's fast Xet backend and falls back
+to a plain, reliable download per shard when Xet stalls or errors, re-probing Xet
+on each new shard. A stall watchdog runs each attempt in a subprocess and restarts
+it if the bytes stop growing, since a hung backend raises no exception.
+
+**Validation status.** End-to-end runtime and forward pass are confirmed on the
+real 30B: the container loads with no missing tensor, experts stream from the INT4
+shards, and the model produces coherent multilingual output with a natural EOS
+stop. The L1/L2 oracle suites (token-exact QK-Norm, router normalization, and
+plain SwiGLU against Transformers) described in Section 0.2 remain the next step to
+certify numeric exactness beyond the qualitative check.
+
+**Scaling note (unchanged).** Dimensions come from `config.json`, so the same code
+runs the two GPT-OSS sizes and the Qwen3 sizes. The closest non-GPT-OSS families
+are those that keep GQA (Qwen3, Mixtral, Phi-MoE); models built on MLA (DeepSeek,
+Kimi, recent GLM) would need the attention block rewritten and are out of scope
+here.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture

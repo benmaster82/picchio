@@ -19,6 +19,12 @@ without a datacenter GPU.
 Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
 GPT-OSS architecture.
 
+**It also runs Qwen3-MoE models** (for example `Qwen3-30B-A3B`). The engine reads
+the architecture from `config.json`, and a handful of config-gated differences
+(QK-Norm, plain SwiGLU, softmax-normalized top-k routing, no attention sinks) let
+the same streaming core serve a second model family with no change to the GPT-OSS
+path. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model).
+
 > **New to this?** Read the sections in order. Every command below is complete:
 > nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
 > equivalents are given where they differ.
@@ -38,7 +44,8 @@ GPT-OSS architecture.
 9. [Troubleshooting](#9-troubleshooting)
 10. [Verifying correctness (optional)](#10-verifying-correctness-optional)
 11. [How it works & project layout](#11-how-it-works--project-layout)
-12. [License](#12-license)
+12. [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
+13. [License](#13-license)
 
 ---
 
@@ -554,21 +561,24 @@ LRU cache keeps recently-used experts around and a learned hot-store keeps the
 most frequently used ones pinned. Because only a few experts are touched per
 token, total disk traffic is a fraction of the model size.
 
-### Architecture (GPT-OSS)
+### Architecture
 
-| Property | 20B | 120B |
-|---|---|---|
-| Total parameters | 21 B | 117 B |
-| Active per token | ~3.6 B | ~5.1 B |
-| Hidden size | 2880 | 2880 |
-| Layers (all MoE) | 24 | 36 |
-| Experts / layer | 32 | 128 |
-| Active experts / token | 4 (top-4) | 4 (top-4) |
-| Attention | GQA (64 Q / 8 KV heads), sliding-window + full, attention sinks, YaRN | same |
-| Converted size | ~14 GB | ~66 GB |
+| Property | GPT-OSS 20B | GPT-OSS 120B | Qwen3 30B-A3B |
+|---|---|---|---|
+| Total parameters | 21 B | 117 B | 30.5 B |
+| Active per token | ~3.6 B | ~5.1 B | ~3.3 B |
+| Hidden size | 2880 | 2880 | 2048 |
+| Layers (all MoE) | 24 | 36 | 48 |
+| Experts / layer | 32 | 128 | 128 |
+| Active experts / token | 4 (top-4) | 4 (top-4) | 8 (top-8) |
+| Attention | GQA, sliding-window + full, attention sinks, YaRN | same | GQA + QK-Norm, full only |
+| Activation | clipped SwiGLU | clipped SwiGLU | plain SwiGLU (SiLU) |
+| Converted size | ~14 GB | ~66 GB | ~20 GB |
 
-Quantization: experts are INT4 (group-scaled, 64), the embedding and output head
-are INT8, attention is F32.
+Quantization (both families): experts are INT4 (group-scaled, 64), the embedding
+and output head are INT8, attention is F32. The engine reads every dimension from
+`config.json` and flips the family-specific behaviors from the model's
+`model_type`, so the GPT-OSS path is byte-for-byte unchanged.
 
 ### Files in this repository
 
@@ -580,12 +590,15 @@ json.h                 config.json parser
 tok.h                  Built-in approximate tokenizer (fallback for bare-metal runs)
 Makefile / build.bat   Build for Linux/macOS and Windows
 
-convert.py             Convert a GPT-OSS model (MXFP4/BF16 -> INT4) for Picchio
-convert_streaming.py   Shard-by-shard download+convert for the 120B
+convert.py             Convert a GPT-OSS (MXFP4/BF16) or Qwen3-MoE (BF16) model to INT4
+convert_streaming.py   Shard-by-shard download+convert for the GPT-OSS 120B
+convert_streaming_qwen.py  Shard-by-shard download+convert for a Qwen3-MoE model
 export_vocab.py        Build the binary tokenizer file
 download_expert_biases.py  Regenerate the 120B expert-bias sidecar
 
-chat.py                Token-exact chat bridge (Harmony), single-turn and multi-turn
+chat.py                Token-exact GPT-OSS chat bridge (Harmony)
+chat_qwen.py           Qwen3-MoE chat bridge (ChatML via transformers)
+picchio_logo.py        Shared terminal logo/banner for the chat bridges
 server.py              OpenAI-compatible HTTP API server
 requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
 
@@ -593,6 +606,7 @@ make_test_model.py     Generate a tiny synthetic model for validation
 test_forward.py        Numeric oracle to validate the forward pass
 
 DESIGN.md              Design notes, rationale, and measurements
+PORTING_QWEN3.md       How the Qwen3-MoE port works and what it changes
 ```
 
 For a much deeper dive into the numerics, the streaming/caching design, the
@@ -600,6 +614,75 @@ service protocol, and the measured results, read [`DESIGN.md`](DESIGN.md).
 
 ---
 
-## 12. License
+## 12. Running a Qwen3-MoE model
+
+Picchio runs Qwen3-MoE checkpoints (for example
+[`Qwen/Qwen3-30B-A3B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507))
+with the same streaming engine. The 30B-A3B is a good fit for a 16 GB machine: it
+converts to about 20 GB and activates only ~3.3 B parameters per token.
+
+### a) Install the dependencies
+
+```powershell
+pip install torch safetensors numpy huggingface_hub transformers
+```
+
+`transformers` is used by the chat bridge to render Qwen's ChatML prompts and to
+tokenize. The engine itself still only exchanges raw token IDs.
+
+### b) Convert the model
+
+The converter auto-detects Qwen from `config.json` (no extra flag). Qwen experts
+arrive as separate BF16 gate/up/down matrices; Picchio fuses gate and up and
+quantizes everything to INT4, exactly the layout the runtime expects.
+
+If the whole raw model fits on disk (about 61 GB for the 30B in BF16):
+
+```powershell
+python convert.py --model Qwen/Qwen3-30B-A3B-Instruct-2507 --output C:\models\qwen3_30b_i4 --download
+```
+
+If disk is tight, convert **shard by shard** so only the finished INT4 model
+(~20 GB) ever lands on disk, never the full 61 GB of raw weights:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:PICCHIO_OUTPUT = "C:\models\qwen3_30b_i4"   # where the converted shards go
+$env:PICCHIO_RAW    = "C:\models\qwen_tmp"       # scratch for one raw shard at a time
+python convert_streaming_qwen.py
+```
+
+`convert_streaming_qwen.py` downloads one shard, converts it, deletes the raw
+shard, and moves on. It is resumable, keeps the Hugging Face cache off your system
+drive, and adapts the download backend automatically (it uses Hugging Face's fast
+Xet path when available and falls back to a plain, reliable download when Xet is
+unavailable).
+
+### c) Chat
+
+Qwen uses ChatML, not Harmony, so it has its own bridge, `chat_qwen.py`:
+
+```powershell
+python chat_qwen.py --model C:\models\qwen3_30b_i4 --no-reasoning --ctx 2048 --pin-gb 8 --temperature 0.7
+```
+
+The options mirror `chat.py`: `--no-reasoning` disables Qwen's thinking
+(`enable_thinking=False`), and `--temperature` / `--top-p` / `--top-k` control
+sampling. Omit the prompt for an interactive multi-turn session with KV-prefix
+reuse between turns.
+
+### What differs under the hood
+
+Detection is by `model_type` in `config.json`. For Qwen the engine turns on
+QK-Norm (RMSNorm on Q and K per head before RoPE), plain SwiGLU instead of the
+clipped GPT-OSS variant, softmax-normalized top-k routing (`norm_topk_prob`),
+full attention on every layer (no sliding window), no attention sinks, and the
+ChatML end-of-turn token as the stop id. Everything is config-gated, so the
+GPT-OSS path is unchanged. For the full list and the validation status, see
+[`PORTING_QWEN3.md`](PORTING_QWEN3.md).
+
+---
+
+## 13. License
 
 MIT. See [`LICENSE`](LICENSE).
