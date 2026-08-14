@@ -455,6 +455,8 @@ static int cfg_load(Cfg *c, const char *model_path) {
     free(json);
 
     /* Summary */
+    fprintf(stderr, "  model: %s (%s)\n", arch,
+            is_qwen ? "Qwen3-MoE" : "GPT-OSS");
     fprintf(stderr, "  config: D=%d L=%d H=%d KV=%d hd=%d E=%d top%d\n",
             c->hidden, c->n_layers, c->n_heads, c->n_kv_heads,
             c->head_dim, c->n_experts, c->topk);
@@ -2482,10 +2484,15 @@ static int self_test(void) {
 
 /* Helper: load an F32 tensor from safetensors.
  * If the tensor is BF16, convert to F32. */
+/* Set while probing optional/alternate tensor names (router aliases, sinks that
+ * a family legitimately lacks) so a normal miss doesn't print a scary warning. */
+static int g_quiet_missing = 0;
+
 static float *load_f32_tensor(StDB *db, const char *name, int64_t expected_numel) {
     StTensor *t = st_find(db, name);
     if (!t) {
-        fprintf(stderr, "  ⚠ tensor not found: %s\n", name);
+        if (!g_quiet_missing)
+            fprintf(stderr, "  ⚠ tensor not found: %s\n", name);
         return NULL;
     }
     int64_t numel = st_numel(t);
@@ -2729,20 +2736,24 @@ static int load_dense_weights(Model *m, StDB *db) {
         }
 
         /* Attention sink logits (one per query head). Mandatory for GPT-OSS,
-         * absent in Qwen3 (the attention code guards on a NULL sinks pointer). */
+         * absent in Qwen3 (the attention code guards on a NULL sinks pointer), so
+         * probe quietly and let the use_sinks check below report a real problem. */
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.sinks", l);
+        g_quiet_missing = 1;
         ly->sinks = load_f32_tensor(db, name, H);
+        g_quiet_missing = 0;
         if (!ly->sinks && c->use_sinks) {
             fprintf(stderr, "  error: attention sinks missing at layer %d\n", l);
             return -1;
         }
         if (ly->sinks) loaded += H * 4;
 
-        /* Router weights + bias */
+        /* Router weights: the tensor name differs by family, so probe the aliases
+         * quietly and only complain if none of them exists. */
+        g_quiet_missing = 1;
         snprintf(name, sizeof(name), "model.layers.%d.mlp.router.weight", l);
         ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
-        if (!ly->router) {
-            /* Qwen3-MoE names it mlp.gate.weight; Mixtral block_sparse_moe.gate. */
+        if (!ly->router) {  /* Qwen3: mlp.gate.weight; Mixtral: block_sparse_moe.gate */
             snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", l);
             ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
         }
@@ -2750,10 +2761,14 @@ static int load_dense_weights(Model *m, StDB *db) {
             snprintf(name, sizeof(name), "model.layers.%d.block_sparse_moe.gate.weight", l);
             ly->router = load_f32_tensor(db, name, (int64_t)c->n_experts * D);
         }
-        loaded += (int64_t)c->n_experts * D * 4;
-
         snprintf(name, sizeof(name), "model.layers.%d.mlp.router.bias", l);
-        ly->router_bias = load_f32_tensor(db, name, c->n_experts);
+        ly->router_bias = load_f32_tensor(db, name, c->n_experts);  /* GPT-OSS only */
+        g_quiet_missing = 0;
+        if (!ly->router) {
+            fprintf(stderr, "  error: router weights missing at layer %d\n", l);
+            return -1;
+        }
+        loaded += (int64_t)c->n_experts * D * 4;
         if (ly->router_bias) loaded += c->n_experts * 4;
 
         if (l % 6 == 0 || l == c->n_layers - 1)
@@ -2926,7 +2941,7 @@ static int service_loop(Model *m, int cap) {
  * ═══════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
-    fprintf(stderr, "🪶 picchio v0.5.0 — GPT-OSS MoE streaming engine\n");
+    fprintf(stderr, "🪶 picchio v0.5.0 — MoE streaming engine\n");
     fprintf(stderr, "   GQA · INT4 · CPU streaming (architecture read from config.json)\n\n");
 
     /* ── Self-test mode ── */

@@ -22,6 +22,8 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
+import picchio_logo
+
 KEEP_ANALYSIS = RenderConversationConfig(auto_drop_analysis=False)
 
 
@@ -324,8 +326,8 @@ def main():
     detail = f"{model.name} · ctx {session.ctx} · pin {args.pin_gb} GB · temp {args.temperature}"
     if args.no_reasoning:
         detail += " · no-reasoning"
+    picchio_logo.banner("GPT-OSS · 20B/120B · int4 · streaming CPU")
     _err()
-    _err(f"  {GREEN('●')} {BOLD('picchio')}   {DIM('streaming MoE inference · GPT-OSS')}")
     _err(f"  {DIM(detail)}")
     if not single:
         _err(f"  {DIM('type a message · /exit to quit')}")
