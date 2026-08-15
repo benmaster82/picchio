@@ -42,3 +42,6 @@ Thumbs.db
 
 # Development tools and one-off scripts, not published (local archive)
 dev/
+
+# S1 flat expert store artifacts
+*.picchioflat
