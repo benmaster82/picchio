@@ -569,6 +569,46 @@ are those that keep GQA (Qwen3, Mixtral, Phi-MoE); models built on MLA (DeepSeek
 Kimi, recent GLM) would need the attention block rewritten and are out of scope
 here.
 
+### 0.15 Future tiers: storage-bypass and network
+
+Picchio's remaining wall is I/O, and the measurements point at a specific truth:
+the workload is bandwidth and IOPS bound, not syscall bound (section 0.11 has the
+large GPT-OSS experts already reading at the NVMe sequential ceiling). So the
+overhead worth removing is not the file system path lookup or the syscall count,
+which are negligible, but the **page cache** (the double copy, and its contention
+with the LRU, measured as the PILOT regression in section 0.8) and **queue depth
+1** (synchronous reads leave 5 to 10x of small-read IOPS on the table). This
+matters most for the many-small-experts regime: Qwen3 today (about 384 experts of
+2.65 MB per token), and the industry trend toward more and smaller experts.
+
+The roadmap, specified in `DESIGN_STREAMING_IO.md`, is incremental and keeps the
+current safetensors path as a fallback: **S1** a flat, 4 KiB-aligned expert store
+(`.picchioflat`) with a resident index, so one aligned read equals one expert with
+no fragmentation; **S2** unbuffered DMA (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`)
+straight into the LRU slots, which S1's alignment makes legal and which ends the
+page-cache contention; **S3** asynchronous submission at high queue depth
+(`io_uring` on Linux, overlapped plus IOCP on Windows), reusing the batch union
+Picchio already computes to saturate the NVMe on small reads. S1 to S3 are high
+ROI, portable, and dependency-free. **S4** (a raw partition, no file system) and
+**S5** (a user-space NVMe driver, SPDK class) are a dedicated-disk, fast-NVMe
+future; S5 in particular is Linux-only, takes over the device, and is best kept as
+a separate research track so the core stays "pure C, zero dependencies, runs
+anywhere". The precondition for all of it is an internal Gen3+ NVMe: on a USB
+bridge the bridge, not the OS, is the wall.
+
+The unifying idea is that the single expert-load boundary (`expert_load` /
+`cache_load_batch`, today backed by `st.h`) is where every future tier plugs in
+without changing the forward pass: an aligned disk, a raw device, a user-space
+NVMe queue, or the tier below disk, the **network**. That last tier already has a
+sibling project, [Lumabri](https://github.com/JustVugg/lumabri) (same author as
+Colibri): a pure-C P2P system that streams experts from a swarm of peers rather
+than local disk, keeping only dense, router, and KV local and moving about 4 KB of
+activations per routed expert. It answers the tier below "does not fit in RAM",
+namely "does not fit on the local disk". Its transparent `LD_PRELOAD` shim
+intercepts reads at the same boundary S1 formalizes, and its SHA256-block plus
+ed25519 integrity model mirrors the L0 manifest contract and the per-expert hash
+in the S1 index.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture
