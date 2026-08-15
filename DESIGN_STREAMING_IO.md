@@ -1,10 +1,12 @@
 # Streaming I/O roadmap: aligned expert store and OS-bypass
 
-Status: design proposal (not yet implemented). This document specifies a fast
-storage path for Picchio's expert streaming and the roadmap that leads to a full
-OS-bypass data path. It is deliberately incremental: each phase is useful on its
-own, is measured before the next is started, and keeps the current safetensors
-path working as a fallback.
+Status: S1 prototyped and S2/S3 measured in a standalone harness
+(`flat_pack.py`, `flat_bench.py`, `flat_bench_qd.py`); integration into the core
+engine is pending. See section 8 for the measured results. This document
+specifies a fast storage path for Picchio's expert streaming and the roadmap that
+leads to a full OS-bypass data path. It is deliberately incremental: each phase is
+useful on its own, is measured before the next is started, and keeps the current
+safetensors path working as a fallback.
 
 ## 0. What actually costs time (and what does not)
 
@@ -232,3 +234,50 @@ core engine stays small and dependency-free:
 The through-line: the same expert-load boundary that S1 formalizes is where every
 future tier plugs in (aligned disk, raw device, user-space NVMe, or a peer swarm),
 so the core forward pass never has to change.
+
+## 8. Measured results (prototype harness)
+
+The harness was run on `Qwen3-30B-A3B` (2.65 MB INT4 experts, the many-small
+regime) and `gpt-oss-20b` (14 MB experts, the few-large regime), on the two disks
+of the test machine: an external USB SSD (JMicron bridge) and an internal Kingston
+NVMe. Experts were byte-verified identical to the safetensors container in every
+run (the L0 gate). Numbers are true-disk (unbuffered); each pass reads a fixed set
+of about 1 to 1.3 GB.
+
+**The disk is the number one lever.**
+
+| Config | expert | true-disk MB/s | p50 us/read | p99 us/read |
+|---|---:|---:|---:|---:|
+| Qwen, USB | 2.65 MB | 324 | 6406 | 34537 |
+| Qwen, NVMe | 2.65 MB | 1480 | 1762 | 1923 |
+| gpt-oss, NVMe | 14 MB | 1770 | 7825 | ~11000 |
+
+Moving Qwen from the USB bridge to the internal NVMe is 4.6x on throughput and
+about 18x on the p99 tail: the single-queue bridge stall disappears. This dominates
+every software lever below. (One run on the busy system NVMe produced a 632 ms p99
+outlier from background OS I/O; it did not reproduce. Lesson: measure on a quiet
+disk and read p50, not just the aggregate.)
+
+**S2 preview (page cache over true disk):** buffered-warm divided by unbuffered is
+about 1.1 to 1.4x on the NVMe, but about 6x on the USB. Skipping the page cache
+buys throughput mainly on slow disks; on a fast NVMe S2's value is keeping the OS
+cache from evicting the LRU (the PILOT problem in section 0.8), not raw bandwidth.
+
+**S3 (async high queue depth, overlapped plus IOCP, unbuffered), QD sweep on the
+NVMe:**
+
+| Regime | QD1 | plateau | gain | plateau QD |
+|---|---:|---:|---:|---:|
+| Qwen small experts (2.65 MB) | 1499 MB/s | 1969 MB/s | 1.31x | QD2 |
+| gpt-oss big experts (14 MB) | 1798 MB/s | 1977 MB/s | 1.10x | QD2 |
+
+Both regimes converge to the same ceiling (about 1970 MB/s, this NVMe's limit), but
+the small experts start lower at QD1 and gain the most from overlapping reads (plus
+31 percent), while the big experts already saturate near QD1 (plus 10 percent). This
+confirms the thesis: S3 targets the many-small-experts regime. The plateau lands at
+QD2 only because this is an entry NVMe; a Gen4/5 drive plateaus at a much higher QD
+and MB/s, so the S3 headroom grows with faster hardware.
+
+**Ranked wins on this hardware:** (1) put the model on the internal NVMe (4.6x),
+(2) async QD for small experts (about 1.3x), (3) unbuffered reads to protect the
+LRU. S1 is the enabler that makes (2) and (3) possible, and it is byte-exact.
