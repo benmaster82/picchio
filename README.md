@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS · 20B/120B · int4 · streaming CPU" width="560">
+  <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS 20B/120B · Qwen3-MoE · int4 · streaming CPU" width="560">
 </p>
 
 > *The woodpecker drums a hundred times a second on a huge trunk;
@@ -19,11 +19,22 @@ without a datacenter GPU.
 Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
 GPT-OSS architecture.
 
-**It also runs Qwen3-MoE models** (for example `Qwen3-30B-A3B`). The engine reads
-the architecture from `config.json`, and a handful of config-gated differences
-(QK-Norm, plain SwiGLU, softmax-normalized top-k routing, no attention sinks) let
-the same streaming core serve a second model family with no change to the GPT-OSS
-path. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model).
+### Supported models
+
+The same streaming core serves two MoE families. The engine reads every dimension
+from `config.json` and flips the family-specific behaviors from the model's
+`model_type`, so adding the second family left the GPT-OSS path byte-for-byte
+unchanged.
+
+| Family | Models | Converted size | Chat bridge |
+|---|---|---|---|
+| **GPT-OSS** | `gpt-oss-20b`, `gpt-oss-120b` | ~14 GB / ~66 GB | [`chat.py`](chat.py) (Harmony) |
+| **Qwen3-MoE** | e.g. `Qwen3-30B-A3B` | ~20 GB | [`chat_qwen.py`](chat_qwen.py) (ChatML) |
+
+The Qwen3 support is config-gated: QK-Norm, plain SwiGLU, softmax-normalized
+top-k routing, and full attention (no sinks, no sliding window) are switched on
+only for Qwen checkpoints. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
+and [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
 
 > **New to this?** Read the sections in order. Every command below is complete:
 > nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
@@ -605,12 +616,21 @@ requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
 make_test_model.py     Generate a tiny synthetic model for validation
 test_forward.py        Numeric oracle to validate the forward pass
 
+flat_common.py         Shared helpers for the .picchioflat store (model-agnostic)
+flat_pack.py           Repack converted experts into a flat, block-aligned store
+flat_bench.py          Byte-verify the flat store and microbench expert I/O
+flat_bench_qd.py       Async high-queue-depth read benchmark (overlapped + IOCP)
+
 DESIGN.md              Design notes, rationale, and measurements
+DESIGN_STREAMING_IO.md Storage-bypass I/O roadmap (flat store, O_DIRECT, async QD)
 PORTING_QWEN3.md       How the Qwen3-MoE port works and what it changes
 ```
 
 For a much deeper dive into the numerics, the streaming/caching design, the
-service protocol, and the measured results, read [`DESIGN.md`](DESIGN.md).
+service protocol, and the measured results, read [`DESIGN.md`](DESIGN.md). The
+ongoing work on storage-bypass I/O (a flat block-aligned expert store, unbuffered
+reads, and async high-queue-depth streaming), with the prototype harness and its
+measured numbers, is in [`DESIGN_STREAMING_IO.md`](DESIGN_STREAMING_IO.md).
 
 ---
 
