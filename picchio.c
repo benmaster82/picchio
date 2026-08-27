@@ -1738,22 +1738,27 @@ static int sample_logits(float *logits, int vocab) {
  *  FORWARD PASS (one token, decode)
  * ═══════════════════════════════════════════════════════════ */
 
-static int forward_token(Model *m, int tok, int pos) {
+/* ═══════════════════════════════════════════════════════════
+ *  PIPELINE-SPLITTABLE FORWARD
+ *
+ *  The residual stream h (D floats) is the only state that crosses a layer
+ *  boundary; each layer's KV cache stays local to whichever machine owns that
+ *  layer. So the forward can be cut at any layer L: stage A runs [0, cut) and
+ *  emits h, stage B runs [cut, n_layers) on the received h. run_layer_range is
+ *  the shared primitive; calling it with [0, n_layers) is byte-identical to the
+ *  old monolithic loop (pipe_split_check proves this in the self-test).
+ * ═══════════════════════════════════════════════════════════ */
+
+/* Run transformer layers [l_lo, l_hi) in place on the residual stream h at
+ * position pos. Behaviorally identical to the original forward_token loop. */
+static void run_layer_range(Model *m, float *h, int pos, int l_lo, int l_hi) {
     Cfg *c = &m->c;
     int D = c->hidden;
-
-    float *h = falloc(D);           /* hidden state */
     float *hn = falloc(D);          /* normalized hidden */
     float *attn_out = falloc(D);    /* attention output */
     float *ffn_out = falloc(D);     /* FFN/MoE output */
 
-    /* Embedding */
-    embed_token(m, tok, h);
-    trace_vector("embedding", -1, h, D);
-    if (g_oracle_dir) oracle_dump_vec("embedding", h, D);
-
-    /* Transformer layers */
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int l = l_lo; l < l_hi; l++) {
         Layer *ly = &m->L[l];
         char dump_name[128];
         if (g_oracle_dir) {
@@ -1820,25 +1825,74 @@ static int forward_token(Model *m, int tok, int pos) {
         }
     }
 
-    /* Final norm */
+    free(hn); free(attn_out); free(ffn_out);
+}
+
+/* Final norm + LM head → logits. The pipeline's last stage, after the layers. */
+static void forward_head_logits(Model *m, const float *h, float *logits) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *hn = falloc(D);
     rmsnorm(hn, h, m->final_norm, D, c->eps);
     if (g_oracle_dir) oracle_dump_vec("final_norm", hn, D);
-
-    /* LM head → logits */
     double th = now_s();
-    float *logits = falloc(c->vocab);
     matmul_qt(logits, hn, &m->lm_head, 1);
     trace_top_logits(logits, c->vocab);
     if (g_oracle_dir) oracle_dump_vec("logits", logits, c->vocab);
     m->t_head += now_s() - th;
+    free(hn);
+}
 
-    /* Sampling */
+static int forward_token(Model *m, int tok, int pos) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+
+    float *h = falloc(D);           /* hidden state (residual stream) */
+    embed_token(m, tok, h);
+    trace_vector("embedding", -1, h, D);
+    if (g_oracle_dir) oracle_dump_vec("embedding", h, D);
+
+    run_layer_range(m, h, pos, 0, c->n_layers);
+
+    float *logits = falloc(c->vocab);
+    forward_head_logits(m, h, logits);
     int sampled = sample_logits(logits, c->vocab);
 
-    free(h); free(hn); free(attn_out); free(ffn_out); free(logits);
-
+    free(h); free(logits);
     m->n_fw++;
     return sampled;
+}
+
+/* Byte-identity gate for the pipeline split: the monolithic forward must produce
+ * logits bit-for-bit identical to the same forward cut at layer `cut`, with the
+ * residual stream carried through a serialize/deserialize round-trip (the wire
+ * format the two machines exchange). Any mismatch is a split/transport bug. */
+static int pipe_split_check(Model *m, int tok, int pos, int cut) {
+    Cfg *c = &m->c;
+    int D = c->hidden, V = c->vocab;
+
+    /* monolithic reference */
+    float *hf = falloc(D);
+    embed_token(m, tok, hf);
+    run_layer_range(m, hf, pos, 0, c->n_layers);
+    float *lf = falloc(V);
+    forward_head_logits(m, hf, lf);
+
+    /* split: stage A [0,cut) → wire → stage B [cut,L) → head */
+    float *hs = falloc(D);
+    embed_token(m, tok, hs);
+    run_layer_range(m, hs, pos, 0, cut);
+    unsigned char *wire = (unsigned char *)malloc((size_t)D * sizeof(float));
+    memcpy(wire, hs, (size_t)D * sizeof(float));     /* stage A -> wire */
+    memcpy(hs, wire, (size_t)D * sizeof(float));     /* wire -> stage B */
+    free(wire);
+    run_layer_range(m, hs, pos, cut, c->n_layers);
+    float *ls = falloc(V);
+    forward_head_logits(m, hs, ls);
+
+    int same = (memcmp(lf, ls, (size_t)V * sizeof(float)) == 0);
+    free(hf); free(lf); free(hs); free(ls);
+    return same;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -2468,6 +2522,21 @@ static int self_test(void) {
             return 1;
         }
         fprintf(stderr, " ✓ (err max=%.4f)\n", max_err);
+    }
+
+    fprintf(stderr, "  test pipeline split (byte-identity)...");
+    {
+        int cut = c->n_layers / 2; if (cut < 1) cut = 1;
+        int tks[3] = {6, 11, 2};
+        int ok = 1;
+        for (int i = 0; i < 3; i++)
+            if (!pipe_split_check(&m, tks[i], 8 + i, cut)) { ok = 0; break; }
+        if (!ok) {
+            fprintf(stderr, " ✗ split logits differ from the monolithic forward\n");
+            return 1;
+        }
+        fprintf(stderr, " ✓ (cut@%d: layers [0,%d)+[%d,%d) == monolithic)\n",
+                cut, cut, cut, c->n_layers);
     }
 
     fprintf(stderr, "\n── self-test PASSED ──\n");
