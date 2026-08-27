@@ -2950,6 +2950,9 @@ static void net_init(void) {}
 static void net_close(sock_t s) { close(s); }
 #endif
 
+static sock_t g_pipe_sock = BADSOCK;  /* coordinator's live connection to the worker */
+static int g_pipe_coord = 0;          /* 1 = service_loop forwards through the worker */
+
 #define PIPE_MAGIC 0x32504350u   /* 'PCP2' */
 enum { PIPE_FWD = 1, PIPE_RES = 2 };
 
@@ -3301,7 +3304,14 @@ static int service_loop(Model *m, int cap) {
 
         /* Reuse the prefix: the subsequent positions will be overwritten. */
         pos = (int)keep;
-        int next = prefill_tokens(m, ids, (int)n_ids, pos);
+        int next;
+        if (g_pipe_coord) {   /* distributed: prefill sequentially through the worker */
+            next = ids[0];
+            for (long i = 0; i < n_ids; i++)
+                next = pipe_coord_step(m, g_pipe_sock, ids[i], pos + (int)i, g_pipe_cut);
+        } else {
+            next = prefill_tokens(m, ids, (int)n_ids, pos);
+        }
         pos += (int)n_ids;
         free(ids);
 
@@ -3314,7 +3324,9 @@ static int service_loop(Model *m, int cap) {
             printf("TOKEN %d\n", tok);
             fflush(stdout);
             produced++;
-            int following = forward_token(m, tok, pos);
+            int following = g_pipe_coord
+                ? pipe_coord_step(m, g_pipe_sock, tok, pos, g_pipe_cut)
+                : forward_token(m, tok, pos);
             pos++;
             m->n_emit++;
             int stopped = 0;
@@ -3708,6 +3720,32 @@ int main(int argc, char **argv) {
       if (prole && strcmp(prole, "coord") == 0) {
         const char *peer = getenv("PIPE_PEER");
         if (!peer) peer = "127.0.0.1:52200";
+        const char *svc = getenv("SERVICE");
+        if (svc && atoi(svc)) {
+            /* Distributed CHAT: connect to the worker once, then drive service_loop
+             * (the protocol the Python bridge speaks), forwarding through the worker. */
+            char host[256] = "127.0.0.1"; int port = 52200;
+            { const char *colon = strrchr(peer, ':');
+              if (colon) { size_t hl = (size_t)(colon - peer);
+                           if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+                           memcpy(host, peer, hl); host[hl] = '\0'; port = atoi(colon + 1); }
+              else strncpy(host, peer, sizeof(host) - 1); }
+            net_init();
+            g_pipe_sock = tcp_connect(host, port);
+            if (g_pipe_sock == BADSOCK) {
+                fprintf(stderr, "pipe coord: cannot connect to %s:%d\n", host, port);
+                st_close(&db); return 1;
+            }
+            g_pipe_coord = 1;
+            fprintf(stderr, "pipe coord (chat): worker %s:%d, cut@%d, layers [0,%d) here\n",
+                    host, port, g_pipe_cut, g_pipe_cut);
+            int rc = service_loop(&m, initial_ctx);
+            net_close(g_pipe_sock);
+            stats_dump(&m); hotstore_save(&m); pilot_shutdown();
+            if (has_tokenizer) tok_free(&tok);
+            st_close(&db);
+            return rc;
+        }
         int rc = pipe_coord_run(&m, peer, g_pipe_cut, max_tokens);
         stats_dump(&m); hotstore_save(&m); pilot_shutdown();
         if (has_tokenizer) tok_free(&tok);
