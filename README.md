@@ -36,6 +36,11 @@ top-k routing, and full attention (no sinks, no sliding window) are switched on
 only for Qwen checkpoints. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
 and [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
 
+**It can also split a model across two machines on a LAN** and run them as one, so
+a model too big for any single computer can run by pooling their RAM. Only the
+small residual-stream vector crosses the network, and the output is byte-identical
+to a single node. See [Distributed inference across two machines](#13-distributed-inference-across-two-machines).
+
 > **New to this?** Read the sections in order. Every command below is complete:
 > nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
 > equivalents are given where they differ.
@@ -56,7 +61,8 @@ and [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
 10. [Verifying correctness (optional)](#10-verifying-correctness-optional)
 11. [How it works & project layout](#11-how-it-works--project-layout)
 12. [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
-13. [License](#13-license)
+13. [Distributed inference across two machines](#13-distributed-inference-across-two-machines)
+14. [License](#14-license)
 
 ---
 
@@ -616,6 +622,9 @@ requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
 make_test_model.py     Generate a tiny synthetic model for validation
 test_forward.py        Numeric oracle to validate the forward pass
 
+net_bench.py           Measure LAN latency/throughput (sizing the distributed split)
+pipe_node.py           Prototype of the 2-stage pipeline with byte-identity check
+
 flat_common.py         Shared helpers for the .picchioflat store (model-agnostic)
 flat_pack.py           Repack converted experts into a flat, block-aligned store
 flat_bench.py          Byte-verify the flat store and microbench expert I/O
@@ -703,6 +712,82 @@ GPT-OSS path is unchanged. For the full list and the validation status, see
 
 ---
 
-## 13. License
+## 13. Distributed inference across two machines
+
+Picchio can split a model across **two machines on the same network** and run them
+as one, so a model that does not fit in one computer's RAM can run on two smaller
+ones. The layers are cut at a boundary: the **coordinator** (machine A) holds the
+first layers plus the embedding, the **worker** (machine B) holds the rest plus the
+output head. For each token only the small residual-stream vector (a few KB)
+crosses the network; each machine keeps its own layers' KV cache locally. The
+result is **byte-identical** to running the whole model on one node.
+
+> **When to use it.** Only when the model does not fit on one machine. If it fits,
+> a single machine is always faster (the network adds latency per token). This is
+> the way to run a model that is *too big for any one of your computers*, by pooling
+> their RAM. Wired Ethernet is strongly preferred over WiFi.
+
+### How the split works
+
+- **Sampling lives on the coordinator**, the single authority for temperature, seed
+  and repetition penalty, so the distributed output matches a single node exactly.
+- Each node loads **only its own layers** (`PIPE_CUT` sets the boundary), so a
+  20B whose dense part is ~3.7 GB on one machine becomes ~1.9 GB on each of two.
+- The prompt is encoded in **batched blocks** (one network round-trip per block),
+  then tokens are generated one at a time.
+
+### Run it (PowerShell)
+
+Both machines need `picchio.exe` and the **same converted model folder** on disk
+(each loads only its half into RAM, but both read from the model files).
+
+**1. On the WORKER machine (B).** Open TCP port 52200 once (Administrator prompt):
+```powershell
+New-NetFirewallRule -DisplayName "picchio" -Direction Inbound -Protocol TCP -LocalPort 52200 -Action Allow
+```
+Find its LAN IP with `ipconfig` (the "IPv4 Address", e.g. `192.168.1.14`), then start
+the worker (it stays listening):
+```powershell
+$env:PIPE_ROLE="worker"; $env:PIPE_CUT="16"; $env:PIN_GB="2"; $env:CTX="1024"
+.\picchio.exe C:\models\gptoss20b_i8h
+```
+Wait for `pipe worker (stage B): listening on port 52200`.
+
+**2. On the COORDINATOR machine (A).** Point it at the worker's IP and chat:
+```powershell
+$env:PIPE_ROLE="coord"; $env:PIPE_PEER="192.168.1.14:52200"; $env:PIPE_CUT="16"
+python chat.py --model C:\models\gptoss20b_i8h --no-reasoning --pin-gb 3 --ctx 1024 --temperature 0.7
+```
+`chat.py` inherits the `PIPE_*` variables from the environment, so it drives the
+two nodes transparently: you type, the two machines answer together.
+
+- **`PIPE_CUT` must be the same on both machines.** Give the stronger/larger-RAM
+  machine more layers (a higher cut) to balance the pipeline.
+- To go back to single-machine mode, clear the variables (`Remove-Item Env:PIPE_ROLE,
+  Env:PIPE_PEER, Env:PIPE_CUT`) or open a fresh terminal.
+
+### Distributed environment variables
+
+| Variable | Meaning |
+|---|---|
+| `PIPE_ROLE` | `worker` (stage B) or `coord` (stage A). Unset = normal single-node. |
+| `PIPE_CUT` | Layer boundary. Coordinator holds `[0, cut)`, worker holds `[cut, n_layers)`. Must match on both nodes. |
+| `PIPE_PEER` | Coordinator only: the worker's `host:port` (e.g. `192.168.1.14:52200`). |
+| `PIPE_PORT` | Worker only: TCP port to listen on (default `52200`). |
+
+### Checking it
+
+`./picchio --pipe-self-test` runs both stages over a loopback socket on a tiny
+synthetic model and verifies the distributed tokens equal a single node's. On a
+real model, `PIPE_SPLIT_CHECK=<cut> ./picchio <model>` checks in one process that
+the split forward is byte-identical to the monolithic one.
+
+The design notes and the measurement harnesses (`net_bench.py` for LAN latency,
+`pipe_node.py` for the pipeline prototype) are described in
+[`DESIGN.md`](DESIGN.md).
+
+---
+
+## 14. License
 
 MIT. See [`LICENSE`](LICENSE).
