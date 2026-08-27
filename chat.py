@@ -288,6 +288,9 @@ def main():
                         help="0 = deterministic greedy; values ~0.7-1.0 avoid loops")
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--rep", type=float, default=1.0,
+                        help="repetition penalty (1.0=off; try 1.1 to stop "
+                             "degenerate loops like '......')")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--show-analysis", action="store_true",
                         help="show the analysis channel instead of final")
@@ -315,7 +318,7 @@ def main():
         parser.error(f"model not found: {model}")
 
     sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p,
-                "TOPK": args.top_k, "SEED": args.seed}
+                "TOPK": args.top_k, "REP": args.rep, "SEED": args.seed}
     session = PicchioSession(exe, model, args.ctx, args.pin_gb, args.threads,
                              resolve_aux(model, args.model_aux), sampling)
     chat = HarmonyChat(session, args.reasoning, args.date, args.no_reasoning)
