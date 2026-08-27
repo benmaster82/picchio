@@ -2721,6 +2721,16 @@ static int load_qt_i4(StDB *db, const char *name, QT *qt, int O, int I) {
 }
 
 /* Load all resident dense weights (embedding, attention, norms, router) */
+/* Distributed pipeline: the layer range this process owns, and whether it holds
+ * the embedding (stage A) and the head + final norm (stage B). Defaults describe a
+ * full single-node model; the PIPE_ROLE setup in main narrows them for a stage so
+ * each node loads only its own layers (the RAM-pooling win of Step 2b). */
+static int g_pipe_lo = 0;
+static int g_pipe_hi = 1 << 30;   /* clamped to n_layers after cfg_load */
+static int g_pipe_cut = 0;        /* the run-time split boundary (coord runs [0,cut)) */
+static int g_load_embed = 1;
+static int g_load_head = 1;
+
 static int load_dense_weights(Model *m, StDB *db) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -2729,39 +2739,45 @@ static int load_dense_weights(Model *m, StDB *db) {
     int hd = c->head_dim;
     int64_t loaded = 0;
 
-    fprintf(stderr, "\n  loading dense weights...\n");
+    fprintf(stderr, "\n  loading dense weights (layers [%d,%d)%s%s)...\n",
+            g_pipe_lo, g_pipe_hi < c->n_layers ? g_pipe_hi : c->n_layers,
+            g_load_embed ? " +embed" : "", g_load_head ? " +head" : "");
 
-    /* ── Embedding ── */
-    fprintf(stderr, "    embed_tokens [%d, %d]...", c->vocab, D);
-    if (load_qt_i4(db, "model.embed_tokens.weight", &m->embed, c->vocab, D) == 0) {
-        loaded += qt_bytes(&m->embed);
-        fprintf(stderr, " ✓ (%.1f MB)\n", qt_bytes(&m->embed) / 1e6);
-    } else {
-        fprintf(stderr, " ✗\n");
-        return -1;
+    /* ── Embedding (stage A, or full model) ── */
+    if (g_load_embed) {
+        fprintf(stderr, "    embed_tokens [%d, %d]...", c->vocab, D);
+        if (load_qt_i4(db, "model.embed_tokens.weight", &m->embed, c->vocab, D) == 0) {
+            loaded += qt_bytes(&m->embed);
+            fprintf(stderr, " ✓ (%.1f MB)\n", qt_bytes(&m->embed) / 1e6);
+        } else {
+            fprintf(stderr, " ✗\n");
+            return -1;
+        }
     }
 
-    /* ── LM Head ── */
-    fprintf(stderr, "    lm_head [%d, %d]...", c->vocab, D);
-    if (load_qt_i4(db, "lm_head.weight", &m->lm_head, c->vocab, D) == 0) {
-        loaded += qt_bytes(&m->lm_head);
-        fprintf(stderr, " ✓ (%.1f MB)\n", qt_bytes(&m->lm_head) / 1e6);
-    } else {
-        fprintf(stderr, " ✗\n");
-        return -1;
+    /* ── LM head + final norm (stage B, or full model) ── */
+    if (g_load_head) {
+        fprintf(stderr, "    lm_head [%d, %d]...", c->vocab, D);
+        if (load_qt_i4(db, "lm_head.weight", &m->lm_head, c->vocab, D) == 0) {
+            loaded += qt_bytes(&m->lm_head);
+            fprintf(stderr, " ✓ (%.1f MB)\n", qt_bytes(&m->lm_head) / 1e6);
+        } else {
+            fprintf(stderr, " ✗\n");
+            return -1;
+        }
+
+        m->final_norm = load_f32_tensor(db, "model.norm.weight", D);
+        if (!m->final_norm) {
+            fprintf(stderr, "    ⚠ final_norm not found, using 1.0\n");
+            m->final_norm = falloc(D);
+            for (int i = 0; i < D; i++) m->final_norm[i] = 1.0f;
+        }
+        loaded += D * 4;
     }
 
-    /* ── Final norm ── */
-    m->final_norm = load_f32_tensor(db, "model.norm.weight", D);
-    if (!m->final_norm) {
-        fprintf(stderr, "    ⚠ final_norm not found, using 1.0\n");
-        m->final_norm = falloc(D);
-        for (int i = 0; i < D; i++) m->final_norm[i] = 1.0f;
-    }
-    loaded += D * 4;
-
-    /* ── Per-layer weights ── */
+    /* ── Per-layer weights (only the layers this stage owns) ── */
     for (int l = 0; l < c->n_layers; l++) {
+        if (l < g_pipe_lo || l >= g_pipe_hi) continue;   /* another stage's layer */
         Layer *ly = &m->L[l];
         ly->layer_type = c->layer_type[l];
         char name[256];
@@ -3017,6 +3033,12 @@ static void pipe_worker_serve(Model *m, sock_t conn) {
         if (recv_all(conn, &hd, sizeof(hd)) != 0) break;
         if (hd.magic != PIPE_MAGIC || hd.type != PIPE_FWD) break;
         if (hd.nbytes != (uint32_t)D * (uint32_t)sizeof(float)) break;
+        if (hd.lo < g_pipe_lo || hd.hi > g_pipe_hi) {
+            fprintf(stderr, "pipe worker: requested range [%d,%d) outside owned "
+                    "[%d,%d) — PIPE_CUT mismatch between the two nodes?\n",
+                    hd.lo, hd.hi, g_pipe_lo, g_pipe_hi);
+            break;
+        }
         if (recv_all(conn, h, hd.nbytes) != 0) break;
         run_layer_range(m, h, hd.pos, hd.lo, hd.hi);
         forward_head_logits(m, h, logits);
@@ -3363,6 +3385,39 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Distributed pipeline: narrow the owned layer range BEFORE loading, so a
+     * stage reads only its own layers (Step 2b). The coordinator holds [0,cut) and
+     * the embedding; the worker holds [cut,n_layers), the final norm and the head. */
+    g_pipe_hi = m.c.n_layers;
+    { const char *prole = getenv("PIPE_ROLE");
+      if (prole) {
+          int cut = m.c.n_layers / 2;
+          const char *v = getenv("PIPE_CUT"); if (v) cut = atoi(v);
+          if (cut < 1) cut = 1;
+          if (cut >= m.c.n_layers) cut = m.c.n_layers - 1;
+          g_pipe_cut = cut;
+          /* PIPE_LOAD_FULL: diagnostic — load the whole model on both nodes but
+           * still run the split at `cut`, to separate a partial-load bug from a
+           * split/transport bug. */
+          int load_full = 0;
+          { const char *lf = getenv("PIPE_LOAD_FULL"); if (lf && atoi(lf)) load_full = 1; }
+          if (strcmp(prole, "worker") == 0) {
+              if (load_full) { g_pipe_lo = 0; g_pipe_hi = m.c.n_layers;
+                               g_load_embed = 1; g_load_head = 1; }
+              else { g_pipe_lo = cut; g_pipe_hi = m.c.n_layers;
+                     g_load_embed = 0; g_load_head = 1; }
+              fprintf(stderr, "pipe role: worker — runs [%d,%d) + head, loaded [%d,%d)%s\n",
+                      cut, m.c.n_layers, g_pipe_lo, g_pipe_hi, load_full ? " (FULL)" : "");
+          } else if (strcmp(prole, "coord") == 0) {
+              if (load_full) { g_pipe_lo = 0; g_pipe_hi = m.c.n_layers;
+                               g_load_embed = 1; g_load_head = 1; }
+              else { g_pipe_lo = 0; g_pipe_hi = cut;
+                     g_load_embed = 1; g_load_head = 0; }
+              fprintf(stderr, "pipe role: coord — runs [0,%d) + embedding, loaded [%d,%d)%s\n",
+                      cut, g_pipe_lo, g_pipe_hi, load_full ? " (FULL)" : "");
+          }
+      } }
+
     /* ── 2. Open the safetensors files ── */
     StDB db;
     st_init(&db);
@@ -3627,11 +3682,7 @@ int main(int argc, char **argv) {
       if (prole && strcmp(prole, "coord") == 0) {
         const char *peer = getenv("PIPE_PEER");
         if (!peer) peer = "127.0.0.1:52200";
-        int cut = c->n_layers / 2;
-        { const char *v = getenv("PIPE_CUT"); if (v) cut = atoi(v); }
-        if (cut < 1) cut = 1;
-        if (cut >= c->n_layers) cut = c->n_layers - 1;
-        int rc = pipe_coord_run(&m, peer, cut, max_tokens);
+        int rc = pipe_coord_run(&m, peer, g_pipe_cut, max_tokens);
         stats_dump(&m); hotstore_save(&m); pilot_shutdown();
         if (has_tokenizer) tok_free(&tok);
         st_close(&db);
