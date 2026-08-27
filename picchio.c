@@ -1946,11 +1946,15 @@ static void expert_apply(ESlot *es, const float *x, float *dst, float w,
 
 /* Prefill n tokens starting at pos_base. Returns the token sampled from the last
  * position, as the last sequential forward_token would. */
-static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
+/* Run the batched layers [l_lo, l_hi) over n positions, in place on H (n*D
+ * residuals). Extracted from forward_prefill so the batched prefill can be split
+ * at a layer boundary for the distributed pipeline; calling it with [0, n_layers)
+ * is identical to the original monolithic loop. */
+static void run_prefill_range(Model *m, float *H, int n, int pos_base,
+                              int l_lo, int l_hi) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk;
 
-    float *H = (float *)falloc((int64_t)n * D);
     float *XN = (float *)falloc((int64_t)n * D);
     float *hn = falloc(D);
     float *attn_out = falloc(D);
@@ -1959,14 +1963,12 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
     float *scores = falloc(E);
     int *uniq = (int *)malloc((size_t)E * sizeof(int));
     unsigned char *seen = (unsigned char *)malloc((size_t)E);
-    if (!H || !XN || !sel_all || !w_all || !uniq || !seen) {
+    if (!XN || !sel_all || !w_all || !uniq || !seen) {
         fprintf(stderr, "error: not enough memory for the batched prefill\n");
         exit(1);
     }
 
-    for (int p = 0; p < n; p++) embed_token(m, ids[p], H + (int64_t)p * D);
-
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int l = l_lo; l < l_hi; l++) {
         Layer *ly = &m->L[l];
 
         /* Attention: in position order, so the previous KV is ready. */
@@ -2071,16 +2073,29 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
         m->t_moe += now_s() - tm;
     }
 
+    free(XN); free(hn); free(attn_out); free(sel_all); free(w_all);
+    free(scores); free(uniq); free(seen);
+}
+
+static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+
+    float *H = (float *)falloc((int64_t)n * D);
+    if (!H) {
+        fprintf(stderr, "error: not enough memory for the batched prefill\n");
+        exit(1);
+    }
+    for (int p = 0; p < n; p++) embed_token(m, ids[p], H + (int64_t)p * D);
+
+    run_prefill_range(m, H, n, pos_base, 0, c->n_layers);
+
     /* Only the last position produces the useful logits. */
-    rmsnorm(hn, H + (int64_t)(n - 1) * D, m->final_norm, D, c->eps);
-    double th = now_s();
     float *logits = falloc(c->vocab);
-    matmul_qt(logits, hn, &m->lm_head, 1);
-    m->t_head += now_s() - th;
+    forward_head_logits(m, H + (int64_t)(n - 1) * D, logits);
     int sampled = sample_logits(logits, c->vocab);
 
-    free(H); free(XN); free(hn); free(attn_out); free(sel_all); free(w_all);
-    free(scores); free(uniq); free(seen); free(logits);
+    free(H); free(logits);
     m->n_fw += n;
     return sampled;
 }
@@ -2954,7 +2969,7 @@ static sock_t g_pipe_sock = BADSOCK;  /* coordinator's live connection to the wo
 static int g_pipe_coord = 0;          /* 1 = service_loop forwards through the worker */
 
 #define PIPE_MAGIC 0x32504350u   /* 'PCP2' */
-enum { PIPE_FWD = 1, PIPE_RES = 2 };
+enum { PIPE_FWD = 1, PIPE_RES = 2, PIPE_BATCH = 3 };  /* BATCH = prefill block */
 
 typedef struct {
     uint32_t magic;
@@ -3030,23 +3045,35 @@ static sock_t tcp_connect(const char *host, int port) {
 static void pipe_worker_serve(Model *m, sock_t conn) {
     Cfg *c = &m->c;
     int D = c->hidden;
-    float *h = falloc(D);
+    float *h = falloc(D);                 /* single-token residual */
     float *logits = falloc(c->vocab);
     nodelay(conn);
     for (;;) {
         PipeHdr hd;
         if (recv_all(conn, &hd, sizeof(hd)) != 0) break;
-        if (hd.magic != PIPE_MAGIC || hd.type != PIPE_FWD) break;
-        if (hd.nbytes != (uint32_t)D * (uint32_t)sizeof(float)) break;
+        if (hd.magic != PIPE_MAGIC) break;
         if (hd.lo < g_pipe_lo || hd.hi > g_pipe_hi) {
             fprintf(stderr, "pipe worker: requested range [%d,%d) outside owned "
                     "[%d,%d) — PIPE_CUT mismatch between the two nodes?\n",
                     hd.lo, hd.hi, g_pipe_lo, g_pipe_hi);
             break;
         }
-        if (recv_all(conn, h, hd.nbytes) != 0) break;
-        run_layer_range(m, h, hd.pos, hd.lo, hd.hi);
-        forward_head_logits(m, h, logits);
+        if (hd.type == PIPE_FWD) {                 /* decode: one token */
+            if (hd.nbytes != (uint32_t)D * (uint32_t)sizeof(float)) break;
+            if (recv_all(conn, h, hd.nbytes) != 0) break;
+            run_layer_range(m, h, hd.pos, hd.lo, hd.hi);
+            forward_head_logits(m, h, logits);
+        } else if (hd.type == PIPE_BATCH) {        /* prefill: block of positions */
+            int n = hd.seq;
+            if (n < 1 ||
+                hd.nbytes != (uint32_t)((int64_t)n * D * (int64_t)sizeof(float))) break;
+            float *H = (float *)falloc((int64_t)n * D);
+            if (!H) break;
+            if (recv_all(conn, H, hd.nbytes) != 0) { free(H); break; }
+            run_prefill_range(m, H, n, hd.pos, hd.lo, hd.hi);
+            forward_head_logits(m, H + (int64_t)(n - 1) * D, logits);
+            free(H);
+        } else break;
         PipeHdr rh = { PIPE_MAGIC, PIPE_RES, hd.seq, hd.pos, hd.lo, hd.hi,
                        (uint32_t)c->vocab * (uint32_t)sizeof(float) };
         if (send_all(conn, &rh, sizeof(rh)) != 0) break;
@@ -3079,6 +3106,35 @@ static int pipe_coord_step(Model *m, sock_t s, int tok, int pos, int cut) {
     }
     free(h);
     m->n_fw++;
+    return rtok;
+}
+
+/* Distributed batched prefill: embed n tokens, run [0,cut) over the whole block,
+ * ship all n residuals at once, receive the last position's logits, sample. One
+ * network round-trip per block instead of one per token. */
+static int pipe_coord_prefill(Model *m, sock_t s, const int *ids, int n,
+                              int pos_base, int cut) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *H = (float *)falloc((int64_t)n * D);
+    if (!H) { fprintf(stderr, "error: prefill memory\n"); exit(1); }
+    for (int p = 0; p < n; p++) embed_token(m, ids[p], H + (int64_t)p * D);
+    run_prefill_range(m, H, n, pos_base, 0, cut);
+    PipeHdr hd = { PIPE_MAGIC, PIPE_BATCH, n, pos_base, cut, c->n_layers,
+                   (uint32_t)((int64_t)n * D * (int64_t)sizeof(float)) };
+    int rtok = -1;
+    if (send_all(s, &hd, sizeof(hd)) == 0 && send_all(s, H, hd.nbytes) == 0) {
+        PipeHdr rh;
+        if (recv_all(s, &rh, sizeof(rh)) == 0 && rh.type == PIPE_RES
+            && rh.nbytes == (uint32_t)c->vocab * (uint32_t)sizeof(float)) {
+            float *logits = falloc(c->vocab);
+            if (recv_all(s, logits, rh.nbytes) == 0)
+                rtok = sample_logits(logits, c->vocab);
+            free(logits);
+        }
+    }
+    free(H);
+    m->n_fw += n;
     return rtok;
 }
 
@@ -3129,7 +3185,10 @@ static int pipe_coord_run(Model *m, const char *peer, int cut, int max_tokens) {
 
     double t0 = now_s();
     int last = prompt[0];
-    for (int p = 0; p < n; p++) last = pipe_coord_step(m, s, prompt[p], p, cut);
+    for (int off = 0; off < n; off += 64) {
+        int len = n - off < 64 ? n - off : 64;
+        last = pipe_coord_prefill(m, s, prompt + off, len, off, cut);
+    }
     fprintf(stderr, "prefill %d tokens in %.2fs (next=%d)\n", n, now_s() - t0, last);
 
     int output_ids = 0;
@@ -3305,10 +3364,16 @@ static int service_loop(Model *m, int cap) {
         /* Reuse the prefix: the subsequent positions will be overwritten. */
         pos = (int)keep;
         int next;
-        if (g_pipe_coord) {   /* distributed: prefill sequentially through the worker */
+        if (g_pipe_coord) {   /* distributed: batched prefill through the worker */
+            int batch = 64;
+            { const char *v = getenv("PREFILL_BATCH"); if (v) batch = atoi(v); }
+            if (batch < 1) batch = 1;
             next = ids[0];
-            for (long i = 0; i < n_ids; i++)
-                next = pipe_coord_step(m, g_pipe_sock, ids[i], pos + (int)i, g_pipe_cut);
+            for (long off = 0; off < n_ids; off += batch) {
+                int len = (int)(n_ids - off < batch ? n_ids - off : batch);
+                next = pipe_coord_prefill(m, g_pipe_sock, ids + off, len,
+                                          pos + (int)off, g_pipe_cut);
+            }
         } else {
             next = prefill_tokens(m, ids, (int)n_ids, pos);
         }
