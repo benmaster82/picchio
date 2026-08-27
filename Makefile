@@ -5,9 +5,10 @@ CC      ?= gcc
 CFLAGS  := -O3 -march=native -fopenmp -Wall -Wextra -Wpedantic
 LDFLAGS := -lm -lpthread -fopenmp
 
-# Windows (MinGW): rss_gb uses GetProcessMemoryInfo → needs psapi
+# Windows (MinGW): rss_gb uses GetProcessMemoryInfo → needs psapi;
+# the distributed pipeline mode uses Winsock → needs ws2_32.
 ifeq ($(OS),Windows_NT)
-LDFLAGS += -lpsapi
+LDFLAGS += -lpsapi -lws2_32
 endif
 
 # Sources (in the root, not in c/)

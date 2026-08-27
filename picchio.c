@@ -25,11 +25,18 @@
 #include <limits.h>
 
 #ifdef _WIN32
+#include <winsock2.h>  /* must precede windows.h */
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <psapi.h>     /* GetProcessMemoryInfo for rss_gb */
 #else
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
@@ -2258,13 +2265,11 @@ static void fill_random_qt_f32(QT *t, int O, int I) {
     fill_random_f32(t->qf, (int64_t)O * I);
 }
 
-static int self_test(void) {
-    fprintf(stderr, "── self-test: synthetic mini-model ──\n\n");
-
-    /* Mini configuration: 2 layers, D=64, 4 heads, 2 KV heads, 4 experts, top-2 */
-    static Model m;
-    memset(&m, 0, sizeof(m));
-    Cfg *c = &m.c;
+/* Build a synthetic mini-model (2 layers, D=64, 4 experts) fully resident in RAM.
+ * Shared by the self-test and the pipeline self-test so both exercise the exact
+ * same forward math with no disk or config dependency. */
+static void build_synth_model(Model *m) {
+    Cfg *c = &m->c;
 
     c->hidden = 64;
     c->n_layers = 2;
@@ -2302,15 +2307,15 @@ static int self_test(void) {
             D, c->n_layers, H, KVH, hd, c->n_experts, c->topk, c->vocab);
 
     /* Allocate embedding and lm_head */
-    fill_random_qt_f32(&m.embed, c->vocab, D);
-    fill_random_qt_f32(&m.lm_head, c->vocab, D);
-    m.final_norm = falloc(D);
-    for (int i = 0; i < D; i++) m.final_norm[i] = 1.0f;  /* norms = 1 for the test */
+    fill_random_qt_f32(&m->embed, c->vocab, D);
+    fill_random_qt_f32(&m->lm_head, c->vocab, D);
+    m->final_norm = falloc(D);
+    for (int i = 0; i < D; i++) m->final_norm[i] = 1.0f;  /* norms = 1 for the test */
 
     /* Allocate layers */
-    m.L = calloc(c->n_layers, sizeof(Layer));
+    m->L = calloc(c->n_layers, sizeof(Layer));
     for (int l = 0; l < c->n_layers; l++) {
-        Layer *ly = &m.L[l];
+        Layer *ly = &m->L[l];
         ly->layer_type = c->layer_type[l];
 
         /* RMSNorm weights (all 1.0 for the test) */
@@ -2338,25 +2343,25 @@ static int self_test(void) {
     }
 
     /* KV-cache */
-    kv_init(&m.kv, c->n_layers, KVH, hd, c->ctx_len);
+    kv_init(&m->kv, c->n_layers, KVH, hd, c->ctx_len);
 
     /* Expert cache — for the self-test, preload all experts into RAM */
-    m.ecap = c->n_experts;  /* enough slots for all */
-    m.ecache = calloc(c->n_layers, sizeof(ESlot *));
-    m.ecn = calloc(c->n_layers, sizeof(int));
-    m.pin = calloc(c->n_layers, sizeof(ESlot *));
-    m.npin = calloc(c->n_layers, sizeof(int));
-    m.eusage = calloc(c->n_layers, sizeof(uint32_t *));
-    m.eheat = calloc(c->n_layers, sizeof(uint32_t *));
+    m->ecap = c->n_experts;  /* enough slots for all */
+    m->ecache = calloc(c->n_layers, sizeof(ESlot *));
+    m->ecn = calloc(c->n_layers, sizeof(int));
+    m->pin = calloc(c->n_layers, sizeof(ESlot *));
+    m->npin = calloc(c->n_layers, sizeof(int));
+    m->eusage = calloc(c->n_layers, sizeof(uint32_t *));
+    m->eheat = calloc(c->n_layers, sizeof(uint32_t *));
 
     for (int l = 0; l < c->n_layers; l++) {
-        m.ecache[l] = calloc(m.ecap, sizeof(ESlot));
-        m.ecn[l] = c->n_experts;  /* all preloaded */
-        m.eusage[l] = calloc(c->n_experts, sizeof(uint32_t));
-        m.eheat[l] = calloc(c->n_experts, sizeof(uint32_t));
+        m->ecache[l] = calloc(m->ecap, sizeof(ESlot));
+        m->ecn[l] = c->n_experts;  /* all preloaded */
+        m->eusage[l] = calloc(c->n_experts, sizeof(uint32_t));
+        m->eheat[l] = calloc(c->n_experts, sizeof(uint32_t));
 
         for (int e = 0; e < c->n_experts; e++) {
-            ESlot *es = &m.ecache[l][e];
+            ESlot *es = &m->ecache[l][e];
             es->eid = e;
             es->layer = l;
             /* gate_up fused: [moe_inter, D] */
@@ -2372,6 +2377,17 @@ static int self_test(void) {
     }
 
     fprintf(stderr, "  structures allocated ✓\n");
+}
+
+static int self_test(void) {
+    fprintf(stderr, "── self-test: synthetic mini-model ──\n\n");
+
+    /* Mini configuration: 2 layers, D=64, 4 heads, 2 KV heads, 4 experts, top-2 */
+    static Model m;
+    memset(&m, 0, sizeof(m));
+    Cfg *c = &m.c;
+
+    build_synth_model(&m);
 
     /* ── Forward pass: 8 tokens ── */
     fprintf(stderr, "  forward pass: 8 tokens...\n");
@@ -2893,6 +2909,293 @@ static int read_token_ids_file(const char *path, int max_tokens, int **out_ids) 
     return n;
 }
 
+/* ═══════════════════════════════════════════════════════════
+ *  DISTRIBUTED PIPELINE (Step 2): long-lived TCP stages
+ *
+ *  A model split at a layer boundary. The coordinator (stage A) owns layers
+ *  [0, cut): it embeds the token, runs run_layer_range, and ships the residual
+ *  stream (D floats) to the worker (stage B), which owns [cut, n_layers), resumes
+ *  the forward, applies the head, samples, and returns the token. The residual is
+ *  the only thing on the wire; each stage keeps its own layers' KV locally, so the
+ *  result is byte-identical to a single node (pipe_self_test proves it over a real
+ *  loopback socket). In this step both nodes load the full model and each runs its
+ *  own layer range; loading only the owned layers (the RAM-pooling win) is Step 2b.
+ * ═══════════════════════════════════════════════════════════ */
+
+#ifdef _WIN32
+typedef SOCKET sock_t;
+#define BADSOCK INVALID_SOCKET
+static void net_init(void) { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }
+static void net_close(sock_t s) { closesocket(s); }
+#else
+typedef int sock_t;
+#define BADSOCK (-1)
+static void net_init(void) {}
+static void net_close(sock_t s) { close(s); }
+#endif
+
+#define PIPE_MAGIC 0x32504350u   /* 'PCP2' */
+enum { PIPE_FWD = 1, PIPE_RES = 2 };
+
+typedef struct {
+    uint32_t magic;
+    uint32_t type;
+    int32_t  seq;
+    int32_t  pos;
+    int32_t  lo;
+    int32_t  hi;
+    uint32_t nbytes;
+} PipeHdr;
+
+static void nodelay(sock_t s) {
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+}
+
+static int send_all(sock_t s, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    while (n) {
+        int chunk = (int)(n > (1u << 20) ? (1u << 20) : n);
+        int r = send(s, p, chunk, 0);
+        if (r <= 0) return -1;
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+
+static int recv_all(sock_t s, void *buf, size_t n) {
+    char *p = (char *)buf;
+    while (n) {
+        int chunk = (int)(n > (1u << 20) ? (1u << 20) : n);
+        int r = recv(s, p, chunk, 0);
+        if (r <= 0) return -1;
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+
+static sock_t tcp_listen(int port) {
+    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == BADSOCK) return BADSOCK;
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    struct sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons((unsigned short)port);
+    if (bind(s, (struct sockaddr *)&a, sizeof(a)) != 0) { net_close(s); return BADSOCK; }
+    if (listen(s, 4) != 0) { net_close(s); return BADSOCK; }
+    return s;
+}
+
+static sock_t tcp_connect(const char *host, int port) {
+    char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return BADSOCK;
+    sock_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == BADSOCK) { freeaddrinfo(res); return BADSOCK; }
+    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+        net_close(s); freeaddrinfo(res); return BADSOCK;
+    }
+    freeaddrinfo(res);
+    nodelay(s);
+    return s;
+}
+
+/* Worker (stage B): serve one connection until it closes. For each residual
+ * received, run layers [hdr.lo, hdr.hi), apply the head, sample, return the token. */
+static void pipe_worker_serve(Model *m, sock_t conn) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *h = falloc(D);
+    float *logits = falloc(c->vocab);
+    nodelay(conn);
+    for (;;) {
+        PipeHdr hd;
+        if (recv_all(conn, &hd, sizeof(hd)) != 0) break;
+        if (hd.magic != PIPE_MAGIC || hd.type != PIPE_FWD) break;
+        if (hd.nbytes != (uint32_t)D * (uint32_t)sizeof(float)) break;
+        if (recv_all(conn, h, hd.nbytes) != 0) break;
+        run_layer_range(m, h, hd.pos, hd.lo, hd.hi);
+        forward_head_logits(m, h, logits);
+        int32_t tok = sample_logits(logits, c->vocab);
+        PipeHdr rh = { PIPE_MAGIC, PIPE_RES, hd.seq, hd.pos, hd.lo, hd.hi,
+                       (uint32_t)sizeof(int32_t) };
+        if (send_all(conn, &rh, sizeof(rh)) != 0) break;
+        if (send_all(conn, &tok, sizeof(tok)) != 0) break;
+        m->n_fw++;
+    }
+    free(h); free(logits);
+}
+
+/* Coordinator (stage A): embed + run layers [0, cut), ship the residual, get the
+ * sampled token back from the worker. Returns the sampled token (or -1 on error). */
+static int pipe_coord_step(Model *m, sock_t s, int tok, int pos, int cut) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *h = falloc(D);
+    embed_token(m, tok, h);
+    run_layer_range(m, h, pos, 0, cut);
+    PipeHdr hd = { PIPE_MAGIC, PIPE_FWD, pos, pos, cut, c->n_layers,
+                   (uint32_t)D * (uint32_t)sizeof(float) };
+    int32_t rtok = -1;
+    if (send_all(s, &hd, sizeof(hd)) == 0 && send_all(s, h, hd.nbytes) == 0) {
+        PipeHdr rh;
+        if (recv_all(s, &rh, sizeof(rh)) == 0 && rh.type == PIPE_RES)
+            recv_all(s, &rtok, sizeof(rtok));
+    }
+    free(h);
+    m->n_fw++;
+    return rtok;
+}
+
+/* Coordinator run: raw-ID prompt (INPUT or INPUT_FILE) -> sequential distributed
+ * prefill -> decode, printing token IDs (the Python bridge owns any rendering). */
+static int pipe_coord_run(Model *m, const char *peer, int cut, int max_tokens) {
+    Cfg *c = &m->c;
+    char host[256] = "127.0.0.1"; int port = 52200;
+    { const char *colon = strrchr(peer, ':');
+      if (colon) {
+          size_t hl = (size_t)(colon - peer);
+          if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+          memcpy(host, peer, hl); host[hl] = '\0';
+          port = atoi(colon + 1);
+      } else { strncpy(host, peer, sizeof(host) - 1); } }
+
+    int stackbuf[8192]; int *prompt = stackbuf; int owned = 0, n = 0;
+    const char *input_file = getenv("INPUT_FILE");
+    if (input_file && *input_file) {
+        n = read_token_ids_file(input_file, c->ctx_len, &prompt);
+        if (n < 0) return 1;
+        owned = 1;
+    } else {
+        const char *in = getenv("INPUT");
+        if (in) { const char *p = in;
+            while (*p && n < 8192) {
+                while (*p == ' ' || *p == '\n' || *p == '\t') p++;
+                if (!*p) break;
+                prompt[n++] = (int)strtol(p, (char **)&p, 10);
+            } }
+    }
+    if (n == 0) {
+        fprintf(stderr, "pipe coord: empty prompt (set INPUT or INPUT_FILE)\n");
+        if (owned) free(prompt);
+        return 1;
+    }
+
+    net_init();
+    sock_t s = tcp_connect(host, port);
+    if (s == BADSOCK) {
+        fprintf(stderr, "pipe coord: cannot connect to %s:%d\n", host, port);
+        if (owned) free(prompt);
+        return 1;
+    }
+    fprintf(stderr, "pipe coord (stage A): connected to %s:%d · cut@%d · "
+            "layers [0,%d) here, [%d,%d) on the worker · %d prompt tokens\n",
+            host, port, cut, cut, cut, c->n_layers, n);
+
+    double t0 = now_s();
+    int last = prompt[0];
+    for (int p = 0; p < n; p++) last = pipe_coord_step(m, s, prompt[p], p, cut);
+    fprintf(stderr, "prefill %d tokens in %.2fs (next=%d)\n", n, now_s() - t0, last);
+
+    int output_ids = 0;
+    { const char *v = getenv("OUTPUT"); if (v && strcmp(v, "ids") == 0) output_ids = 1; }
+    int pos = n, tok = last;
+    for (int i = 0; i < max_tokens; i++) {
+        if (output_ids) { printf("%d\n", tok); fflush(stdout); }
+        else { printf("[%d]", tok); fflush(stdout); }
+        if (tok == c->stop_ids[0]) break;
+        tok = pipe_coord_step(m, s, tok, pos, cut);
+        if (tok < 0) { fprintf(stderr, "\npipe coord: worker dropped\n"); break; }
+        pos++;
+        m->n_emit++;
+    }
+    printf("\n");
+    net_close(s);
+    if (owned) free(prompt);
+    return 0;
+}
+
+/* Loopback self-test: a worker thread and the coordinator on one machine, over a
+ * real TCP socket, must produce the same tokens as a single-node forward. */
+typedef struct { Model *m; sock_t ls; } PipeThreadArg;
+
+#ifdef _WIN32
+static DWORD WINAPI pipe_worker_thread(LPVOID arg) {
+#else
+static void *pipe_worker_thread(void *arg) {
+#endif
+    PipeThreadArg *a = (PipeThreadArg *)arg;
+    sock_t conn = accept(a->ls, NULL, NULL);
+    if (conn != BADSOCK) { pipe_worker_serve(a->m, conn); net_close(conn); }
+    net_close(a->ls);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static int pipe_self_test(void) {
+    fprintf(stderr, "── pipeline self-test: 2 TCP stages over loopback ──\n\n");
+    net_init();
+    static Model m;
+    memset(&m, 0, sizeof(m));
+    Cfg *c = &m.c;
+    build_synth_model(&m);
+
+    g_temperature = 0.0f;   /* greedy argmax: deterministic on both paths */
+    g_rep_penalty = 1.0f;
+
+    int cut = c->n_layers / 2; if (cut < 1) cut = 1;
+    int port = 52190;
+    sock_t ls = tcp_listen(port);
+    if (ls == BADSOCK) { fprintf(stderr, "  ✗ cannot listen on %d\n", port); return 1; }
+
+    PipeThreadArg arg = { &m, ls };
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, pipe_worker_thread, &arg, 0, NULL);
+    if (!th) { fprintf(stderr, "  ✗ cannot start worker thread\n"); return 1; }
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, pipe_worker_thread, &arg) != 0) {
+        fprintf(stderr, "  ✗ cannot start worker thread\n"); return 1; }
+#endif
+
+    sock_t s = tcp_connect("127.0.0.1", port);
+    if (s == BADSOCK) { fprintf(stderr, "  ✗ coordinator cannot connect\n"); return 1; }
+
+    fprintf(stderr, "  stage A [0,%d)  ──residual over TCP──▶  stage B [%d,%d)\n\n",
+            cut, cut, c->n_layers);
+
+    int tks[6] = {1, 5, 3, 12, 7, 2};
+    int mism = 0;
+    for (int i = 0; i < 6; i++) {
+        int mono = forward_token(&m, tks[i], i);            /* single-node reference */
+        int dist = pipe_coord_step(&m, s, tks[i], i, cut);  /* distributed */
+        fprintf(stderr, "    pos=%d tok=%d  mono=%d  dist=%d  %s\n",
+                i, tks[i], mono, dist, mono == dist ? "ok" : "MISMATCH");
+        if (mono != dist) mism++;
+    }
+    net_close(s);
+#ifdef _WIN32
+    WaitForSingleObject(th, 2000); CloseHandle(th);
+#else
+    pthread_join(th, NULL);
+#endif
+
+    if (mism) {
+        fprintf(stderr, "\n  ✗ %d/6 tokens differ between mono and distributed\n", mism);
+        return 1;
+    }
+    fprintf(stderr, "\n── pipeline self-test PASSED ──\n");
+    fprintf(stderr, "  distributed tokens == single-node, over a real socket.\n\n");
+    return 0;
+}
+
 /* ── Service mode: persistent multi-turn session over a pipe ──
  * stdout contains only the protocol, stderr only diagnostics.
  * Invariant: every emitted TOKEN is also consumed by the forward pass, so
@@ -3016,6 +3319,10 @@ int main(int argc, char **argv) {
     /* ── Self-test mode ── */
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
         return self_test();
+    }
+    /* ── Pipeline self-test (2 TCP stages over loopback, synthetic model) ── */
+    if (argc > 1 && strcmp(argv[1], "--pipe-self-test") == 0) {
+        return pipe_self_test();
     }
 
     const char *model_path = getenv("MODEL");
@@ -3282,6 +3589,54 @@ int main(int argc, char **argv) {
 
     /* ── 6. Generation ── */
     fprintf(stderr, "\n");
+
+    /* Distributed pipeline mode: this process is one stage of a 2-machine split.
+     * PIPE_ROLE=worker  -> stage B: accept a coordinator, run its requested layer
+     *                      range + head, return tokens (long-lived).
+     * PIPE_ROLE=coord   -> stage A: connect to PIPE_PEER (host:port), run
+     *                      embed + layers [0,PIPE_CUT), stream residuals, decode.
+     * Both load the full model here (Step 2); loading only the owned layers is
+     * the next step. The worker is stateless about the cut: the coordinator names
+     * the layer range in every message. */
+    { const char *prole = getenv("PIPE_ROLE");
+      if (prole && strcmp(prole, "worker") == 0) {
+        net_init();
+        int port = 52200;
+        { const char *v = getenv("PIPE_PORT"); if (v) port = atoi(v); }
+        sock_t ls = tcp_listen(port);
+        if (ls == BADSOCK) {
+            fprintf(stderr, "pipe worker: cannot listen on port %d\n", port);
+            st_close(&db); return 1;
+        }
+        fprintf(stderr, "pipe worker (stage B): listening on port %d "
+                "(full model resident; runs the range the coordinator requests)\n", port);
+        for (;;) {
+            sock_t conn = accept(ls, NULL, NULL);
+            if (conn == BADSOCK) break;
+            fprintf(stderr, "pipe worker: coordinator connected\n");
+            pipe_worker_serve(&m, conn);
+            net_close(conn);
+            fprintf(stderr, "pipe worker: coordinator disconnected, waiting\n");
+        }
+        net_close(ls);
+        stats_dump(&m); hotstore_save(&m); pilot_shutdown();
+        if (has_tokenizer) tok_free(&tok);
+        st_close(&db);
+        return 0;
+      }
+      if (prole && strcmp(prole, "coord") == 0) {
+        const char *peer = getenv("PIPE_PEER");
+        if (!peer) peer = "127.0.0.1:52200";
+        int cut = c->n_layers / 2;
+        { const char *v = getenv("PIPE_CUT"); if (v) cut = atoi(v); }
+        if (cut < 1) cut = 1;
+        if (cut >= c->n_layers) cut = c->n_layers - 1;
+        int rc = pipe_coord_run(&m, peer, cut, max_tokens);
+        stats_dump(&m); hotstore_save(&m); pilot_shutdown();
+        if (has_tokenizer) tok_free(&tok);
+        st_close(&db);
+        return rc;
+      } }
 
     /* Service mode: persistent session, no prompt/decode in C. */
     { const char *v = getenv("SERVICE");

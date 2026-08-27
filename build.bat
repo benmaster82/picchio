@@ -17,7 +17,8 @@ REM -mavx2 -mfma enable the SIMD paths of quant.h, guarded by #ifdef __AVX2__:
 REM without these flags the kernels use only scalar code. Requires a CPU with AVX2.
 REM -static produces a self-contained executable: it does not need libgomp-1.dll
 REM or libwinpthread-1.dll at runtime, so picchio.exe runs even without MinGW on PATH.
-"%GCC%" -O2 -Wall -fopenmp -mavx2 -mfma -Wno-misleading-indentation -Wno-unused-function -static -Wl,--stack,8388608 -o picchio.exe picchio.c -lm -lpsapi
+REM -lws2_32: Winsock, for the distributed pipeline mode (TCP stages).
+"%GCC%" -O2 -Wall -fopenmp -mavx2 -mfma -Wno-misleading-indentation -Wno-unused-function -static -Wl,--stack,8388608 -o picchio.exe picchio.c -lm -lpsapi -lws2_32
 if %ERRORLEVEL% NEQ 0 (
     echo Build error.
     exit /b 1
