@@ -3021,7 +3021,9 @@ static sock_t tcp_connect(const char *host, int port) {
 }
 
 /* Worker (stage B): serve one connection until it closes. For each residual
- * received, run layers [hdr.lo, hdr.hi), apply the head, sample, return the token. */
+ * received, run layers [hdr.lo, hdr.hi), apply the head, and return the LOGITS.
+ * Sampling stays on the coordinator, the single authority for temperature, seed
+ * and repetition history — so the distributed output matches a single node. */
 static void pipe_worker_serve(Model *m, sock_t conn) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -3042,18 +3044,17 @@ static void pipe_worker_serve(Model *m, sock_t conn) {
         if (recv_all(conn, h, hd.nbytes) != 0) break;
         run_layer_range(m, h, hd.pos, hd.lo, hd.hi);
         forward_head_logits(m, h, logits);
-        int32_t tok = sample_logits(logits, c->vocab);
         PipeHdr rh = { PIPE_MAGIC, PIPE_RES, hd.seq, hd.pos, hd.lo, hd.hi,
-                       (uint32_t)sizeof(int32_t) };
+                       (uint32_t)c->vocab * (uint32_t)sizeof(float) };
         if (send_all(conn, &rh, sizeof(rh)) != 0) break;
-        if (send_all(conn, &tok, sizeof(tok)) != 0) break;
+        if (send_all(conn, logits, rh.nbytes) != 0) break;
         m->n_fw++;
     }
     free(h); free(logits);
 }
 
-/* Coordinator (stage A): embed + run layers [0, cut), ship the residual, get the
- * sampled token back from the worker. Returns the sampled token (or -1 on error). */
+/* Coordinator (stage A): embed + run layers [0, cut), ship the residual, receive
+ * the logits from the worker, and sample locally. Returns the token (or -1). */
 static int pipe_coord_step(Model *m, sock_t s, int tok, int pos, int cut) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -3062,11 +3063,16 @@ static int pipe_coord_step(Model *m, sock_t s, int tok, int pos, int cut) {
     run_layer_range(m, h, pos, 0, cut);
     PipeHdr hd = { PIPE_MAGIC, PIPE_FWD, pos, pos, cut, c->n_layers,
                    (uint32_t)D * (uint32_t)sizeof(float) };
-    int32_t rtok = -1;
+    int rtok = -1;
     if (send_all(s, &hd, sizeof(hd)) == 0 && send_all(s, h, hd.nbytes) == 0) {
         PipeHdr rh;
-        if (recv_all(s, &rh, sizeof(rh)) == 0 && rh.type == PIPE_RES)
-            recv_all(s, &rtok, sizeof(rtok));
+        if (recv_all(s, &rh, sizeof(rh)) == 0 && rh.type == PIPE_RES
+            && rh.nbytes == (uint32_t)c->vocab * (uint32_t)sizeof(float)) {
+            float *logits = falloc(c->vocab);
+            if (recv_all(s, logits, rh.nbytes) == 0)
+                rtok = sample_logits(logits, c->vocab);
+            free(logits);
+        }
     }
     free(h);
     m->n_fw++;
@@ -3645,6 +3651,25 @@ int main(int argc, char **argv) {
     /* ── 6. Generation ── */
     fprintf(stderr, "\n");
 
+    /* Diagnostic: run the split byte-identity check ON THE REAL MODEL in a single
+     * process (mono vs run_layer_range[0,cut)+[cut,L), same memory, no network).
+     * This isolates a split-math bug (DIFFER) from a network/process bug (IDENTICAL). */
+    { const char *v = getenv("PIPE_SPLIT_CHECK");
+      if (v) {
+        int cut = atoi(v);
+        if (cut < 1) cut = 1;
+        if (cut >= c->n_layers) cut = c->n_layers - 1;
+        g_temperature = 0.0f; g_rep_penalty = 1.0f;
+        int toks[4] = {1, 15496, 100, 2323};
+        for (int i = 0; i < 4; i++) {
+            int ok = pipe_split_check(&m, toks[i], i, cut);
+            fprintf(stderr, "PIPE_SPLIT_CHECK tok=%d pos=%d cut=%d: %s\n",
+                    toks[i], i, cut, ok ? "IDENTICAL" : "DIFFER");
+        }
+        st_close(&db);
+        return 0;
+      } }
+
     /* Distributed pipeline mode: this process is one stage of a 2-machine split.
      * PIPE_ROLE=worker  -> stage B: accept a coordinator, run its requested layer
      *                      range + head, return tokens (long-lived).
@@ -3664,7 +3689,8 @@ int main(int argc, char **argv) {
             st_close(&db); return 1;
         }
         fprintf(stderr, "pipe worker (stage B): listening on port %d "
-                "(full model resident; runs the range the coordinator requests)\n", port);
+                "(owns layers [%d,%d) + head; returns logits, coordinator samples)\n",
+                port, g_pipe_lo, g_pipe_hi);
         for (;;) {
             sock_t conn = accept(ls, NULL, NULL);
             if (conn == BADSOCK) break;
