@@ -3855,6 +3855,16 @@ int main(int argc, char **argv) {
                 g_io_threads > 1 ? "parallel reads" : "serial");
     }
 
+    /* IDOT=1: faster integer expert kernel (INT8 activation × INT4 weight, AVX2).
+     * Approximate (activation quantized to int8), so opt-in; F32 stays default. */
+    {
+        const char *v = getenv("IDOT");
+        if (v && atoi(v) != 0) {
+            quant_set_idot(1);
+            fprintf(stderr, "expert kernel: IDOT (int8×int4 integer dot, AVX2)\n");
+        }
+    }
+
     /* Prefetch → LRU (PREFETCH=1, historical alias PILOT=1). Predicts the next
      * layer's experts (post-MoE proxy) and loads them during the attention. */
     {

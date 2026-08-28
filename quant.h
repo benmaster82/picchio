@@ -318,6 +318,87 @@ static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
     }
 }
 
+/* ── Matmul INT4 gs64, IDOT path: INT8-quantized activation × INT4 weight ──
+ * Faster CPU kernel for the group-scaled INT4 experts. Instead of dequantizing
+ * the weights to F32 and doing F32 FMA, it quantizes the activation to INT8 once
+ * per group (shared across all output rows) and runs an *integer* dot with AVX2
+ * (maddubs/madd), accumulating in int32, then scales by (act_scale·weight_scale).
+ * INT4 weights (|w| ≤ 8) keep the int16 partials well within range. This is an
+ * approximation of the exact F32 path (the activation is quantized to int8), so
+ * it is opt-in via IDOT=1 and the F32 path stays the default oracle. On AVX2 it
+ * roughly halves the expert matmul time (2× the MACs/instruction, no int→float). */
+static void matmul_i4_gs_idot(float *y, const float *x, const uint8_t *q4,
+                              const float *scale, int S, int I, int O, int gs) {
+    int rb = (I + 1) / 2;
+    int n_groups = (I + gs - 1) / gs;
+    int8_t *xq = (int8_t *)malloc((size_t)I);
+    float  *ax = (float *)malloc((size_t)n_groups * sizeof(float));
+    if (!xq || !ax) { free(xq); free(ax);
+        matmul_i4_gs(y, x, q4, scale, S, I, O, gs); return; }
+
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (int64_t)s * I;
+        /* Quantize the activation to int8, one scale per group. */
+        for (int g = 0; g < n_groups; g++) {
+            int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
+            float amax = 0;
+            for (int i = g0; i < g1; i++) { float a = fabsf(xs[i]); if (a > amax) amax = a; }
+            float axg = amax / 127.f; if (axg < 1e-12f) axg = 1e-12f;
+            ax[g] = axg;
+            float inv = 1.f / axg;
+            for (int i = g0; i < g1; i++) {
+                int v = (int)lrintf(xs[i] * inv);
+                if (v > 127) v = 127; if (v < -128) v = -128;
+                xq[i] = (int8_t)v;
+            }
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *w = q4 + (int64_t)o * rb;
+            const float *sc = scale + (int64_t)o * n_groups;
+            float a = 0.f;
+            for (int g = 0; g < n_groups; g++) {
+                int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
+                int idot = 0, i = g0;
+#ifdef __AVX2__
+                __m256i acc = _mm256_setzero_si256();
+                const __m256i ones = _mm256_set1_epi16(1);
+                const __m128i m0f  = _mm_set1_epi8(0x0F);
+                const __m256i c8   = _mm256_set1_epi8(8);
+                for (; i + 32 <= g1; i += 32) {
+                    __m128i by  = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
+                    __m128i lo4 = _mm_and_si128(by, m0f);
+                    __m128i hi4 = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
+                    __m256i w8  = _mm256_set_m128i(_mm_unpackhi_epi8(lo4, hi4),
+                                                   _mm_unpacklo_epi8(lo4, hi4));
+                    w8 = _mm256_sub_epi8(w8, c8);                 /* nibble - 8 → [-8,7] */
+                    __m256i y8  = _mm256_loadu_si256((const __m256i *)(xq + i));
+                    __m256i axv = _mm256_sign_epi8(w8, w8);       /* |w| (unsigned) */
+                    __m256i syv = _mm256_sign_epi8(y8, w8);       /* xq·sign(w) */
+                    __m256i p   = _mm256_maddubs_epi16(axv, syv); /* Σ pairs → int16 */
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+                }
+                idot += hsum256_i32(acc);
+#endif
+                for (; i < g1; i += 2) {
+                    uint8_t by = w[i >> 1];
+                    idot += (int)xq[i] * ((int)(by & 0xF) - 8);
+                    if (i + 1 < g1) idot += (int)xq[i + 1] * ((int)(by >> 4) - 8);
+                }
+                a += (float)idot * ax[g] * sc[g];
+            }
+            y[(int64_t)s * O + o] = a;
+        }
+    }
+    free(xq); free(ax);
+}
+
+/* IDOT toggle (opt-in via IDOT=1): the integer expert kernel is approximate, so
+ * the exact F32 path stays the default and the oracle/self-test reference. */
+static int q_idot_enabled = 0;
+static inline void quant_set_idot(int v) { q_idot_enabled = v; }
+
 /* ── Dispatcher: picks the kernel based on the format ── */
 
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
@@ -325,9 +406,12 @@ static void matmul_qt(float *y, const float *x, QT *w, int S) {
     if (w->fmt == 1) { matmul_q8(y, x, w->q8, w->s, S, w->I, w->O); return; }
     if (w->fmt == 2) {
         /* If block_size > 0, use group-scaled */
-        if (w->block_size > 0)
-            matmul_i4_gs(y, x, w->q4, w->s, S, w->I, w->O, w->block_size);
-        else
+        if (w->block_size > 0) {
+            if (q_idot_enabled)
+                matmul_i4_gs_idot(y, x, w->q4, w->s, S, w->I, w->O, w->block_size);
+            else
+                matmul_i4_gs(y, x, w->q4, w->s, S, w->I, w->O, w->block_size);
+        } else
             matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
         return;
     }

@@ -661,6 +661,28 @@ without a per-layer sync. Remaining levers, in ROI order: keep the whole layer
 on-GPU to kill the per-layer sync; pinned-memory + overlapped uploads; a single
 batched kernel over the K experts to cut launches; INT8 dp4a kernels.
 
+### 0.17 CPU integer expert kernel (IDOT) — correct, but not a win here
+
+An INT8-activation × INT4-weight integer kernel (`matmul_i4_gs_idot` in `quant.h`,
+opt-in via `IDOT=1`) was added for the group-scaled experts: it quantizes the
+activation to int8 once per group and runs an AVX2 integer dot (`sign`/`maddubs`/
+`madd`, int32 accumulation) instead of dequantizing the weights to F32. It is
+**numerically faithful** (greedy output identical to the F32 path), but on the
+i5-10500H (Comet Lake, 6-core, AVX2 only — **no AVX-512/VNNI**) it did **not**
+beat the existing F32 kernel: `t_moe` 46 vs 43 s on the 20B. The sign-trick
+instruction chain (latency-exposed on the short 64-element groups) plus the
+serial per-group activation quantization offset the higher integer MAC throughput,
+and picchio's F32 `matmul_i4_gs` is already well vectorized. Kept opt-in and off
+by default (the F32 path stays the oracle) because the technique is sound and may
+pay off on other CPUs or with further tuning (hoisted constants, deferred int32
+promotion, quantizing the activation once for all K experts, and — where
+available — VNNI `dpbusd`). The one confirmed CPU win on this hardware was
+prosaic: a larger RAM expert cache (`PIN_GB` 4 → 9 lifted the 20B hit rate
+72 % → 90 %, disk 27 → 11 s, ~10 % faster), with `threads = 6` (hyper-threading
+at 12 was slower). The 120B stays disk-bound on a USB SSD (~70 % of wall is expert
+reads), where neither the GPU nor the integer kernel helps — only faster storage
+or a bigger RAM cache does.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture
