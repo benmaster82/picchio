@@ -830,7 +830,12 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         s->gu.I = D;
         int64_t rb = (int64_t)I * ((D + 1) / 2);
         s->gu.q4 = (uint8_t *)malloc(rb);
-        st_read_raw(g_db, t_gu, s->gu.q4, rb);
+        if (!s->gu.q4 || st_read_raw(g_db, t_gu, s->gu.q4, rb) != rb) {
+            /* Short/failed read (I/O pressure) would leave the tail garbage:
+             * drop the expert rather than compute with corrupt weights. */
+            free(gu_f32); free(s->gu.q4); s->gu.q4 = NULL;
+            s->eid = -1; return;
+        }
         /* Look for scales */
         snprintf(name, sizeof(name),
                  "model.layers.%d.mlp.experts.gate_up_proj.%d.qs", layer, eid);
@@ -913,7 +918,16 @@ gate_up_loaded:
             s->d.I = down_I;
             int64_t rb = (int64_t)D * ((down_I + 1) / 2);
             s->d.q4 = (uint8_t *)malloc(rb);
-            st_read_raw(g_db, t_d, s->d.q4, rb);
+            if (!s->d.q4 || st_read_raw(g_db, t_d, s->d.q4, rb) != rb) {
+                /* gate_up already loaded: free it too, since an eid=-1 slot is
+                 * skipped by the cache's guarded free and would otherwise leak. */
+                free(d_f32); free(s->d.q4); s->d.q4 = NULL;
+                free(s->gu.qf); s->gu.qf = NULL;
+                free(s->gu.q4); s->gu.q4 = NULL;
+                free(s->gu.s);  s->gu.s = NULL;
+                free(s->gu_bias); s->gu_bias = NULL;
+                s->eid = -1; return;
+            }
             snprintf(name, sizeof(name),
                      "model.layers.%d.mlp.experts.down_proj.%d.qs", layer, eid);
             StTensor *t_ds = st_find(g_db, name);
@@ -3363,6 +3377,19 @@ static int service_loop(Model *m, int cap) {
 
         /* Reuse the prefix: the subsequent positions will be overwritten. */
         pos = (int)keep;
+
+        /* Reset the repetition-penalty history at the start of every turn.
+         * The persistent chat never sends RESET (it reuses the KV prefix via
+         * `keep`), so without this g_history would accumulate across turns —
+         * and prefill_tokens re-seeds it with the whole re-rendered prompt each
+         * turn, so the fixed 4096-token buffer saturates after a few turns and
+         * the penalty poisons sampling (output degrades ~turn 3, sooner on the
+         * 120B whose prompts are longer). Clearing it here makes the penalty
+         * scope this turn's prompt delta plus its generated tokens, which is the
+         * intended "penalize repeating the current context" behavior. Done only
+         * after validation passed, so a rejected turn leaves the session intact. */
+        g_history_len = 0;
+
         int next;
         if (g_pipe_coord) {   /* distributed: batched prefill through the worker */
             int batch = 64;

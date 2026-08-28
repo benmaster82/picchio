@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <errno.h>
 #endif
 
 /* ── Constants ── */
@@ -368,6 +369,46 @@ static StTensor *st_find_prefix(StDB *db, const char *prefix, const char *suffix
     return st_find(db, full);
 }
 
+/* ── Robust positioned read ──────────────────────────────────────────────
+ * Loops until `nbytes` bytes are read, or a genuine EOF/error stops it early.
+ * A single ReadFile/pread is NOT guaranteed to transfer the whole request: on
+ * Windows an OVERLAPPED ReadFile can short-read, and under I/O pressure (e.g. a
+ * USB-bridged external SSD) large reads may return fewer bytes or fail. Large
+ * requests are chunked for the same reason. Returns the number of bytes actually
+ * read; callers MUST compare it against the expected size, because a short read
+ * leaves the tail of `dst` UNINITIALIZED — using it feeds garbage weights into
+ * the model (observed as output that degrades as more experts stream in). */
+#ifdef _WIN32
+static int64_t st_pread_full(HANDLE h, void *dst, int64_t nbytes, int64_t abs_offset) {
+    int64_t done = 0;
+    while (done < nbytes) {
+        int64_t want = nbytes - done;
+        if (want > (int64_t)0x02000000) want = 0x02000000;  /* 32 MiB chunks */
+        int64_t off = abs_offset + done;
+        OVERLAPPED ov = {0};
+        ov.Offset     = (DWORD)(off & 0xFFFFFFFF);
+        ov.OffsetHigh = (DWORD)(off >> 32);
+        DWORD rd = 0;
+        if (!ReadFile(h, (char *)dst + done, (DWORD)want, &rd, &ov)) break;  /* error */
+        if (rd == 0) break;  /* EOF */
+        done += rd;
+    }
+    return done;
+}
+#else
+static int64_t st_pread_full(int fd, void *dst, int64_t nbytes, int64_t abs_offset) {
+    int64_t done = 0;
+    while (done < nbytes) {
+        ssize_t rd = pread(fd, (char *)dst + done, (size_t)(nbytes - done),
+                           abs_offset + done);
+        if (rd < 0) { if (errno == EINTR) continue; break; }  /* error */
+        if (rd == 0) break;  /* EOF */
+        done += rd;
+    }
+    return done;
+}
+#endif
+
 /* ── Read the raw data of a tensor (pread) ── */
 
 static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) {
@@ -378,14 +419,9 @@ static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) 
     int64_t abs_offset = sf->data_offset + t->offset_start;
 
 #ifdef _WIN32
-    OVERLAPPED ov = {0};
-    ov.Offset = (DWORD)(abs_offset & 0xFFFFFFFF);
-    ov.OffsetHigh = (DWORD)(abs_offset >> 32);
-    DWORD rd;
-    ReadFile(st_win_handle(sf, t->file_idx), dst, (DWORD)nbytes, &rd, &ov);
-    return (int64_t)rd;
+    return st_pread_full(st_win_handle(sf, t->file_idx), dst, nbytes, abs_offset);
 #else
-    return pread(sf->fd, dst, nbytes, abs_offset);
+    return st_pread_full(sf->fd, dst, nbytes, abs_offset);
 #endif
 }
 
@@ -398,14 +434,9 @@ static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
     if (nbytes > total - byte_offset) nbytes = total - byte_offset;
     int64_t abs_offset = sf->data_offset + t->offset_start + byte_offset;
 #ifdef _WIN32
-    OVERLAPPED ov = {0};
-    ov.Offset = (DWORD)(abs_offset & 0xFFFFFFFF);
-    ov.OffsetHigh = (DWORD)(abs_offset >> 32);
-    DWORD rd = 0;
-    if (!ReadFile(st_win_handle(sf, t->file_idx), dst, (DWORD)nbytes, &rd, &ov)) return -1;
-    return (int64_t)rd;
+    return st_pread_full(st_win_handle(sf, t->file_idx), dst, nbytes, abs_offset);
 #else
-    return pread(sf->fd, dst, nbytes, abs_offset);
+    return st_pread_full(sf->fd, dst, nbytes, abs_offset);
 #endif
 }
 
@@ -425,14 +456,9 @@ static int64_t st_read_coalesced(StDB *db, StTensor *t_first, StTensor *t_last,
     int64_t abs_offset = sf->data_offset + start;
 
 #ifdef _WIN32
-    OVERLAPPED ov = {0};
-    ov.Offset = (DWORD)(abs_offset & 0xFFFFFFFF);
-    ov.OffsetHigh = (DWORD)(abs_offset >> 32);
-    DWORD rd;
-    ReadFile(sf->hFile, dst, (DWORD)nbytes, &rd, &ov);
-    return (int64_t)rd;
+    return st_pread_full(sf->hFile, dst, nbytes, abs_offset);
 #else
-    return pread(sf->fd, dst, nbytes, abs_offset);
+    return st_pread_full(sf->fd, dst, nbytes, abs_offset);
 #endif
 }
 

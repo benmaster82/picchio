@@ -188,7 +188,7 @@ class HarmonyChat:
         return self.encoding.render_conversation_for_completion(
             Conversation.from_messages(messages), Role.ASSISTANT, KEEP_ANALYSIS)
 
-    def ask(self, user_text, max_new, show_channel="final", live=True):
+    def ask(self, user_text, max_new, live=True):
         full = self.render(user_text)
         if len(full) > self.session.ctx:
             raise RuntimeError(
@@ -210,33 +210,51 @@ class HarmonyChat:
 
         t0 = time.time()
         spin = itertools.cycle(_SPIN)
-        state = {"n": 0, "shown": False}
+        # Stream BOTH channels live so the user always sees what is happening: the
+        # reasoning prints dimmed on stderr under a "thinking ❯" header, the answer
+        # prints on stdout under "picchio ❯". Keeping the answer alone on stdout
+        # means redirecting/piping the command still yields a clean answer file.
+        state = {"n": 0, "channel": None}
+
+        def _header(ch):
+            _clear_status()
+            label = DIM(BOLD("thinking")) if ch == "analysis" else GREEN(BOLD("picchio"))
+            sys.stderr.write(f"  {label} {DIM('❯')} ")
+            sys.stderr.flush()
 
         def on_token(token):
             parser.process(token)
             state["n"] += 1
             chunk = parser.last_content_delta
-            if chunk and parser.current_channel == show_channel:
-                if not state["shown"]:
-                    _clear_status()
-                    label = "thinking" if show_channel == "analysis" else "picchio"
-                    sys.stderr.write(f"  {GREEN(BOLD(label))} {DIM('❯')} ")
-                    sys.stderr.flush()
-                    state["shown"] = True
-                if live:
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-            elif not state["shown"]:
-                # Still in the analysis/header channel: show a live spinner.
-                _status(DIM(f"  {next(spin)} thinking · {state['n']} tokens · "
-                            f"{time.time() - t0:.1f}s"))
+            ch = parser.current_channel
+            if not (live and chunk and ch in ("analysis", "final")):
+                # Header/role tokens, or non-live (JSON) mode: just animate the spinner.
+                if state["channel"] is None:
+                    _status(DIM(f"  {next(spin)} thinking · {state['n']} tokens · "
+                                f"{time.time() - t0:.1f}s"))
+                return
+            if state["channel"] != ch:
+                # Channel switch: close the previous line on its own stream, then
+                # print the new header. The first header just clears the spinner.
+                if state["channel"] == "final":
+                    sys.stdout.write("\n"); sys.stdout.flush()
+                elif state["channel"] == "analysis":
+                    sys.stderr.write("\n"); sys.stderr.flush()
+                _header(ch)
+                state["channel"] = ch
+            if ch == "final":
+                sys.stdout.write(chunk); sys.stdout.flush()
+            else:
+                sys.stderr.write(DIM(chunk)); sys.stderr.flush()
 
         produced, reason, pos = self.session.turn(delta, max_new, keep, on_token)
         self.committed = full + self.final_prefill + produced
 
-        if state["shown"] and live:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        # Close the last streamed line on whichever stream it used.
+        if state["channel"] == "final":
+            sys.stdout.write("\n"); sys.stdout.flush()
+        elif state["channel"] == "analysis":
+            sys.stderr.write("\n"); sys.stderr.flush()
         else:
             _clear_status()
 
@@ -293,7 +311,8 @@ def main():
                              "degenerate loops like '......')")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--show-analysis", action="store_true",
-                        help="show the analysis channel instead of final")
+                        help="deprecated: reasoning is now always shown live "
+                             "(dimmed) alongside the answer")
     parser.add_argument("--dry-run", action="store_true",
                         help="render and verify the IDs without starting Picchio")
     parser.add_argument("--json", action="store_true")
@@ -322,7 +341,6 @@ def main():
     session = PicchioSession(exe, model, args.ctx, args.pin_gb, args.threads,
                              resolve_aux(model, args.model_aux), sampling)
     chat = HarmonyChat(session, args.reasoning, args.date, args.no_reasoning)
-    channel = "analysis" if args.show_analysis else "final"
     single = args.prompt is not None
 
     # header banner (stderr only)
@@ -353,7 +371,7 @@ def main():
                     continue
                 if text in ("/exit", "/quit"):
                     break
-            replies, reason, pos = chat.ask(text, args.max_tokens, channel,
+            replies, reason, pos = chat.ask(text, args.max_tokens,
                                             live=not args.json)
             if args.json:
                 print(json.dumps({"reason": reason, "pos": pos,

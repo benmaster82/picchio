@@ -284,8 +284,8 @@ Type your message after the `you ❯` prompt. Type `/exit` or `/quit` to leave.
 |---|---|
 | `--temperature 0.7` | Randomness. **Use ~0.7 for normal conversation.** The default `0` (greedy) is deterministic but can make the model loop in its "thinking" channel without answering. |
 | `--max-tokens 200` | Maximum length of the reply. |
-| `--no-reasoning` | Skip the internal "analysis" (chain-of-thought) and answer directly. Faster. |
-| `--show-analysis` | Show the model's private reasoning instead of only the final answer. |
+| `--no-reasoning` | Skip the internal "analysis" (chain-of-thought) and answer directly. Faster, but **can degrade multi-turn chats on large models** (see Troubleshooting) — prefer `--reasoning low` if answers deteriorate after a few turns. |
+| `--show-analysis` | Deprecated: the reasoning is now always streamed live (dimmed, under a `thinking ❯` header) next to the answer. |
 | `--top-p`, `--top-k`, `--seed` | Standard sampling controls. |
 | `--reasoning low\|medium\|high` | How much the model thinks before answering. |
 | `--json` | Print the structured reply as JSON. |
@@ -535,10 +535,22 @@ run on. AVX2 is required.
 **The model keeps "thinking" and never gives an answer.**
 You're in greedy mode. Add `--temperature 0.7` (chat) or set `TEMPERATURE=0.7`.
 
+**A multi-turn chat degrades after a few turns (especially the 120B).**
+This is usually `--no-reasoning`. GPT-OSS is trained to reason before answering;
+forcing the `final` channel confuses the model as the conversation grows (it
+flounders into `. . . …` or leaks its reasoning). The bigger models are more
+sensitive than the 20B. Fix: drop `--no-reasoning` and let it think, e.g.
+`--reasoning low` (the reasoning is hidden by default but now also streamed live,
+dimmed, so you can see what it is doing). Note `--rep 1.1` does **not** rescue
+this: the degenerate run alternates different punctuation tokens, which a
+per-token repetition penalty cannot catch.
+
 **Output is gibberish / degenerates in long replies.**
 Make sure you converted with the current `convert.py` (it keeps the embedding and
 output head at INT8 as required). Models converted with older code must be
-reconverted.
+reconverted. You can check a container quickly: `embed_tokens`/`lm_head` must be
+`I8` in the shard header, not `U8` (the old INT4-packed layout collapses into a
+mix of languages and repetitions on long texts).
 
 **Out of memory / very slow.**
 Lower `PIN_GB` (e.g. `--pin-gb 2`) and/or lower `--ctx`. Streaming still works with
