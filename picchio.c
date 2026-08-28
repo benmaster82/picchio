@@ -1849,6 +1849,70 @@ static void run_layer_range(Model *m, float *h, int pos, int l_lo, int l_hi) {
     free(hn); free(attn_out); free(ffn_out);
 }
 
+/* ═══════════════════════════════════════════════════════════
+ *  OPTIONAL GPU BACKEND (loaded at runtime; CPU path unchanged)
+ *
+ *  The CUDA kernels live in a separate library (picchio_cuda.dll /
+ *  libpicchio_cuda.so) built by nvcc, so the pure-C engine never links against
+ *  CUDA and the default build stays dependency-free and byte-identical. The
+ *  backend is opt-in (GPU=1) and used only if the library AND a device are
+ *  present; any per-call failure transparently falls back to the CPU kernel.
+ * ═══════════════════════════════════════════════════════════ */
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+typedef int  (*pgpu_init_t)(void);
+typedef void (*pgpu_shutdown_t)(void);
+typedef int  (*pgpu_i8_t)(float *, const float *, const int8_t *, const float *,
+                          int, int, const void *);
+
+static pgpu_shutdown_t g_pgpu_shutdown = NULL;
+static pgpu_i8_t       g_pgpu_i8 = NULL;
+static int             g_gpu_on = 0;
+
+static void *gpu_sym(void *lib, const char *name) {
+#ifdef _WIN32
+    return (void *)(uintptr_t)GetProcAddress((HMODULE)lib, name);
+#else
+    return dlsym(lib, name);
+#endif
+}
+
+static void gpu_backend_shutdown(void) {
+    if (g_gpu_on && g_pgpu_shutdown) g_pgpu_shutdown();
+    g_gpu_on = 0;
+}
+
+static void gpu_backend_load(void) {
+    const char *want = getenv("GPU");
+    if (!want || atoi(want) == 0) return;   /* opt-in: GPU=1 */
+#ifdef _WIN32
+    void *lib = (void *)LoadLibraryA("picchio_cuda.dll");
+#else
+    void *lib = dlopen("libpicchio_cuda.so", RTLD_NOW);
+#endif
+    if (!lib) {
+        fprintf(stderr, "[gpu] GPU=1 but backend library not found — using CPU\n");
+        return;
+    }
+    pgpu_init_t init = (pgpu_init_t)(uintptr_t)gpu_sym(lib, "pgpu_init");
+    pgpu_i8_t   i8   = (pgpu_i8_t)(uintptr_t)gpu_sym(lib, "pgpu_matmul_i8");
+    g_pgpu_shutdown  = (pgpu_shutdown_t)(uintptr_t)gpu_sym(lib, "pgpu_shutdown");
+    if (!init || !i8 || !g_pgpu_shutdown) {
+        fprintf(stderr, "[gpu] backend symbols missing — using CPU\n");
+        return;
+    }
+    if (init()) {
+        g_pgpu_i8 = i8;
+        g_gpu_on = 1;
+        atexit(gpu_backend_shutdown);
+        fprintf(stderr, "[gpu] backend active — lm_head offloaded to GPU\n");
+    } else {
+        fprintf(stderr, "[gpu] no CUDA device — using CPU\n");
+    }
+}
+
 /* Final norm + LM head → logits. The pipeline's last stage, after the layers. */
 static void forward_head_logits(Model *m, const float *h, float *logits) {
     Cfg *c = &m->c;
@@ -1857,7 +1921,11 @@ static void forward_head_logits(Model *m, const float *h, float *logits) {
     rmsnorm(hn, h, m->final_norm, D, c->eps);
     if (g_oracle_dir) oracle_dump_vec("final_norm", hn, D);
     double th = now_s();
-    matmul_qt(logits, hn, &m->lm_head, 1);
+    /* GPU lm_head (INT8 resident in VRAM) with CPU fallback on any failure. */
+    if (!(g_gpu_on && m->lm_head.fmt == 1 &&
+          g_pgpu_i8(logits, hn, m->lm_head.q8, m->lm_head.s,
+                    m->lm_head.O, m->lm_head.I, m->lm_head.q8) == 0))
+        matmul_qt(logits, hn, &m->lm_head, 1);
     trace_top_logits(logits, c->vocab);
     if (g_oracle_dir) oracle_dump_vec("logits", logits, c->vocab);
     m->t_head += now_s() - th;
@@ -3715,6 +3783,10 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "✓ loaded in %.1f s · resident %.2f GB\n",
             now_s() - t0, m.resident_bytes / 1e9);
+
+    /* Optional GPU backend (GPU=1): offloads lm_head to the CUDA library if
+     * present, otherwise stays on the CPU path. */
+    gpu_backend_load();
 
     /* ── 5. Sampling parameters ── */
     {

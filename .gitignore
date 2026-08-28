@@ -3,6 +3,12 @@
 *.o
 *.obj
 
+# CUDA backend build artifacts (optional; rebuild with build_cuda.bat)
+*.dll
+*.lib
+*.exp
+pgpu_test.*
+
 # Model directories (60+ GB)
 /model-*.safetensors
 /expert_biases.safetensors

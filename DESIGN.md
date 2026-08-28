@@ -609,6 +609,35 @@ intercepts reads at the same boundary S1 formalizes, and its SHA256-block plus
 ed25519 integrity model mirrors the L0 manifest contract and the per-expert hash
 in the S1 index.
 
+### 0.16 Optional CUDA backend (G0 foundation + honest lm_head result)
+
+A first, optional GPU tier is in place. The design keeps the "pure C, runs
+anywhere" default intact: the CUDA kernels live in a **separate library**
+(`picchio_cuda.dll` / `libpicchio_cuda.so`, built by `nvcc` via `build_cuda.bat`),
+loaded at runtime only with `GPU=1`. The engine never links against CUDA, so the
+default build stays dependency-free and byte-identical; on Windows this also
+sidesteps the MinGW↔MSVC ABI problem, since the two toolchains never link
+together. Any missing library, absent device, or per-call failure transparently
+falls back to the CPU kernel. The API exchanges only raw pointers + dims
+(`picchio_cuda.h`), so no C++ type crosses the boundary. The GPU path relaxes the
+byte-identity contract (FP reduction order differs) to **top-1 token agreement**
+against the CPU oracle; the standalone `pgpu_test` validates this (max abs logit
+diff ~3.8e-6, top-1 MATCH).
+
+The first offload tried was `lm_head` (isolated, INT8, resident in VRAM). The
+honest measured result on a **GTX 1650 Max-Q** (a deliberately weak, 4 GB,
+no-tensor-core card): the GPU is **~2.5× slower** than the 6-core AVX2 CPU for
+this op (82 vs 33 ms/token steady state), because it is memory/PCIe-bound (it
+re-reads the 579 MB head and, in the naive kernel, re-reads the activation) and
+the card is weak. More importantly, `lm_head` is **not the bottleneck**:
+`t_moe` ≈ 663 ms/token versus `t_head` ≈ 33 ms (~5%), so even a perfect offload
+of the head is ~4% end-to-end. The value delivered was the **infrastructure**
+(the G0 foundation: runtime-loaded backend, opt-in, fallback, validated), not a
+speedup. The lesson for the next step is unambiguous: the GPU must target the
+**experts** (`t_moe`), with VRAM **residency** of the hot set (no re-upload) and
+**batched** per-layer kernels, not `lm_head`. Expectations must also be scaled to
+the card: the §7.3 "5–10 tok/s" assumes a 4090-class GPU, not a 1650 Max-Q.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture
