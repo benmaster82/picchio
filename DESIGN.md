@@ -638,6 +638,29 @@ speedup. The lesson for the next step is unambiguous: the GPU must target the
 **batched** per-layer kernels, not `lm_head`. Expectations must also be scaled to
 the card: the §7.3 "5–10 tok/s" assumes a 4090-class GPU, not a 1650 Max-Q.
 
+**G2 — experts on GPU (`pgpu_moe_layer`), with a VRAM expert cache.** The full
+expert path (gate_up → SwiGLU → down → weighted accumulate) runs on the GPU, with
+experts cached in a byte-bounded VRAM LRU (`PIN_VRAM_GB`) keyed by (layer, eid),
+plugged into `moe_forward` after `cache_load_batch` with a CPU fallback. It is
+**numerically correct** (greedy output identical to the CPU: "Parigi" == "Parigi").
+A standalone microbench (`g2_bench.cu`) was encouraging — resident 165 ms/tok
+(~4x the CPU), streamed 428 ms/tok (~1.5x) — but the **integrated** result on the
+GTX 1650 Max-Q (4 GB, WDDM) was **~1.45x slower than the CPU** (`t_moe` 965 vs
+663 ms/tok). The microbench was optimistic for three reasons: (1) it ran 100
+iterations back-to-back, letting the GPU boost and hiding latency, whereas the
+engine does **bursty one-layer work with a CPU<->GPU sync every layer** (the
+residual stream continues on the CPU), so the Max-Q never reaches peak throughput;
+(2) the 20B's experts are ~9.5 GB but only ~204 of 768 fit in 2.86 GB, so ~36% of
+accesses **miss and re-upload** ~14 MB each; (3) the microbench excluded the
+`cache_load_batch` RAM/disk load that still runs underneath. The honest conclusion
+mirrors `lm_head`: this specific 4 GB WDDM laptop GPU cannot beat 6 AVX2 cores for
+**streamed** MoE. G2 is kept as correct, opt-in, off-by-default infrastructure —
+it should win on a card that holds most experts resident (8–24 GB) and/or once
+**more of the forward** (attention + residual) lives on the GPU so it stays busy
+without a per-layer sync. Remaining levers, in ROI order: keep the whole layer
+on-GPU to kill the per-layer sync; pinned-memory + overlapped uploads; a single
+batched kernel over the K experts to cut launches; INT8 dp4a kernels.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture

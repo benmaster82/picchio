@@ -60,6 +60,29 @@ PGPU_API int  pgpu_matmul_i4gs(float *y, const float *x,
                                const uint8_t *q4, const float *scale,
                                int O, int I, int gs);
 
+/* ── G2: full MoE expert tier on GPU (residency + batching) ──────────────── */
+
+/* One selected expert's INT4 group-scaled weights (host pointers, already in RAM
+ * via the CPU expert cache). Biases may be NULL. The backend uploads and caches
+ * these in VRAM keyed by (layer, eid); a bounded VRAM LRU (PIN_VRAM_GB) keeps the
+ * hot set resident so most tokens skip the upload. */
+typedef struct {
+    int            eid;
+    const uint8_t *gu_q4;  const float *gu_s;  const float *gu_bias;  /* gate_up [moe_inter, D] */
+    const uint8_t *d_q4;   const float *d_s;   const float *d_bias;   /* down    [D, moe_inter/2] */
+} PgpuExpert;
+
+/* Compute one token's MoE contribution on the GPU for `nexp` selected experts:
+ *   out[D] = sum_k wsum[k] * down( swiglu( gate_up(x) ) )
+ * matching the CPU path exactly (interleaved gate/up, clipped or plain SwiGLU,
+ * biases, routed scale already folded into wsum). x[D] is the layer input; out[D]
+ * is overwritten. Returns 0 on success, -1 to fall back to the CPU expert loop. */
+PGPU_API int  pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
+                             int layer, const PgpuExpert *experts,
+                             const float *wsum, int nexp, int gs,
+                             int swiglu_clipped, float swiglu_limit,
+                             float swiglu_alpha);
+
 #ifdef __cplusplus
 }
 #endif

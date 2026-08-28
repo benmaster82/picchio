@@ -52,6 +52,23 @@
 #include "json.h"
 #include "st.h"
 #include "tok.h"
+#include "picchio_cuda.h"   /* optional GPU backend: PgpuExpert + entry-point types */
+
+/* Optional GPU backend entry-point types + state. The loader functions
+ * (gpu_backend_load/shutdown) are defined further down; these are declared up
+ * here so moe_forward and forward_head_logits can reference them. */
+typedef int  (*pgpu_init_t)(void);
+typedef void (*pgpu_shutdown_t)(void);
+typedef int  (*pgpu_i8_t)(float *, const float *, const int8_t *, const float *,
+                          int, int, const void *);
+typedef int  (*pgpu_moe_t)(float *, const float *, int, int, int,
+                           const PgpuExpert *, const float *, int, int,
+                           int, float, float);
+static pgpu_shutdown_t g_pgpu_shutdown = NULL;
+static pgpu_i8_t       g_pgpu_i8 = NULL;    /* lm_head (opt-in: GPU_LMHEAD=1) */
+static pgpu_moe_t      g_pgpu_moe = NULL;   /* experts (the G2 win) */
+static int             g_gpu_on = 0;        /* experts on GPU */
+static int             g_gpu_lmhead = 0;    /* lm_head on GPU (off by default) */
 
 /* ═══════════════════════════════════════════════════════════
  *  CONFIGURATION (read from the model's config.json)
@@ -1488,7 +1505,32 @@ static void moe_forward(float *out, const float *x, Model *m,
     ESlot *slots[64];
     cache_load_batch(m, layer, sel, K, slots);
 
-    for (int k = 0; k < K; k++) {
+    /* G2: compute the whole expert sum on the GPU (weights cached in VRAM),
+     * falling back to the CPU loop below on any failure. Skipped in validation
+     * modes so the oracle/trace dumps stay on the byte-exact CPU path. */
+    int gpu_done = 0;
+    if (g_gpu_on && g_pgpu_moe && !g_oracle_dir && !g_trace_numeric) {
+        PgpuExpert ge[64];
+        float wsum[64];
+        int ok = 1, bs = 0;
+        for (int k = 0; k < K; k++) {
+            ESlot *es = slots[k];
+            if (es->eid < 0 || es->gu.fmt != 2 || es->d.fmt != 2 ||
+                es->gu.block_size <= 0 || es->gu.block_size != es->d.block_size) {
+                ok = 0; break;
+            }
+            bs = es->gu.block_size;
+            ge[k].eid = es->eid;
+            ge[k].gu_q4 = es->gu.q4; ge[k].gu_s = es->gu.s; ge[k].gu_bias = es->gu_bias;
+            ge[k].d_q4  = es->d.q4;  ge[k].d_s  = es->d.s;  ge[k].d_bias  = es->d_bias;
+            wsum[k] = weights[k] * c->routed_scale;
+        }
+        if (ok && g_pgpu_moe(out, x, D, c->moe_inter, layer, ge, wsum, K, bs,
+                             c->swiglu_clipped, c->swiglu_limit, c->swiglu_alpha) == 0)
+            gpu_done = 1;
+    }
+
+    for (int k = 0; !gpu_done && k < K; k++) {
         ESlot *es = slots[k];
         if (es->eid < 0) continue;  /* load error */
 
@@ -1862,15 +1904,6 @@ static void run_layer_range(Model *m, float *h, int pos, int l_lo, int l_hi) {
 #include <dlfcn.h>
 #endif
 
-typedef int  (*pgpu_init_t)(void);
-typedef void (*pgpu_shutdown_t)(void);
-typedef int  (*pgpu_i8_t)(float *, const float *, const int8_t *, const float *,
-                          int, int, const void *);
-
-static pgpu_shutdown_t g_pgpu_shutdown = NULL;
-static pgpu_i8_t       g_pgpu_i8 = NULL;
-static int             g_gpu_on = 0;
-
 static void *gpu_sym(void *lib, const char *name) {
 #ifdef _WIN32
     return (void *)(uintptr_t)GetProcAddress((HMODULE)lib, name);
@@ -1897,19 +1930,28 @@ static void gpu_backend_load(void) {
         return;
     }
     pgpu_init_t init = (pgpu_init_t)(uintptr_t)gpu_sym(lib, "pgpu_init");
+    pgpu_moe_t  moe  = (pgpu_moe_t)(uintptr_t)gpu_sym(lib, "pgpu_moe_layer");
     pgpu_i8_t   i8   = (pgpu_i8_t)(uintptr_t)gpu_sym(lib, "pgpu_matmul_i8");
     g_pgpu_shutdown  = (pgpu_shutdown_t)(uintptr_t)gpu_sym(lib, "pgpu_shutdown");
-    if (!init || !i8 || !g_pgpu_shutdown) {
+    if (!init || !moe || !g_pgpu_shutdown) {
         fprintf(stderr, "[gpu] backend symbols missing — using CPU\n");
         return;
     }
-    if (init()) {
-        g_pgpu_i8 = i8;
-        g_gpu_on = 1;
-        atexit(gpu_backend_shutdown);
-        fprintf(stderr, "[gpu] backend active — lm_head offloaded to GPU\n");
-    } else {
+    if (!init()) {
         fprintf(stderr, "[gpu] no CUDA device — using CPU\n");
+        return;
+    }
+    g_pgpu_moe = moe;
+    g_gpu_on = 1;
+    atexit(gpu_backend_shutdown);
+    fprintf(stderr, "[gpu] backend active — MoE experts offloaded to GPU\n");
+    /* lm_head offload is opt-in: on weak GPUs it is memory-bound and slower than
+     * the CPU (see DESIGN 0.16), and it is not the bottleneck. */
+    const char *lh = getenv("GPU_LMHEAD");
+    if (lh && atoi(lh) != 0 && i8) {
+        g_pgpu_i8 = i8;
+        g_gpu_lmhead = 1;
+        fprintf(stderr, "[gpu] lm_head also offloaded (GPU_LMHEAD=1)\n");
     }
 }
 
@@ -1921,8 +1963,8 @@ static void forward_head_logits(Model *m, const float *h, float *logits) {
     rmsnorm(hn, h, m->final_norm, D, c->eps);
     if (g_oracle_dir) oracle_dump_vec("final_norm", hn, D);
     double th = now_s();
-    /* GPU lm_head (INT8 resident in VRAM) with CPU fallback on any failure. */
-    if (!(g_gpu_on && m->lm_head.fmt == 1 &&
+    /* GPU lm_head (INT8 resident in VRAM), opt-in, with CPU fallback. */
+    if (!(g_gpu_lmhead && m->lm_head.fmt == 1 &&
           g_pgpu_i8(logits, hn, m->lm_head.q8, m->lm_head.s,
                     m->lm_head.O, m->lm_head.I, m->lm_head.q8) == 0))
         matmul_qt(logits, hn, &m->lm_head, 1);
