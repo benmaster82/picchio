@@ -667,16 +667,20 @@ An INT8-activation × INT4-weight integer kernel (`matmul_i4_gs_idot` in `quant.
 opt-in via `IDOT=1`) was added for the group-scaled experts: it quantizes the
 activation to int8 once per group and runs an AVX2 integer dot (`sign`/`maddubs`/
 `madd`, int32 accumulation) instead of dequantizing the weights to F32. It is
-**numerically faithful** (greedy output identical to the F32 path), but on the
-i5-10500H (Comet Lake, 6-core, AVX2 only — **no AVX-512/VNNI**) it did **not**
-beat the existing F32 kernel: `t_moe` 46 vs 43 s on the 20B. The sign-trick
-instruction chain (latency-exposed on the short 64-element groups) plus the
-serial per-group activation quantization offset the higher integer MAC throughput,
-and picchio's F32 `matmul_i4_gs` is already well vectorized. Kept opt-in and off
-by default (the F32 path stays the oracle) because the technique is sound and may
-pay off on other CPUs or with further tuning (hoisted constants, deferred int32
-promotion, quantizing the activation once for all K experts, and — where
-available — VNNI `dpbusd`). The one confirmed CPU win on this hardware was
+**numerically faithful** (greedy output identical to the F32 path). The first
+version was actually ~7 % **slower** than the F32 kernel (`t_moe` 46 vs 43 s on
+the 20B): it did a horizontal reduction (`hsum`) **per group** — 45 per row —
+plus a latency-exposed float accumulation chain. A second version (matching the
+insight from Colibri's kernels) folds each group's int32 partials into a **float
+vector accumulator** with `_mm256_fmadd_ps` and does a **single hsum per row**,
+which brought it back to **rough parity** with F32 (~46 vs ~48 s in one pass).
+The honest caveat is that `t_moe` is **disk-noise-dominated** here (the same run
+measured 48 s and 78 s on two passes), so a ~4 % delta cannot be claimed as a
+real win. The bottom line: on a no-VNNI Comet Lake CPU the integer path has little
+headroom over the already-well-vectorized F32 `matmul_i4_gs`. Kept opt-in and off
+by default (the F32 path stays the oracle) because it is correct, no longer a
+regression, and the integer approach pays off on CPUs with VNNI (`dpbusd`) or with
+further tuning (quantizing the activation once for all K experts). The one confirmed CPU win on this hardware was
 prosaic: a larger RAM expert cache (`PIN_GB` 4 → 9 lifted the 20B hit rate
 72 % → 90 %, disk 27 → 11 s, ~10 % faster), with `threads = 6` (hyper-threading
 at 12 was slower). The 120B stays disk-bound on a USB SSD (~70 % of wall is expert
