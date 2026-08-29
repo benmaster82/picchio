@@ -677,10 +677,21 @@ which brought it back to **rough parity** with F32 (~46 vs ~48 s in one pass).
 The honest caveat is that `t_moe` is **disk-noise-dominated** here (the same run
 measured 48 s and 78 s on two passes), so a ~4 % delta cannot be claimed as a
 real win. The bottom line: on a no-VNNI Comet Lake CPU the integer path has little
-headroom over the already-well-vectorized F32 `matmul_i4_gs`. Kept opt-in and off
-by default (the F32 path stays the oracle) because it is correct, no longer a
-regression, and the integer approach pays off on CPUs with VNNI (`dpbusd`) or with
-further tuning (quantizing the activation once for all K experts). The one confirmed CPU win on this hardware was
+headroom over the already-well-vectorized F32 `matmul_i4_gs`.
+
+**AVX-VNNI path with runtime dispatch (for other users' hardware).** The integer
+approach's real payoff is on CPUs with VNNI (Intel Ice Lake / Alder Lake+, AMD
+Zen4+ — the majority of machines since ~2019), where a single `dpbusd`
+(int8×int8→int32) replaces the `maddubs`+`madd` pair. `quant.h` now ships a VNNI
+variant (`idot_rows_vnni`, compiled behind `__attribute__((target("avx2,avxvnni")))`)
+selected at runtime via `__builtin_cpu_supports("avxvnni")`, with the AVX2
+`maddubs` kernel (`idot_rows_avx2`) as the fallback. So one portable binary runs
+everywhere and takes the faster path only where the CPU supports it. Validated on
+Comet Lake (correctly reports "AVX2 maddubs", output identical to F32); the VNNI
+path compiles and dispatches but is untested on real VNNI silicon here. Kept opt-in
+and off by default (the F32 path stays the oracle). This is the guiding principle
+for the whole GPU/kernel line: implement what helps local execution broadly, gated
+so it never regresses the hardware that cannot use it. The one confirmed CPU win on this hardware was
 prosaic: a larger RAM expert cache (`PIN_GB` 4 → 9 lifted the 20B hit rate
 72 % → 90 %, disk 27 → 11 s, ~10 % faster), with `threads = 6` (hyper-threading
 at 12 was slower). The 120B stays disk-bound on a USB SSD (~70 % of wall is expert

@@ -327,9 +327,127 @@ static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
  * approximation of the exact F32 path (the activation is quantized to int8), so
  * it is opt-in via IDOT=1 and the F32 path stays the default oracle. On AVX2 it
  * roughly halves the expert matmul time (2× the MACs/instruction, no int→float). */
+/* AVX-VNNI is available on most x86 CPUs since ~2019 (Intel Ice Lake / Alder
+ * Lake+, AMD Zen4+). We compile a VNNI variant behind a function target attribute
+ * and dispatch to it at runtime (__builtin_cpu_supports), so a single binary runs
+ * everywhere and uses the faster `dpbusd` path only where the CPU supports it. */
+#if defined(__AVX2__) && defined(__x86_64__) && \
+    ((defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12) || \
+     (defined(__clang__) && __clang_major__ >= 14))
+#define PICCHIO_HAVE_VNNI 1
+#endif
+
+static int q_idot_enabled = 0;
+static int q_idot_vnni    = 0;
+
+/* Per-row expert dot for one activation row already quantized to int8 (xq) with
+ * per-group scales (ax). Writes yrow[o] = Σ_g (ax[g]·wscale[o,g])·⟨xq_g, w_g⟩. */
+static void idot_rows_avx2(float *yrow, const int8_t *xq, const float *ax,
+                           const uint8_t *q4, const float *scale,
+                           int I, int O, int gs, int n_groups) {
+    int rb = (I + 1) / 2;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const float *sc = scale + (int64_t)o * n_groups;
+#ifdef __AVX2__
+        const __m256i ones = _mm256_set1_epi16(1);
+        const __m128i m0f  = _mm_set1_epi8(0x0F);
+        const __m256i c8   = _mm256_set1_epi8(8);
+        __m256 facc = _mm256_setzero_ps();
+        float  atail = 0.f;
+        for (int g = 0; g < n_groups; g++) {
+            int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
+            __m256i gi = _mm256_setzero_si256();
+            int i = g0;
+            for (; i + 32 <= g1; i += 32) {
+                __m128i by  = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
+                __m128i lo4 = _mm_and_si128(by, m0f);
+                __m128i hi4 = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
+                __m256i w8  = _mm256_set_m128i(_mm_unpackhi_epi8(lo4, hi4),
+                                               _mm_unpacklo_epi8(lo4, hi4));
+                w8 = _mm256_sub_epi8(w8, c8);
+                __m256i y8  = _mm256_loadu_si256((const __m256i *)(xq + i));
+                __m256i p   = _mm256_maddubs_epi16(_mm256_sign_epi8(w8, w8),
+                                                   _mm256_sign_epi8(y8, w8));
+                gi = _mm256_add_epi32(gi, _mm256_madd_epi16(p, ones));
+            }
+            float sc_g = ax[g] * sc[g];
+            facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(gi), _mm256_set1_ps(sc_g), facc);
+            int tail = 0;
+            for (; i < g1; i += 2) {
+                uint8_t by = w[i >> 1];
+                tail += (int)xq[i] * ((int)(by & 0xF) - 8);
+                if (i + 1 < g1) tail += (int)xq[i + 1] * ((int)(by >> 4) - 8);
+            }
+            if (tail) atail += (float)tail * sc_g;
+        }
+        yrow[o] = hsum256(facc) + atail;
+#else
+        float a = 0.f;
+        for (int g = 0; g < n_groups; g++) {
+            int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
+            int idot = 0;
+            for (int i = g0; i < g1; i += 2) {
+                uint8_t by = w[i >> 1];
+                idot += (int)xq[i] * ((int)(by & 0xF) - 8);
+                if (i + 1 < g1) idot += (int)xq[i + 1] * ((int)(by >> 4) - 8);
+            }
+            a += (float)idot * ax[g] * sc[g];
+        }
+        yrow[o] = a;
+#endif
+    }
+}
+
+#ifdef PICCHIO_HAVE_VNNI
+/* Same as idot_rows_avx2 but one `dpbusd` (int8×int8→int32) replaces the
+ * maddubs+madd pair — 2× the integer throughput on CPUs with AVX-VNNI. */
+__attribute__((target("avx2,avxvnni")))
+static void idot_rows_vnni(float *yrow, const int8_t *xq, const float *ax,
+                           const uint8_t *q4, const float *scale,
+                           int I, int O, int gs, int n_groups) {
+    int rb = (I + 1) / 2;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const float *sc = scale + (int64_t)o * n_groups;
+        const __m128i m0f = _mm_set1_epi8(0x0F);
+        const __m256i c8  = _mm256_set1_epi8(8);
+        __m256 facc = _mm256_setzero_ps();
+        float  atail = 0.f;
+        for (int g = 0; g < n_groups; g++) {
+            int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
+            __m256i gi = _mm256_setzero_si256();
+            int i = g0;
+            for (; i + 32 <= g1; i += 32) {
+                __m128i by  = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
+                __m128i lo4 = _mm_and_si128(by, m0f);
+                __m128i hi4 = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
+                __m256i w8  = _mm256_set_m128i(_mm_unpackhi_epi8(lo4, hi4),
+                                               _mm_unpacklo_epi8(lo4, hi4));
+                w8 = _mm256_sub_epi8(w8, c8);
+                __m256i y8  = _mm256_loadu_si256((const __m256i *)(xq + i));
+                gi = _mm256_dpbusd_avx_epi32(gi, _mm256_sign_epi8(w8, w8),
+                                             _mm256_sign_epi8(y8, w8));
+            }
+            float sc_g = ax[g] * sc[g];
+            facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(gi), _mm256_set1_ps(sc_g), facc);
+            int tail = 0;
+            for (; i < g1; i += 2) {
+                uint8_t by = w[i >> 1];
+                tail += (int)xq[i] * ((int)(by & 0xF) - 8);
+                if (i + 1 < g1) tail += (int)xq[i + 1] * ((int)(by >> 4) - 8);
+            }
+            if (tail) atail += (float)tail * sc_g;
+        }
+        yrow[o] = hsum256(facc) + atail;
+    }
+}
+#endif
+
 static void matmul_i4_gs_idot(float *y, const float *x, const uint8_t *q4,
                               const float *scale, int S, int I, int O, int gs) {
-    int rb = (I + 1) / 2;
     int n_groups = (I + gs - 1) / gs;
     int8_t *xq = (int8_t *)malloc((size_t)I);
     float  *ax = (float *)malloc((size_t)n_groups * sizeof(float));
@@ -353,70 +471,27 @@ static void matmul_i4_gs_idot(float *y, const float *x, const uint8_t *q4,
             }
         }
 
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *w = q4 + (int64_t)o * rb;
-            const float *sc = scale + (int64_t)o * n_groups;
-#ifdef __AVX2__
-            const __m256i ones = _mm256_set1_epi16(1);
-            const __m128i m0f  = _mm_set1_epi8(0x0F);
-            const __m256i c8   = _mm256_set1_epi8(8);
-            /* Accumulate each group's int32 partials into a FLOAT vector with its
-             * scale, deferring the horizontal reduction to a single hsum per row
-             * (instead of one hsum per group — the previous version's bottleneck). */
-            __m256 facc = _mm256_setzero_ps();
-            float  atail = 0.f;
-            for (int g = 0; g < n_groups; g++) {
-                int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
-                __m256i gi = _mm256_setzero_si256();
-                int i = g0;
-                for (; i + 32 <= g1; i += 32) {
-                    __m128i by  = _mm_loadu_si128((const __m128i *)(w + (i >> 1)));
-                    __m128i lo4 = _mm_and_si128(by, m0f);
-                    __m128i hi4 = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
-                    __m256i w8  = _mm256_set_m128i(_mm_unpackhi_epi8(lo4, hi4),
-                                                   _mm_unpacklo_epi8(lo4, hi4));
-                    w8 = _mm256_sub_epi8(w8, c8);                 /* nibble - 8 → [-8,7] */
-                    __m256i y8  = _mm256_loadu_si256((const __m256i *)(xq + i));
-                    __m256i p   = _mm256_maddubs_epi16(_mm256_sign_epi8(w8, w8),
-                                                       _mm256_sign_epi8(y8, w8));
-                    gi = _mm256_add_epi32(gi, _mm256_madd_epi16(p, ones));
-                }
-                float sc_g = ax[g] * sc[g];
-                facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(gi),
-                                       _mm256_set1_ps(sc_g), facc);
-                int tail = 0;                                     /* only if gs % 32 */
-                for (; i < g1; i += 2) {
-                    uint8_t by = w[i >> 1];
-                    tail += (int)xq[i] * ((int)(by & 0xF) - 8);
-                    if (i + 1 < g1) tail += (int)xq[i + 1] * ((int)(by >> 4) - 8);
-                }
-                if (tail) atail += (float)tail * sc_g;
-            }
-            y[(int64_t)s * O + o] = hsum256(facc) + atail;
-#else
-            float a = 0.f;
-            for (int g = 0; g < n_groups; g++) {
-                int g0 = g * gs, g1 = g0 + gs; if (g1 > I) g1 = I;
-                int idot = 0;
-                for (int i = g0; i < g1; i += 2) {
-                    uint8_t by = w[i >> 1];
-                    idot += (int)xq[i] * ((int)(by & 0xF) - 8);
-                    if (i + 1 < g1) idot += (int)xq[i + 1] * ((int)(by >> 4) - 8);
-                }
-                a += (float)idot * ax[g] * sc[g];
-            }
-            y[(int64_t)s * O + o] = a;
+        float *yrow = y + (int64_t)s * O;
+#ifdef PICCHIO_HAVE_VNNI
+        if (q_idot_vnni)
+            idot_rows_vnni(yrow, xq, ax, q4, scale, I, O, gs, n_groups);
+        else
 #endif
-        }
+            idot_rows_avx2(yrow, xq, ax, q4, scale, I, O, gs, n_groups);
     }
     free(xq); free(ax);
 }
 
 /* IDOT toggle (opt-in via IDOT=1): the integer expert kernel is approximate, so
- * the exact F32 path stays the default and the oracle/self-test reference. */
-static int q_idot_enabled = 0;
-static inline void quant_set_idot(int v) { q_idot_enabled = v; }
+ * the exact F32 path stays the default and the oracle/self-test reference. On
+ * enable, detect AVX-VNNI once so the dispatcher picks the faster dpbusd path. */
+static inline void quant_set_idot(int v) {
+    q_idot_enabled = v;
+#ifdef PICCHIO_HAVE_VNNI
+    if (v) { __builtin_cpu_init(); q_idot_vnni = __builtin_cpu_supports("avxvnni"); }
+#endif
+}
+static inline int quant_idot_vnni(void) { return q_idot_vnni; }
 
 /* ── Dispatcher: picks the kernel based on the format ── */
 

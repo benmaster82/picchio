@@ -3861,7 +3861,8 @@ int main(int argc, char **argv) {
         const char *v = getenv("IDOT");
         if (v && atoi(v) != 0) {
             quant_set_idot(1);
-            fprintf(stderr, "expert kernel: IDOT (int8×int4 integer dot, AVX2)\n");
+            fprintf(stderr, "expert kernel: IDOT (int8×int4 integer dot, %s)\n",
+                    quant_idot_vnni() ? "AVX-VNNI dpbusd" : "AVX2 maddubs");
         }
     }
 
