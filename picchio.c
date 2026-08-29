@@ -3866,6 +3866,17 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* DROP=1: drop just-read file pages from the OS page cache after each read,
+     * so peak RSS stays "dense + our cache" instead of creeping toward the whole
+     * model when streaming a model larger than RAM (Linux only). */
+    {
+        const char *v = getenv("DROP");
+        if (v && atoi(v) != 0) {
+            st_set_drop_cache(1);
+            fprintf(stderr, "page cache: DROP (fadvise DONTNEED after reads)\n");
+        }
+    }
+
     /* Prefetch → LRU (PREFETCH=1, historical alias PILOT=1). Predicts the next
      * layer's experts (post-MoE proxy) and loads them during the attention. */
     {

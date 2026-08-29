@@ -369,6 +369,15 @@ static StTensor *st_find_prefix(StDB *db, const char *prefix, const char *suffix
     return st_find(db, full);
 }
 
+/* Drop-cache toggle (DROP=1): after each read, advise the kernel to evict the
+ * just-read file pages from the OS page cache. Picchio copies expert bytes into
+ * its own LRU/hot-store buffers, so the page-cache copy is a redundant second
+ * cache that competes for RAM — dropping it keeps peak RSS at "dense + our cache"
+ * instead of creeping toward the whole model, which matters when streaming a
+ * model larger than RAM (the 120B case). Linux only; a no-op elsewhere. */
+static int st_drop_cache = 0;
+static inline void st_set_drop_cache(int v) { st_drop_cache = v; }
+
 /* ── Robust positioned read ──────────────────────────────────────────────
  * Loops until `nbytes` bytes are read, or a genuine EOF/error stops it early.
  * A single ReadFile/pread is NOT guaranteed to transfer the whole request: on
@@ -405,6 +414,10 @@ static int64_t st_pread_full(int fd, void *dst, int64_t nbytes, int64_t abs_offs
         if (rd == 0) break;  /* EOF */
         done += rd;
     }
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+    if (st_drop_cache && done > 0)
+        posix_fadvise(fd, abs_offset, done, POSIX_FADV_DONTNEED);
+#endif
     return done;
 }
 #endif

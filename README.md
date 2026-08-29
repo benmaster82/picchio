@@ -509,6 +509,8 @@ flags map onto these). The most useful:
 | `SEED` | fixed | RNG seed for reproducible sampling. |
 | `IO_THREADS` | 4 | Threads used for reading experts from disk in parallel. |
 | `MODEL_AUX` | (none) | Extra model files on other disks (semicolon-separated). |
+| `IDOT` | `0` | `1` = integer expert kernel (int8 activation × int4 weight). Uses AVX-VNNI (`dpbusd`) where the CPU supports it, else AVX2; a small approximation, so off by default. |
+| `DROP` | `0` | `1` = drop just-read pages from the OS page cache after each read (Linux), keeping peak RAM at "dense + cache" when streaming a model larger than RAM. |
 
 Performance notes:
 
