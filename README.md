@@ -217,9 +217,21 @@ output folder. It only needs to be done once.
 
 > **Smaller experts (`--expert-bits 3`).** By default experts are INT4 (gs64).
 > Adding `--expert-bits 3` packs them at INT3 gs64 instead — about **22% fewer
-> expert bytes on disk and in RAM**, at a small quality cost. This is most useful
-> when you are disk- or RAM-bound (the 120B). The runtime detects the format from
-> the converted `config.json`; nothing else changes on the command line.
+> expert bytes on disk and in RAM** (~26% on the experts, ~16% on the whole
+> model), at a small quality cost. This is most useful when you are disk- or
+> RAM-bound (the 120B). The runtime detects the format from the converted
+> `config.json`; nothing else changes on the command line.
+>
+> **No re-download: transcode an existing INT4 model.** If you already converted
+> to INT4 and don't want to fetch the original again, requantize the experts in
+> place with [`transcode_i4_to_i3.py`](transcode_i4_to_i3.py):
+> ```powershell
+> python transcode_i4_to_i3.py --input C:\models\gptoss20b_i8h --output C:\models\gptoss20b_i3
+> ```
+> It dequantizes each INT4 expert and repacks it as INT3 (INT8 head, F32
+> attention, etc. copied unchanged), writing a marked container — no download.
+> Slightly lower quality than converting from the original (INT4→INT3 compounds a
+> little error), but validated to keep answers correct on a real 20B.
 
 > **Reclaim space after converting.** The raw Hugging Face download is left in a
 > sibling folder named `<output>_raw` (e.g. `C:\models\gptoss20b_i4_raw`). Only the
