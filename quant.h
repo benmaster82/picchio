@@ -516,6 +516,73 @@ static void matmul_i3_gs(float *y, const float *x, const uint8_t *q3,
         const float *sc = scale + (int64_t)o * n_groups;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
+#ifdef __AVX2__
+            /* Decode each 64-value group from its bit-planes with SIMD (the plane
+             * layout is chosen for exactly this), dequantize to int8 [-4,3], then
+             * FMA in F32. One hsum per row (scale folded into a float vector). */
+            const __m128i m3   = _mm_set1_epi8(3);
+            const __m256i c4   = _mm256_set1_epi8(4);
+            const __m256i shuf = _mm256_setr_epi8(0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+                                                  2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+            const __m256i bitp = _mm256_setr_epi8(1,2,4,8,16,32,64,(char)128,
+                                                  1,2,4,8,16,32,64,(char)128,
+                                                  1,2,4,8,16,32,64,(char)128,
+                                                  1,2,4,8,16,32,64,(char)128);
+            __m256 facc = _mm256_setzero_ps();
+            float  atail = 0.f;
+            for (int g = 0; g < n_groups; g++) {
+                const uint8_t *lp = wr + (int64_t)g * I3_GBYTES;
+                const uint8_t *hp = lp + 16;
+                int base = g * I3_GROUP;
+                int n = I - base; if (n > I3_GROUP) n = I3_GROUP;
+                if (n < I3_GROUP) {                              /* partial tail: scalar */
+                    float ga = 0.f;
+                    for (int j = 0; j < n; j++) {
+                        int l2 = (lp[j >> 2] >> ((j & 3) * 2)) & 3;
+                        int h1 = (hp[j >> 3] >> (j & 7)) & 1;
+                        ga += xs[base + j] * (float)((l2 | (h1 << 2)) - 4);
+                    }
+                    atail += ga * sc[g];
+                    continue;
+                }
+                /* low plane (16 B): 4-way byte interleave → codes' low 2 bits */
+                __m128i lo16 = _mm_loadu_si128((const __m128i *)lp);
+                __m128i t0 = _mm_and_si128(lo16, m3);
+                __m128i t1 = _mm_and_si128(_mm_srli_epi16(lo16, 2), m3);
+                __m128i t2 = _mm_and_si128(_mm_srli_epi16(lo16, 4), m3);
+                __m128i t3 = _mm_and_si128(_mm_srli_epi16(lo16, 6), m3);
+                __m128i i01l = _mm_unpacklo_epi8(t0, t1), i01h = _mm_unpackhi_epi8(t0, t1);
+                __m128i i23l = _mm_unpacklo_epi8(t2, t3), i23h = _mm_unpackhi_epi8(t2, t3);
+                __m256i low_lo = _mm256_set_m128i(_mm_unpackhi_epi16(i01l, i23l),
+                                                  _mm_unpacklo_epi16(i01l, i23l));  /* codes 0..31 */
+                __m256i low_hi = _mm256_set_m128i(_mm_unpackhi_epi16(i01h, i23h),
+                                                  _mm_unpacklo_epi16(i01h, i23h));  /* codes 32..63 */
+                /* high plane (8 B): expand bits → 0/4 (top bit of each code) */
+                uint32_t hlo, hhi; memcpy(&hlo, hp, 4); memcpy(&hhi, hp + 4, 4);
+                __m256i e_lo = _mm256_shuffle_epi8(_mm256_set1_epi32((int)hlo), shuf);
+                e_lo = _mm256_cmpeq_epi8(_mm256_and_si256(e_lo, bitp), bitp);
+                __m256i e_hi = _mm256_shuffle_epi8(_mm256_set1_epi32((int)hhi), shuf);
+                e_hi = _mm256_cmpeq_epi8(_mm256_and_si256(e_hi, bitp), bitp);
+                __m256i val_lo = _mm256_sub_epi8(
+                    _mm256_add_epi8(low_lo, _mm256_and_si256(e_lo, c4)), c4);  /* [-4,3] */
+                __m256i val_hi = _mm256_sub_epi8(
+                    _mm256_add_epi8(low_hi, _mm256_and_si256(e_hi, c4)), c4);
+                /* dot with x (int8 → f32, 8 lanes at a time) */
+                __m128i vL = _mm256_castsi256_si128(val_lo), vLh = _mm256_extracti128_si256(val_lo, 1);
+                __m128i vH = _mm256_castsi256_si128(val_hi), vHh = _mm256_extracti128_si256(val_hi, 1);
+                __m256 gv = _mm256_setzero_ps();
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+0),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vL)), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vL,8))), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vLh)), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vLh,8))), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+32), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vH)), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+40), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vH,8))), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+48), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vHh)), gv);
+                gv = _mm256_fmadd_ps(_mm256_loadu_ps(xs+base+56), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vHh,8))), gv);
+                facc = _mm256_fmadd_ps(gv, _mm256_set1_ps(sc[g]), facc);
+            }
+            y[(int64_t)s * O + o] = hsum256(facc) + atail;
+#else
             float a = 0.f;
             for (int g = 0; g < n_groups; g++) {
                 const uint8_t *lp = wr + (int64_t)g * I3_GBYTES;
@@ -531,6 +598,7 @@ static void matmul_i3_gs(float *y, const float *x, const uint8_t *q3,
                 a += ga * sc[g];
             }
             y[(int64_t)s * O + o] = a;
+#endif
         }
     }
 }

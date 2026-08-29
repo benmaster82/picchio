@@ -218,9 +218,11 @@ output folder. It only needs to be done once.
 > **Smaller experts (`--expert-bits 3`).** By default experts are INT4 (gs64).
 > Adding `--expert-bits 3` packs them at INT3 gs64 instead — about **22% fewer
 > expert bytes on disk and in RAM** (~26% on the experts, ~16% on the whole
-> model), at a small quality cost. This is most useful when you are disk- or
-> RAM-bound (the 120B). The runtime detects the format from the converted
-> `config.json`; nothing else changes on the command line.
+> model), at a small quality cost. The INT3 matmul is AVX2-vectorized (the
+> bit-plane layout is chosen for SIMD), so the smaller experts can actually run
+> **faster** than INT4 when I/O-bound (measured ~1.6 vs ~0.9 tok/s on a 20B).
+> The runtime detects the format from the converted `config.json`; nothing else
+> changes on the command line.
 >
 > **No re-download: transcode an existing INT4 model.** If you already converted
 > to INT4 and don't want to fetch the original again, requantize the experts in
