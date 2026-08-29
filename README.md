@@ -215,6 +215,12 @@ python convert.py --model openai/gpt-oss-20b --output C:\models\gptoss20b_i4 --d
 This downloads several GB and writes a converted model of about **14 GB** to the
 output folder. It only needs to be done once.
 
+> **Smaller experts (`--expert-bits 3`).** By default experts are INT4 (gs64).
+> Adding `--expert-bits 3` packs them at INT3 gs64 instead — about **22% fewer
+> expert bytes on disk and in RAM**, at a small quality cost. This is most useful
+> when you are disk- or RAM-bound (the 120B). The runtime detects the format from
+> the converted `config.json`; nothing else changes on the command line.
+
 > **Reclaim space after converting.** The raw Hugging Face download is left in a
 > sibling folder named `<output>_raw` (e.g. `C:\models\gptoss20b_i4_raw`). Only the
 > `--output` folder is needed to run Picchio, so once the conversion finishes you

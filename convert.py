@@ -43,6 +43,11 @@ except ImportError:
 
 # ── INT4 per-row symmetric quantization ──
 
+# Expert quantization width: 4 = INT4 gs64 (default), 3 = INT3 gs64 (~22% smaller
+# on disk/RAM, slightly lossier). Set from --expert-bits in main().
+EXPERT_BITS = 4
+
+
 def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
     """Quantize F32 [O, I] → (packed_uint8, scales_f32).
 
@@ -90,8 +95,50 @@ def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> tuple:
     if I % 2 == 1:
         lo = (quantized[:, -1].astype(np.int16) + 8).astype(np.uint8) & 0xF
         packed[:, rb - 1] = lo
-    
+
     return packed.reshape(-1), scales
+
+
+def quantize_int3(tensor: np.ndarray, group_size: int = 64) -> tuple:
+    """Quantize F32 [O, I] → (packed_uint8, scales_f32), INT3 gs64 (fmt=5).
+
+    Per group of 64 values: a 16-byte low plane (2 low bits of each code) + an
+    8-byte high plane (top bit of each code) = 24 bytes = 3 bits/value. Code
+    c ∈ [0,7] maps to value c-4 ∈ [-4,3]. MUST mirror matmul_i3_gs in quant.h
+    byte-for-byte (scale = amax/3.5). group_size is fixed at 64.
+    """
+    assert group_size == 64, "int3 packing fixes gs=64"
+    if tensor.ndim == 1:
+        tensor = tensor.reshape(1, -1)
+    O, I = tensor.shape
+    n_groups = (I + 63) // 64
+    scales = np.empty((O, n_groups), dtype=np.float32)
+    packed = np.zeros((O, n_groups * 24), dtype=np.uint8)
+
+    for g in range(n_groups):
+        g0 = g * 64
+        g1 = min(g0 + 64, I)
+        n = g1 - g0
+        group = tensor[:, g0:g1]
+        amax = np.max(np.abs(group), axis=1)
+        sc = np.where(amax > 1e-8, amax / 3.5, 1e-8).astype(np.float32)
+        scales[:, g] = sc
+        codes = (np.clip(np.round(group / sc[:, None]), -4, 3).astype(np.int16) + 4)  # [O,n] 0..7
+        if n < 64:  # pad; the C kernel only reads the first n, so padding is ignored
+            codes = np.concatenate([codes, np.zeros((O, 64 - n), dtype=np.int16)], axis=1)
+        low2 = (codes & 3).astype(np.uint8)          # [O,64]
+        high1 = ((codes >> 2) & 1).astype(np.uint8)  # [O,64]
+        base = g * 24
+        lp = low2.reshape(O, 16, 4)                   # low plane: 4 codes/byte
+        packed[:, base:base + 16] = (lp[:, :, 0] | (lp[:, :, 1] << 2)
+                                     | (lp[:, :, 2] << 4) | (lp[:, :, 3] << 6)).astype(np.uint8)
+        hp = high1.reshape(O, 8, 8)                   # high plane: 8 codes/byte
+        hb = np.zeros((O, 8), dtype=np.uint8)
+        for i in range(8):
+            hb |= (hp[:, :, i] << i).astype(np.uint8)
+        packed[:, base + 16:base + 24] = hb
+
+    return packed.reshape(-1), scales.reshape(-1)
 
 
 # ── MXFP4 dequantization ──
@@ -298,11 +345,12 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                         # MXFP4 scales E8M0 — save to combine with blocks
                         output_tensors[key] = tensor_np
                     else:
-                        # Expert weight F32 — quantize to INT4
+                        # Expert weight F32 — quantize to INT4 (or INT3 gs64)
                         t_f32 = tensor_np.astype(np.float32)
                         if t_f32.ndim >= 2:
                             t_2d = t_f32.reshape(-1, t_f32.shape[-1])
-                            packed, scales = quantize_int4(t_2d)
+                            packed, scales = (quantize_int3(t_2d) if EXPERT_BITS == 3
+                                              else quantize_int4(t_2d))
                             output_tensors[key] = packed
                             output_tensors[key + ".qs"] = scales
                             stats["expert_i4"] += packed.nbytes + scales.nbytes
@@ -390,7 +438,17 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
         if src.exists():
             shutil.copy2(src, output_path / fname)
             print(f"  ✓ {fname}")
-    
+
+    # Record the expert quantization width so the runtime loads the right format.
+    if EXPERT_BITS == 3:
+        ocfg_path = output_path / "config.json"
+        with open(ocfg_path) as f:
+            ocfg = json.load(f)
+        ocfg["picchio_expert_bits"] = 3
+        with open(ocfg_path, "w") as f:
+            json.dump(ocfg, f, indent=2)
+        print("  ✓ config.json marked picchio_expert_bits=3")
+
     # Load config
     with open(model_path / "config.json") as f:
         cfg = json.load(f)
@@ -600,10 +658,16 @@ def main():
                         help="Bits for the dense part (4 or 8, default: 4)")
     parser.add_argument("--download", action="store_true",
                         help="Download from HuggingFace before converting")
-    
+    parser.add_argument("--expert-bits", type=int, default=4, choices=[3, 4],
+                        help="Bits for the MoE experts (4 = INT4 gs64 default; "
+                             "3 = INT3 gs64, ~22%% smaller, slightly lossier)")
+
     args = parser.parse_args()
-    
-    print(f"🪶 picchio convert — GPT-OSS / Qwen3-MoE → INT4\n")
+
+    global EXPERT_BITS
+    EXPERT_BITS = args.expert_bits
+
+    print(f"🪶 picchio convert — GPT-OSS / Qwen3-MoE → INT{EXPERT_BITS}\n")
     
     if args.download or "/" in args.model and not Path(args.model).exists():
         download_and_convert(args.model, args.output, args.dense_bits)

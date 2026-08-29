@@ -111,6 +111,7 @@ typedef struct {
     int router_norm;      /* 0: softmax over top-k logits (GPT-OSS);
                              1: softmax over all experts, renormalize top-k (Qwen3) */
     int use_sinks;        /* 1: attention sinks are mandatory (GPT-OSS) */
+    int expert_bits;      /* expert quant width: 4 = INT4 gs64 (default), 3 = INT3 gs64 */
     int8_t layer_type[128]; /* per layer: 0=sliding_attention, 1=full_attention */
 } Cfg;
 
@@ -403,6 +404,7 @@ static int cfg_load(Cfg *c, const char *model_path) {
     c->swiglu_clipped = is_qwen ? 0 : 1;
     c->router_norm    = is_qwen ? 1 : 0;
     c->use_sinks      = is_qwen ? 0 : 1;
+    c->expert_bits    = json_int(json, "picchio_expert_bits", 4);  /* 3 = INT3 gs64 */
 
     c->hidden       = json_int(json, "hidden_size", 2880);
     c->n_layers     = json_int(json, "num_hidden_layers", 36);
@@ -840,12 +842,18 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
         gu_f32 = NULL;
         goto gate_up_loaded;
     } else if (t_gu->dtype == ST_U8) {
-        /* Already INT4 packed — load directly */
+        /* Already packed (INT4 gs64, or INT3 gs64 when expert_bits==3) */
         memset(&s->gu, 0, sizeof(QT));
-        s->gu.fmt = 2;
         s->gu.O = I;
         s->gu.I = D;
-        int64_t rb = (int64_t)I * ((D + 1) / 2);
+        int64_t rb;
+        if (c->expert_bits == 3) {
+            s->gu.fmt = 5;
+            rb = (int64_t)I * (((int64_t)D + 63) / 64) * 24;   /* planes: 24 B / 64 vals */
+        } else {
+            s->gu.fmt = 2;
+            rb = (int64_t)I * ((D + 1) / 2);
+        }
         s->gu.q4 = (uint8_t *)malloc(rb);
         if (!s->gu.q4 || st_read_raw(g_db, t_gu, s->gu.q4, rb) != rb) {
             /* Short/failed read (I/O pressure) would leave the tail garbage:
@@ -928,12 +936,18 @@ gate_up_loaded:
             d_f32 = NULL;
             goto down_loaded;
         } else if (t_d->dtype == ST_U8) {
-            /* Already INT4 packed */
+            /* Already packed (INT4 gs64, or INT3 gs64 when expert_bits==3) */
             memset(&s->d, 0, sizeof(QT));
-            s->d.fmt = 2;
             s->d.O = D;
             s->d.I = down_I;
-            int64_t rb = (int64_t)D * ((down_I + 1) / 2);
+            int64_t rb;
+            if (c->expert_bits == 3) {
+                s->d.fmt = 5;
+                rb = (int64_t)D * (((int64_t)down_I + 63) / 64) * 24;
+            } else {
+                s->d.fmt = 2;
+                rb = (int64_t)D * ((down_I + 1) / 2);
+            }
             s->d.q4 = (uint8_t *)malloc(rb);
             if (!s->d.q4 || st_read_raw(g_db, t_d, s->d.q4, rb) != rb) {
                 /* gate_up already loaded: free it too, since an eid=-1 slot is

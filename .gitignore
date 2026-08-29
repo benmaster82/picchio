@@ -51,3 +51,5 @@ dev/
 
 # S1 flat expert store artifacts
 *.picchioflat
+test_model_i3/
+test_model_i4/
