@@ -51,6 +51,10 @@ static inline int64_t qt_bytes(const QT *t) {
             int64_t nblocks = (int64_t)t->O * ((t->I + bs - 1) / bs);
             return (int64_t)t->O * ((t->I + 1) / 2) + nblocks * 4;
         }
+        case 5: {                                                /* INT3 gs64 */
+            int64_t ng = ((int64_t)t->I + 63) / 64;
+            return (int64_t)t->O * ng * 24 + (int64_t)t->O * ng * 4;  /* planes + scales */
+        }
         default: return 0;
     }
 }
@@ -493,6 +497,76 @@ static inline void quant_set_idot(int v) {
 }
 static inline int quant_idot_vnni(void) { return q_idot_vnni; }
 
+/* ── Matmul INT3 gs64: 3-bit weights, group scale (gs=64) ──
+ * On-disk, per group of 64 values: a 16-byte low plane (the 2 low bits of each
+ * code) + an 8-byte high plane (the top bit of each code) = 24 bytes = 3 bits
+ * per value. Code c in [0,7] maps to value c-4 in [-4,3]. ~22% fewer expert
+ * bytes than INT4 gs64 (3.5 vs 4.5 bits/weight incl. scale) → less disk
+ * bandwidth and RAM at a small quality cost. Packing fixes gs=64. */
+#define I3_GROUP  64
+#define I3_GBYTES 24
+static void matmul_i3_gs(float *y, const float *x, const uint8_t *q3,
+                         const float *scale, int S, int I, int O, int gs) {
+    (void)gs;
+    int n_groups = (I + I3_GROUP - 1) / I3_GROUP;
+    int64_t row_bytes = (int64_t)n_groups * I3_GBYTES;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *wr = q3 + (int64_t)o * row_bytes;
+        const float *sc = scale + (int64_t)o * n_groups;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float a = 0.f;
+            for (int g = 0; g < n_groups; g++) {
+                const uint8_t *lp = wr + (int64_t)g * I3_GBYTES;
+                const uint8_t *hp = lp + 16;
+                int base = g * I3_GROUP;
+                int n = I - base; if (n > I3_GROUP) n = I3_GROUP;
+                float ga = 0.f;
+                for (int j = 0; j < n; j++) {
+                    int low2  = (lp[j >> 2] >> ((j & 3) * 2)) & 3;
+                    int high1 = (hp[j >> 3] >> (j & 7)) & 1;
+                    ga += xs[base + j] * (float)((low2 | (high1 << 2)) - 4);
+                }
+                a += ga * sc[g];
+            }
+            y[(int64_t)s * O + o] = a;
+        }
+    }
+}
+
+/* Quantize F32 rows to INT3 gs64 (mirror of the Python converter, used by the
+ * self-test). Writes packed planes into `q3` and one F32 scale per group. */
+static void quantize_rows_i3_gs(const float *w, uint8_t *q3, float *scale, int O, int I) {
+    int n_groups = (I + I3_GROUP - 1) / I3_GROUP;
+    int64_t row_bytes = (int64_t)n_groups * I3_GBYTES;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *wr = w + (int64_t)o * I;
+        uint8_t *qr = q3 + (int64_t)o * row_bytes;
+        float *sc = scale + (int64_t)o * n_groups;
+        for (int g = 0; g < n_groups; g++) {
+            int base = g * I3_GROUP;
+            int n = I - base; if (n > I3_GROUP) n = I3_GROUP;
+            float amax = 0;
+            for (int j = 0; j < n; j++) { float a = fabsf(wr[base + j]); if (a > amax) amax = a; }
+            float s = amax / 3.5f; if (s < 1e-8f) s = 1e-8f;
+            sc[g] = s;
+            float inv = 1.f / s;
+            uint8_t *lp = qr + (int64_t)g * I3_GBYTES;
+            uint8_t *hp = lp + 16;
+            memset(lp, 0, I3_GBYTES);
+            for (int j = 0; j < n; j++) {
+                int v = (int)lrintf(wr[base + j] * inv);
+                if (v > 3) v = 3; if (v < -4) v = -4;
+                int code = v + 4;
+                lp[j >> 2] |= (uint8_t)((code & 3) << ((j & 3) * 2));
+                hp[j >> 3] |= (uint8_t)(((code >> 2) & 1) << (j & 7));
+            }
+        }
+    }
+}
+
 /* ── Dispatcher: picks the kernel based on the format ── */
 
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
@@ -509,6 +583,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S) {
             matmul_i4(y, x, w->q4, w->s, S, w->I, w->O);
         return;
     }
+    if (w->fmt == 5) { matmul_i3_gs(y, x, w->q4, w->s, S, w->I, w->O, w->block_size); return; }
     /* fmt==3 MXFP4: TODO — for v1 we convert to INT4 at build time */
     fprintf(stderr, "matmul_qt: format %d not supported\n", w->fmt);
     exit(1);

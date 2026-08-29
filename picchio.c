@@ -2679,6 +2679,36 @@ static int self_test(void) {
         fprintf(stderr, " ✓ (err max=%.4f)\n", max_err);
     }
 
+    fprintf(stderr, "  test INT3 quant/matmul...");
+    {
+        /* INT3 gs64: quantize an F32 matrix (2 groups/row), matmul, compare. */
+        int O = 4, I = 128;                 /* I multiple of 64 */
+        int ng = (I + 63) / 64;
+        float W[512], x[128];
+        for (int i = 0; i < O * I; i++) W[i] = (float)((i % 32) - 16) * 0.1f;
+        for (int i = 0; i < I; i++) x[i] = 1.0f;
+
+        uint8_t q3[4 * 2 * 24];             /* O * ng * 24 */
+        float scale[4 * 2];                 /* O * ng */
+        quantize_rows_i3_gs(W, q3, scale, O, I);
+
+        float y_ref[4], y_q3[4];
+        matmul_f32(y_ref, x, W, 1, I, O);
+        matmul_i3_gs(y_q3, x, q3, scale, 1, I, O, 64);
+
+        float max_err = 0;
+        for (int i = 0; i < O; i++) {
+            float err = fabsf(y_ref[i] - y_q3[i]);
+            if (err > max_err) max_err = err;
+        }
+        (void)ng;
+        if (max_err > 6.0f) {               /* wide tolerance: int3 is lossy */
+            fprintf(stderr, " ✗ max error=%.2f\n", max_err);
+            return 1;
+        }
+        fprintf(stderr, " ✓ (err max=%.4f)\n", max_err);
+    }
+
     fprintf(stderr, "  test pipeline split (byte-identity)...");
     {
         int cut = c->n_layers / 2; if (cut < 1) cut = 1;
