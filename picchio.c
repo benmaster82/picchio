@@ -3877,6 +3877,17 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* DIRECT=1: unbuffered expert reads (O_DIRECT / FILE_FLAG_NO_BUFFERING),
+     * bypassing the OS page cache — a win on fast internal NVMe. Opt-in, with a
+     * buffered fallback per read so correctness is never at risk. */
+    {
+        const char *v = getenv("DIRECT");
+        if (v && atoi(v) != 0) {
+            st_set_direct(1);
+            fprintf(stderr, "expert I/O: DIRECT (unbuffered, page-cache bypass)\n");
+        }
+    }
+
     /* Prefetch → LRU (PREFETCH=1, historical alias PILOT=1). Predicts the next
      * layer's experts (post-MoE proxy) and loads them during the attention. */
     {

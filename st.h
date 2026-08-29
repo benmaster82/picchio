@@ -101,6 +101,7 @@ typedef struct {
     int64_t file_size;
 #else
     int fd;
+    int fd_direct;         /* O_DIRECT fd, opened lazily when DIRECT=1 (-1 = none) */
     uint8_t *mmap_ptr;
     int64_t file_size;
 #endif
@@ -115,6 +116,15 @@ typedef struct {
     StTensor *tensors;     /* heap-allocated [ST_MAX_TENSORS] */
     int n_tensors;
 } StDB;
+
+/* O_DIRECT / FILE_FLAG_NO_BUFFERING toggle (DIRECT=1): bypass the OS page cache
+ * for expert reads (a win on fast internal NVMe, where the buffered path can be
+ * page-cache-bound). It requires 4K-aligned offset/length/buffer, so direct reads
+ * go through a per-thread aligned bounce buffer (st_pread_direct). Opt-in; any
+ * failure falls back to the buffered path, so correctness is never at risk. */
+#define ST_ALIGN 4096
+static int st_direct = 0;
+static inline void st_set_direct(int v) { st_direct = v; }
 
 /* ── Per-thread (TLS) handles for safe parallel reads ──
  *
@@ -140,6 +150,25 @@ static HANDLE st_win_handle(StFile *sf, int file_idx) {
         st_tls_h[file_idx] = (h == INVALID_HANDLE_VALUE) ? sf->hFile : h;
     }
     return st_tls_h[file_idx];
+}
+
+/* Separate per-thread NO_BUFFERING handle for the direct path; the buffered
+ * st_win_handle above stays available as the safe fallback. */
+static __thread HANDLE st_tls_hd[ST_MAX_FILES];
+static __thread int    st_tls_hd_ready = 0;
+
+static HANDLE st_win_handle_direct(StFile *sf, int file_idx) {
+    if (!st_tls_hd_ready) {
+        for (int i = 0; i < ST_MAX_FILES; i++) st_tls_hd[i] = NULL;
+        st_tls_hd_ready = 1;
+    }
+    if (!st_tls_hd[file_idx]) {
+        HANDLE h = CreateFileA(sf->path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                               FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, NULL);
+        st_tls_hd[file_idx] = (h == INVALID_HANDLE_VALUE) ? NULL : h;
+    }
+    return st_tls_hd[file_idx];
 }
 #endif
 
@@ -288,6 +317,7 @@ static int st_open_file(StDB *db, const char *path) {
         fprintf(stderr, "st: cannot open %s\n", path);
         return -1;
     }
+    sf->fd_direct = -1;   /* opened lazily by st_posix_dfd when DIRECT=1 */
     struct stat st;
     fstat(sf->fd, &st);
     sf->file_size = st.st_size;
@@ -422,6 +452,82 @@ static int64_t st_pread_full(int fd, void *dst, int64_t nbytes, int64_t abs_offs
 }
 #endif
 
+/* ── Direct (unbuffered) positioned read via a 4K-aligned bounce buffer ──
+ * O_DIRECT / NO_BUFFERING require the offset, length and buffer to be aligned.
+ * We round the request out to 4K, read into a per-thread aligned buffer, then
+ * copy the exact slice to `dst`. Returns nbytes on success, -1 to fall back to
+ * the buffered path (never returns wrong/partial data). */
+static __thread uint8_t *st_bounce = NULL;
+static __thread size_t   st_bounce_cap = 0;
+
+static uint8_t *st_bounce_get(size_t need) {
+    if (st_bounce_cap >= need) return st_bounce;
+#ifdef _WIN32
+    if (st_bounce) VirtualFree(st_bounce, 0, MEM_RELEASE);
+    st_bounce = (uint8_t *)VirtualAlloc(NULL, need, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    if (st_bounce) free(st_bounce);
+    { void *p = NULL; if (posix_memalign(&p, ST_ALIGN, need) != 0) p = NULL;
+      st_bounce = (uint8_t *)p; }
+#endif
+    st_bounce_cap = st_bounce ? need : 0;
+    return st_bounce;
+}
+
+#ifdef _WIN32
+static int64_t st_pread_direct(HANDLE h, void *dst, int64_t nbytes, int64_t abs_offset) {
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return -1;
+    int64_t a0 = abs_offset & ~(int64_t)(ST_ALIGN - 1);
+    int64_t a1 = (abs_offset + nbytes + ST_ALIGN - 1) & ~(int64_t)(ST_ALIGN - 1);
+    int64_t alen = a1 - a0;
+    uint8_t *bb = st_bounce_get((size_t)alen);
+    if (!bb) return -1;
+    int64_t got = 0;
+    while (got < alen) {
+        int64_t want = alen - got;
+        if (want > (int64_t)0x02000000) want = 0x02000000;  /* 32 MiB, 4K-aligned */
+        int64_t off = a0 + got;
+        OVERLAPPED ov = {0};
+        ov.Offset = (DWORD)(off & 0xFFFFFFFF);
+        ov.OffsetHigh = (DWORD)(off >> 32);
+        DWORD rd = 0;
+        if (!ReadFile(h, bb + got, (DWORD)want, &rd, &ov)) break;
+        if (rd == 0) break;  /* EOF */
+        got += rd;
+    }
+    if (got - (abs_offset - a0) < nbytes) return -1;
+    memcpy(dst, bb + (abs_offset - a0), (size_t)nbytes);
+    return nbytes;
+}
+#else
+#ifndef O_DIRECT
+#define O_DIRECT 0   /* platforms without O_DIRECT: aligned read stays correct, no bypass */
+#endif
+static int st_posix_dfd(StFile *sf) {
+    if (sf->fd_direct >= 0) return sf->fd_direct;
+    int fd = open(sf->path, O_RDONLY | O_DIRECT);
+    sf->fd_direct = (fd >= 0) ? fd : sf->fd;   /* fall back to the buffered fd */
+    return sf->fd_direct;
+}
+static int64_t st_pread_direct(int fd, void *dst, int64_t nbytes, int64_t abs_offset) {
+    int64_t a0 = abs_offset & ~(int64_t)(ST_ALIGN - 1);
+    int64_t a1 = (abs_offset + nbytes + ST_ALIGN - 1) & ~(int64_t)(ST_ALIGN - 1);
+    int64_t alen = a1 - a0;
+    uint8_t *bb = st_bounce_get((size_t)alen);
+    if (!bb) return -1;
+    int64_t got = 0;
+    while (got < alen) {
+        ssize_t rd = pread(fd, bb + got, (size_t)(alen - got), a0 + got);
+        if (rd < 0) { if (errno == EINTR) continue; break; }
+        if (rd == 0) break;  /* EOF */
+        got += rd;
+    }
+    if (got - (abs_offset - a0) < nbytes) return -1;
+    memcpy(dst, bb + (abs_offset - a0), (size_t)nbytes);
+    return nbytes;
+}
+#endif
+
 /* ── Read the raw data of a tensor (pread) ── */
 
 static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) {
@@ -432,8 +538,16 @@ static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) 
     int64_t abs_offset = sf->data_offset + t->offset_start;
 
 #ifdef _WIN32
+    if (st_direct) {
+        int64_t r = st_pread_direct(st_win_handle_direct(sf, t->file_idx), dst, nbytes, abs_offset);
+        if (r == nbytes) return r;   /* else fall back to the buffered handle */
+    }
     return st_pread_full(st_win_handle(sf, t->file_idx), dst, nbytes, abs_offset);
 #else
+    if (st_direct) {
+        int64_t r = st_pread_direct(st_posix_dfd(sf), dst, nbytes, abs_offset);
+        if (r == nbytes) return r;
+    }
     return st_pread_full(sf->fd, dst, nbytes, abs_offset);
 #endif
 }
@@ -447,8 +561,16 @@ static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
     if (nbytes > total - byte_offset) nbytes = total - byte_offset;
     int64_t abs_offset = sf->data_offset + t->offset_start + byte_offset;
 #ifdef _WIN32
+    if (st_direct) {
+        int64_t r = st_pread_direct(st_win_handle_direct(sf, t->file_idx), dst, nbytes, abs_offset);
+        if (r == nbytes) return r;
+    }
     return st_pread_full(st_win_handle(sf, t->file_idx), dst, nbytes, abs_offset);
 #else
+    if (st_direct) {
+        int64_t r = st_pread_direct(st_posix_dfd(sf), dst, nbytes, abs_offset);
+        if (r == nbytes) return r;
+    }
     return st_pread_full(sf->fd, dst, nbytes, abs_offset);
 #endif
 }

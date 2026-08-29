@@ -135,6 +135,17 @@ This is expected to recover the PILOT regression (about 11 percent in
 metric it should be. Low complexity once S1 exists. Portable (POSIX `O_DIRECT`,
 Windows `FILE_FLAG_NO_BUFFERING`).
 
+**Status: implemented as opt-in `DIRECT=1`** (ahead of the S1 flat store). Rather
+than require a pre-aligned on-disk layout, the current reader keeps the arbitrary
+safetensors offsets and reads through a per-thread 4K-aligned **bounce buffer**
+(`st_pread_direct` in `st.h`): the request is rounded out to 4K, read unbuffered
+into the aligned buffer, and the exact slice is copied to the destination. This
+costs one extra `memcpy` versus a natively aligned store (what S1 would remove),
+but already bypasses the page cache today, on any model, with a per-read buffered
+fallback so correctness is never at risk. Validated byte-for-byte against the
+buffered path (identical greedy output). On a USB bridge the gain is small (the
+bridge, not the cache, is the wall); the payoff is on internal NVMe.
+
 ## 3. Phase S3: async high queue depth (`io_uring` / IOCP)
 
 Replace synchronous per-thread reads with asynchronous submission. Picchio already
