@@ -36,10 +36,10 @@ top-k routing, and full attention (no sinks, no sliding window) are switched on
 only for Qwen checkpoints. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
 and [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
 
-The converter and complete runtime path are covered by a synthetic Qwen3-MoE
-smoke test. A real 30B checkpoint was not available on the development machine,
-so token-level validation against `transformers` on the full model is still
-pending; the README does not claim that stronger validation yet.
+The converter and complete runtime path are covered by both a synthetic Qwen3-MoE
+smoke test and a short end-to-end run on a converted Qwen3-30B-A3B checkpoint.
+The remaining validation gap is a token/logit comparison with `transformers` on
+the original full-precision model, not basic loading, generation, or ChatML chat.
 
 **It can also split inference across two machines on a LAN.** Each node loads only
 its assigned dense layers and KV state, although both currently still need the
@@ -781,8 +781,13 @@ GPT-OSS path is unchanged. For the full list and the validation status, see
 Current validation status: a small all-MoE Qwen3 fixture created with the official
 `transformers` architecture converts, loads, and generates successfully. Its
 safetensors path and `.picchioflat + DIRECT + ASYNC_MOE` path produced the same
-greedy token sequence. Full-model comparison against the real 30B checkpoint is
-still pending.
+greedy token sequence. A converted real 30B-A3B checkpoint also loaded all 25,013
+tensors and produced identical greedy IDs through synchronous and asynchronous
+safetensors paths (`2773 12 16 15` for the short regression input). On the test
+machine the asynchronous path took 10.77 s versus 12.75 s, about **+18.4% tok/s**.
+Finally, `chat_qwen.py` rendered a real 10-token ChatML prompt and returned the
+coherent, deliberately truncated reply `Ciao! Come…`. A full-model numeric oracle
+comparison against `transformers` and a long multi-turn session remain pending.
 
 ---
 

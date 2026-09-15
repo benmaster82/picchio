@@ -1,11 +1,10 @@
 # Porting Picchio to Qwen3-MoE
 
-Status: **implemented and smoke-tested; pending validation on the real model.**
-The runtime and converter compile, the GPT-OSS self-test still passes, and an
-all-MoE synthetic Qwen3 fixture now converts, loads, and generates through both
-the safetensors and flat expert backends. Token-level comparison against
-`transformers` on the real 30B checkpoint has not yet been run; see
-[Validation](#validation).
+Status: **implemented and tested on a converted real Qwen3-30B-A3B model.** The
+runtime and converter compile, the GPT-OSS self-test still passes, and both an
+all-MoE synthetic fixture and the real 30B runtime/chat path generate correctly.
+Token/logit comparison against `transformers` on the original full-precision 30B
+checkpoint has not yet been run; see [Validation](#validation).
 
 Picchio was written for GPT-OSS. Qwen3-MoE (e.g. `Qwen/Qwen3-30B-A3B`) is the
 closest non-GPT-OSS family: GQA, RMSNorm, RoPE, SwiGLU experts, softmax router.
@@ -81,6 +80,13 @@ Verified so far:
   top-2 routing, no sinks, and plain SwiGLU. Eight greedy output IDs matched
   between safetensors and `.picchioflat + DIRECT + ASYNC_MOE`; all eight flat
   expert payloads were byte-verified against the converted container.
+- Real Qwen3-30B-A3B runtime: all 25,013 tensors from 16 converted shards loaded
+  (`D=2048 L=48 H=32 KV=4 E=128 top8`). A four-token greedy regression produced
+  `2773 12 16 15` through both synchronous and completion-driven asynchronous
+  safetensors paths. The asynchronous pass took 10.77 s versus 12.75 s, about
+  18.4% more tokens/s in this short run.
+- Real `chat_qwen.py` single-shot path: the tokenizer rendered a 10-token ChatML
+  prompt and the model replied `Ciao! Come…`, deliberately capped at four tokens.
 
 Reproduce the smoke test after building Picchio:
 
@@ -88,15 +94,14 @@ Reproduce the smoke test after building Picchio:
 python test_qwen_smoke.py
 ```
 
-Still to do (needs the real weights + `transformers`):
-1. Convert a Qwen3-30B-A3B checkpoint and confirm the container loads
-   (`picchio` prints `config: ... E=128 top8`, dense weights, no missing tensor).
-2. L1 oracle: extend `make_test_model.py`/`test_forward.py` with a Qwen3 fixture
+Still to do for stronger reference and session validation:
+1. L1 oracle: extend `make_test_model.py`/`test_forward.py` with a Qwen3 fixture
    (`tiny-random/qwen3-moe` style) and check per-checkpoint QK-Norm, router
    normalization, and plain-SiLU against `transformers`.
-3. L2: greedy token match vs `transformers` on the real checkpoint (allowing for
+2. L2: greedy token match vs `transformers` on the real checkpoint (allowing for
    INT4 lossiness, per DESIGN §0.2).
-4. Confirm `chat_qwen.py` prefix reuse (`reused k/N` should climb across turns).
+3. Confirm `chat_qwen.py` prefix reuse (`reused k/N` should climb across turns)
+   over a longer multi-turn session.
 
 ## Known caveats
 - Tied embeddings: if a Qwen variant sets `tie_word_embeddings=true`, `lm_head`
@@ -104,6 +109,5 @@ Still to do (needs the real weights + `transformers`):
 - Transient RAM in conversion: a shard's Qwen experts are held as F32 before
   quantization (~2× the BF16 shard). Fine for 30B on a roomy machine; watch it on
   16 GB.
-- The low-level Qwen service path is exercised end-to-end with raw token IDs, but
-  `chat_qwen.py` still needs a real tokenizer/model session to validate rendered
-  ChatML and multi-turn prefix reuse.
+- The low-level service and real single-shot `chat_qwen.py` paths are exercised;
+  long multi-turn prefix reuse still needs validation.
