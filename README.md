@@ -135,17 +135,16 @@ From the project folder (`C:\picchio` or wherever you cloned it):
 If you would rather not build from source, download the prebuilt Windows binary
 from the [Releases page](https://github.com/benmaster82/picchio/releases/latest):
 
-- Save it as **`picchio.exe`**. If the asset has a versioned name (e.g.
-  `picchio-v0.5.0-win64-avx2.exe`), rename it to `picchio.exe`, or pass
-  `--exe <name>` to `chat.py` / `server.py`. Every command below assumes the file
-  is called `picchio.exe`.
+- Download **`picchio.exe`** and place it in the project folder. Release assets
+  use this exact stable name, so every command below works without renaming it.
 - It is a **static build**: no MinGW DLLs, runs from anywhere.
-- Releases can lag the source tree. Compile from source to use the newest
-  experimental options such as `.picchioflat` and `ASYNC_MOE`.
+- Releases can lag the source tree. Version 0.6.0 includes `.picchioflat`,
+  direct I/O, `ASYNC_MOE`, INT3, Qwen3-MoE, and the two-node pipeline; compile
+  from source only when you need changes newer than the latest release.
 - Requires **Windows x64 with an AVX2/FMA CPU** (2013 or newer). The binary is
   unsigned, so Windows SmartScreen may warn on first run ("More info" then "Run
   anyway").
-- Verify the download against the **SHA256** published on the release.
+- Verify the download against `SHA256SUMS.txt` published on the release.
 
 Then skip to [section 4](#4-download-and-convert-a-model) to get a model. To
 compile it yourself instead (any OS), continue below.

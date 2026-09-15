@@ -3986,8 +3986,8 @@ static int service_loop(Model *m, int cap) {
  * ═══════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
-    fprintf(stderr, "🪶 picchio v0.5.0 — MoE streaming engine\n");
-    fprintf(stderr, "   GQA · INT4 · CPU streaming (architecture read from config.json)\n\n");
+    fprintf(stderr, "🪶 picchio v0.6.0 — MoE streaming engine\n");
+    fprintf(stderr, "   GPT-OSS/Qwen3-MoE · INT3/INT4 · CPU streaming\n\n");
 
     /* ── Self-test mode ── */
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
