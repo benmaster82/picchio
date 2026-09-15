@@ -305,6 +305,12 @@ def main():
     ap.add_argument("--ctx", type=int, default=1024)
     ap.add_argument("--pin-gb", type=int, default=4)
     ap.add_argument("--threads", type=int, default=6)
+    ap.add_argument("--io-threads", type=int,
+                    help="parallel expert reads (engine default: 4)")
+    ap.add_argument("--async-moe", action="store_true",
+                    help="overlap routed expert reads with CPU expert compute")
+    ap.add_argument("--direct", action="store_true",
+                    help="use unbuffered expert reads (best paired with --async-moe)")
     ap.add_argument("--model-aux")
     ap.add_argument("--reasoning", choices=("low", "medium", "high"), default="medium")
     ap.add_argument("--date", default=date.today().isoformat())
@@ -324,8 +330,11 @@ def main():
     sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p,
                 "TOPK": args.top_k, "SEED": args.seed}
     print(f"[starting Picchio SERVICE: {model}]", file=sys.stderr)
-    session = PicchioSession(exe, model, args.ctx, args.pin_gb, args.threads,
-                             resolve_aux(model, args.model_aux), sampling)
+    session = PicchioSession(
+        exe, model, args.ctx, args.pin_gb, args.threads,
+        resolve_aux(model, args.model_aux), sampling,
+        async_moe=args.async_moe, direct=args.direct,
+        io_threads=args.io_threads)
     print(f"[ready: ctx={session.ctx} vocab={session.vocab}]", file=sys.stderr)
 
     Handler.engine = Engine(session, model.name, args.reasoning, args.date)

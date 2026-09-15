@@ -51,6 +51,7 @@
 #include "quant.h"
 #include "json.h"
 #include "st.h"
+#include "flat.h"
 #include "tok.h"
 #include "picchio_cuda.h"   /* optional GPU backend: PgpuExpert + entry-point types */
 
@@ -218,6 +219,8 @@ typedef struct {
     uint64_t hits, miss, ereq; /* cache statistics */
     uint64_t n_fw, n_emit;     /* forwards / emitted tokens */
     double t_edisk;       /* total time reading experts from disk */
+    uint64_t async_jobs;  /* current-layer asynchronous read batches */
+    double t_async_wait;  /* time with no ready expert left to compute */
     double t_attn;        /* total attention time */
     double t_moe;         /* total MoE compute time */
     double t_head;        /* total lm_head time */
@@ -714,6 +717,9 @@ static void gqa_attention(float *out, const float *x, Layer *l,
 
 /* Global pointer to the safetensors DB (for access from expert_load) */
 static StDB *g_db = NULL;
+static FlatStore g_flat;
+
+static void flat_global_shutdown(void) { flat_close(&g_flat); }
 
 /* Load an expert bias from the correct F32 format, or recover the old
  * converted format: INT4 bytes mistakenly saved as F32 + gs64 scale. */
@@ -781,6 +787,59 @@ static float *load_expert_bias(int layer, int eid, const char *suffix,
     return out;
 }
 
+/* Fast path for converted group-scaled INT4/INT3 experts. The flat payload is
+ * gate_up packed | gate_up scales | down packed | down scales. Biases remain in
+ * safetensors (small and architecture-dependent). Weight pointers slice one
+ * aligned allocation, so DIRECT reads need no bounce buffer or memcpy. */
+static int expert_load_flat(Model *m, int layer, int eid, ESlot *s) {
+    FlatLoc *loc = flat_loc(&g_flat, layer, eid);
+    if (!loc) return 0;
+    Cfg *c = &m->c;
+    int D = c->hidden, I = c->moe_inter, down_I = I / 2;
+    int64_t gu_qb, d_qb;
+    if (c->expert_bits == 3) {
+        gu_qb = (int64_t)I * (((int64_t)D + 63) / 64) * 24;
+        d_qb = (int64_t)D * (((int64_t)down_I + 63) / 64) * 24;
+    } else if (c->expert_bits == 4) {
+        gu_qb = (int64_t)I * ((D + 1) / 2);
+        d_qb = (int64_t)D * ((down_I + 1) / 2);
+    } else {
+        return 0;
+    }
+    int64_t gu_sb = (int64_t)I * ((D + 63) / 64) * 4;
+    int64_t d_sb = (int64_t)D * ((down_I + 63) / 64) * 4;
+    int64_t expected = gu_qb + gu_sb + d_qb + d_sb;
+    if (expected != loc->len) {
+        static int warned = 0;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "flat: expert payload size mismatch; using safetensors fallback\n");
+        return 0;
+    }
+
+    uint8_t *blob = (uint8_t *)flat_aligned_alloc(loc->padded_len);
+    if (!blob || !flat_read(&g_flat, loc, blob, st_direct)) {
+        flat_aligned_free(blob);
+        return 0;
+    }
+    memset(&s->gu, 0, sizeof(s->gu));
+    memset(&s->d, 0, sizeof(s->d));
+    s->slab = blob;
+    s->slab_cap = loc->padded_len;
+    s->gu.fmt = c->expert_bits == 3 ? 5 : 2;
+    s->gu.O = I; s->gu.I = D; s->gu.block_size = 64;
+    s->gu.q4 = blob;
+    s->gu.s = (float *)(blob + gu_qb);
+    s->d.fmt = c->expert_bits == 3 ? 5 : 2;
+    s->d.O = D; s->d.I = down_I; s->d.block_size = 64;
+    s->d.q4 = blob + gu_qb + gu_sb;
+    s->d.s = (float *)(blob + gu_qb + gu_sb + d_qb);
+    s->gu_bias = load_expert_bias(layer, eid, "gate_up_proj_bias",
+                                  c->n_experts, I);
+    s->d_bias = load_expert_bias(layer, eid, "down_proj_bias",
+                                 c->n_experts, D);
+    return 1;
+}
+
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -789,6 +848,8 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
 
     s->eid = eid;
     s->layer = layer;
+
+    if (expert_load_flat(m, layer, eid, s)) return;
 
     if (!g_db) {
         /* No safetensors DB — mark expert as unavailable */
@@ -1023,16 +1084,22 @@ static void slot_wait_ready(ESlot *s) {
 }
 
 static void free_slot_buffers(ESlot *s) {
-    free(s->gu.qf); s->gu.qf = NULL;
-    free(s->gu.q4); s->gu.q4 = NULL;
-    free(s->gu.s);  s->gu.s = NULL;
-    free(s->d.qf);  s->d.qf = NULL;
-    free(s->d.q4);  s->d.q4 = NULL;
-    free(s->d.s);   s->d.s = NULL;
+    if (s->slab) {
+        flat_aligned_free(s->slab); s->slab = NULL;
+        s->gu.qf = NULL; s->gu.q4 = NULL; s->gu.s = NULL;
+        s->d.qf = NULL; s->d.q4 = NULL; s->d.s = NULL;
+    } else {
+        free(s->gu.qf); s->gu.qf = NULL;
+        free(s->gu.q4); s->gu.q4 = NULL;
+        free(s->gu.s);  s->gu.s = NULL;
+        free(s->d.qf);  s->d.qf = NULL;
+        free(s->d.q4);  s->d.q4 = NULL;
+        free(s->d.s);   s->d.s = NULL;
+    }
     free(s->gu_bias); s->gu_bias = NULL;
     free(s->d_bias);  s->d_bias = NULL;
-    free(s->slab);    s->slab = NULL;
     free(s->fslab);   s->fslab = NULL;
+    s->slab_cap = s->fslab_cap = 0;
 }
 
 static ESlot *cache_lookup(Model *m, int layer, int eid) {
@@ -1079,16 +1146,7 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
 
     /* Free old data if the slot was occupied (eviction) */
     if (victim->eid >= 0) {
-        free(victim->gu.qf); victim->gu.qf = NULL;
-        free(victim->gu.q4); victim->gu.q4 = NULL;
-        free(victim->gu.s);  victim->gu.s = NULL;
-        free(victim->d.qf);  victim->d.qf = NULL;
-        free(victim->d.q4);  victim->d.q4 = NULL;
-        free(victim->d.s);   victim->d.s = NULL;
-        free(victim->gu_bias); victim->gu_bias = NULL;
-        free(victim->d_bias);  victim->d_bias = NULL;
-        free(victim->slab);    victim->slab = NULL;
-        free(victim->fslab);   victim->fslab = NULL;
+        free_slot_buffers(victim);
     }
     
     expert_load(m, layer, eid, victim);
@@ -1174,6 +1232,258 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
         for (int mi = 0; mi < nmiss; mi++) {
             int i = miss_i[mi];
             expert_load(m, layer, eids[i], out[i]);
+        }
+        m->t_edisk += now_s() - t0;
+    }
+}
+
+/* Completion-driven current-layer I/O. Unlike the predictive prefetch below,
+ * this worker owns only misses already selected by the router. Each slot is
+ * published independently (loading=0, release), allowing the main thread to
+ * compute ready experts while the remaining reads are still in flight. */
+typedef struct {
+    Model *m;
+    int layer;
+    int n;
+    ESlot *slots[128];
+    int eids[128];
+    int has_job;
+    int shutdown;
+    int initialized;
+#ifdef _WIN32
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+    HANDLE thread;
+#else
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t thread;
+#endif
+} AsyncLoader;
+
+static AsyncLoader g_async_loader;
+static int g_async_moe_enabled = 0;
+
+static void async_loader_run_job(void) {
+    int n = g_async_loader.n, layer = g_async_loader.layer;
+    Model *m = g_async_loader.m;
+    double t0 = now_s();
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(g_io_threads) \
+            if(g_io_threads > 1 && n > 1)
+#endif
+    for (int i = 0; i < n; i++) {
+        if (!g_async_loader.shutdown)
+            expert_load(m, layer, g_async_loader.eids[i],
+                        g_async_loader.slots[i]);
+        slot_set_loading(g_async_loader.slots[i], 0);
+    }
+    m->t_edisk += now_s() - t0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI async_loader_thread(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        EnterCriticalSection(&g_async_loader.cs);
+        while (!g_async_loader.has_job && !g_async_loader.shutdown)
+            SleepConditionVariableCS(&g_async_loader.cv, &g_async_loader.cs,
+                                     INFINITE);
+        if (g_async_loader.shutdown) {
+            LeaveCriticalSection(&g_async_loader.cs);
+            break;
+        }
+        LeaveCriticalSection(&g_async_loader.cs);
+        async_loader_run_job();
+        EnterCriticalSection(&g_async_loader.cs);
+        g_async_loader.has_job = 0;
+        WakeAllConditionVariable(&g_async_loader.cv);
+        LeaveCriticalSection(&g_async_loader.cs);
+    }
+    return 0;
+}
+#else
+static void *async_loader_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_async_loader.mutex);
+        while (!g_async_loader.has_job && !g_async_loader.shutdown)
+            pthread_cond_wait(&g_async_loader.cond, &g_async_loader.mutex);
+        if (g_async_loader.shutdown) {
+            pthread_mutex_unlock(&g_async_loader.mutex);
+            break;
+        }
+        pthread_mutex_unlock(&g_async_loader.mutex);
+        async_loader_run_job();
+        pthread_mutex_lock(&g_async_loader.mutex);
+        g_async_loader.has_job = 0;
+        pthread_cond_broadcast(&g_async_loader.cond);
+        pthread_mutex_unlock(&g_async_loader.mutex);
+    }
+    return NULL;
+}
+#endif
+
+static void async_loader_shutdown(void) {
+    if (!g_async_loader.initialized) return;
+#ifdef _WIN32
+    EnterCriticalSection(&g_async_loader.cs);
+    while (g_async_loader.has_job)
+        SleepConditionVariableCS(&g_async_loader.cv, &g_async_loader.cs,
+                                 INFINITE);
+    g_async_loader.shutdown = 1;
+    WakeConditionVariable(&g_async_loader.cv);
+    LeaveCriticalSection(&g_async_loader.cs);
+    WaitForSingleObject(g_async_loader.thread, INFINITE);
+    CloseHandle(g_async_loader.thread);
+    DeleteCriticalSection(&g_async_loader.cs);
+#else
+    pthread_mutex_lock(&g_async_loader.mutex);
+    while (g_async_loader.has_job)
+        pthread_cond_wait(&g_async_loader.cond, &g_async_loader.mutex);
+    g_async_loader.shutdown = 1;
+    pthread_cond_signal(&g_async_loader.cond);
+    pthread_mutex_unlock(&g_async_loader.mutex);
+    pthread_join(g_async_loader.thread, NULL);
+    pthread_mutex_destroy(&g_async_loader.mutex);
+    pthread_cond_destroy(&g_async_loader.cond);
+#endif
+    g_async_loader.initialized = 0;
+    g_async_moe_enabled = 0;
+}
+
+static int async_loader_init(Model *m) {
+    memset(&g_async_loader, 0, sizeof(g_async_loader));
+    g_async_loader.m = m;
+#ifdef _WIN32
+    InitializeCriticalSection(&g_async_loader.cs);
+    InitializeConditionVariable(&g_async_loader.cv);
+    g_async_loader.thread = CreateThread(NULL, 0, async_loader_thread,
+                                         NULL, 0, NULL);
+    if (!g_async_loader.thread) {
+        DeleteCriticalSection(&g_async_loader.cs);
+        return 0;
+    }
+#else
+    pthread_mutex_init(&g_async_loader.mutex, NULL);
+    pthread_cond_init(&g_async_loader.cond, NULL);
+    if (pthread_create(&g_async_loader.thread, NULL, async_loader_thread,
+                       NULL) != 0) {
+        pthread_mutex_destroy(&g_async_loader.mutex);
+        pthread_cond_destroy(&g_async_loader.cond);
+        return 0;
+    }
+#endif
+    g_async_loader.initialized = 1;
+    g_async_moe_enabled = 1;
+    return 1;
+}
+
+static int async_loader_submit(Model *m, int layer, ESlot **slots,
+                               const int *eids, int n) {
+    if (!g_async_loader.initialized || n <= 0) return n == 0;
+#ifdef _WIN32
+    EnterCriticalSection(&g_async_loader.cs);
+    while (g_async_loader.has_job && !g_async_loader.shutdown)
+        SleepConditionVariableCS(&g_async_loader.cv, &g_async_loader.cs,
+                                 INFINITE);
+#else
+    pthread_mutex_lock(&g_async_loader.mutex);
+    while (g_async_loader.has_job && !g_async_loader.shutdown)
+        pthread_cond_wait(&g_async_loader.cond, &g_async_loader.mutex);
+#endif
+    if (g_async_loader.shutdown) {
+#ifdef _WIN32
+        LeaveCriticalSection(&g_async_loader.cs);
+#else
+        pthread_mutex_unlock(&g_async_loader.mutex);
+#endif
+        return 0;
+    }
+    g_async_loader.m = m;
+    g_async_loader.layer = layer;
+    g_async_loader.n = n;
+    for (int i = 0; i < n; i++) {
+        g_async_loader.slots[i] = slots[i];
+        g_async_loader.eids[i] = eids[i];
+    }
+    g_async_loader.has_job = 1;
+    m->async_jobs++;
+#ifdef _WIN32
+    WakeConditionVariable(&g_async_loader.cv);
+    LeaveCriticalSection(&g_async_loader.cs);
+#else
+    pthread_cond_signal(&g_async_loader.cond);
+    pthread_mutex_unlock(&g_async_loader.mutex);
+#endif
+    return 1;
+}
+
+/* Resolve/reserve a routed top-k exactly like cache_load_batch, but return as
+ * soon as the misses have been queued. Hits already being filled by predictive
+ * prefetch also stay asynchronous instead of forcing a barrier here. */
+static void cache_load_batch_async(Model *m, int layer, const int *eids, int n,
+                                   ESlot **out) {
+    ESlot *pool = m->ecache[layer];
+    int miss_i[128], nmiss = 0;
+    ESlot *miss_slots[128];
+    int miss_eids[128];
+
+    for (int i = 0; i < n; i++) {
+        ESlot *found = NULL;
+        for (int j = 0; j < m->npin[layer]; j++)
+            if (m->pin[layer][j].eid == eids[i]) {
+                found = &m->pin[layer][j]; break;
+            }
+        if (!found)
+            for (int j = 0; j < m->ecn[layer]; j++)
+                if (pool[j].eid == eids[i]) { found = &pool[j]; break; }
+        if (found) {
+            found->last_used = ++m->eclock;
+            m->hits++;
+            out[i] = found;
+        } else {
+            out[i] = NULL;
+            miss_i[nmiss++] = i;
+        }
+    }
+
+    for (int mi = 0; mi < nmiss; mi++) {
+        int i = miss_i[mi];
+        ESlot *victim = NULL;
+        if (m->ecn[layer] < m->ecap) {
+            victim = &pool[m->ecn[layer]++];
+        } else {
+            uint64_t oldest = UINT64_MAX;
+            for (int j = 0; j < m->ecn[layer]; j++) {
+                if (slot_loading(&pool[j])) continue;
+                if (pool[j].last_used < oldest) {
+                    oldest = pool[j].last_used;
+                    victim = &pool[j];
+                }
+            }
+            if (!victim) {
+                victim = &pool[0];
+                slot_wait_ready(victim);
+            }
+        }
+        if (victim->eid >= 0) free_slot_buffers(victim);
+        victim->eid = eids[i];
+        victim->layer = layer;
+        victim->last_used = ++m->eclock;
+        slot_set_loading(victim, 1);
+        m->miss++;
+        m->ereq++;
+        out[i] = victim;
+        miss_slots[mi] = victim;
+        miss_eids[mi] = eids[i];
+    }
+
+    if (!async_loader_submit(m, layer, miss_slots, miss_eids, nmiss)) {
+        double t0 = now_s();
+        for (int mi = 0; mi < nmiss; mi++) {
+            expert_load(m, layer, miss_eids[mi], miss_slots[mi]);
+            slot_set_loading(miss_slots[mi], 0);
         }
         m->t_edisk += now_s() - t0;
     }
@@ -1436,6 +1746,9 @@ static void router_weights(const Cfg *c, float *scores, const int *sel,
     }
 }
 
+static void expert_apply(ESlot *es, const float *x, float *dst, float w,
+                         const Cfg *c);
+
 static void moe_forward(float *out, const float *x, Model *m,
                         int layer, const Cfg *c) {
     int D = c->hidden;
@@ -1510,14 +1823,58 @@ static void moe_forward(float *out, const float *x, Model *m,
             m->eheat[layer][sel[k]]++;
     }
 
-    /* 5. Load and compute each expert.
-     * The K selected experts (unique, K <= ecap) are prefetched in a single
-     * batch: the misses are read from disk in parallel before computing. */
+    /* 5. Load and compute each expert. ASYNC_MOE lets ready experts run while
+     * other selected misses are still being read. Validation and GPU modes use
+     * the established blocking path. */
     float *expert_out = calloc(D, sizeof(float));
     memset(out, 0, D * sizeof(float));
 
     ESlot *slots[64];
-    cache_load_batch(m, layer, sel, K, slots);
+    int async_done = 0;
+    int use_async = g_async_moe_enabled && !g_gpu_on &&
+                    !g_oracle_dir && !g_trace_numeric;
+    if (use_async)
+        cache_load_batch_async(m, layer, sel, K, slots);
+    else
+        cache_load_batch(m, layer, sel, K, slots);
+
+    if (use_async) {
+        /* Compute in completion order, but keep each contribution separate.
+         * The final reduction below is in router top-k order, preserving the
+         * same floating-point accumulation order as the synchronous path. */
+        float *contrib = (float *)calloc((size_t)K * D, sizeof(float));
+        unsigned char done[64] = {0};
+        if (!contrib) { fprintf(stderr, "OOM async MoE contributions\n"); exit(1); }
+        int completed = 0;
+        while (completed < K) {
+            int progress = 0;
+            for (int k = 0; k < K; k++) {
+                if (done[k] || slot_loading(slots[k])) continue;
+                if (slots[k]->eid >= 0)
+                    expert_apply(slots[k], x, contrib + (size_t)k * D,
+                                 1.0f, c);
+                done[k] = 1;
+                completed++;
+                progress = 1;
+            }
+            if (!progress && completed < K) {
+                double tw = now_s();
+#ifdef _WIN32
+                Sleep(0);
+#else
+                usleep(50);
+#endif
+                m->t_async_wait += now_s() - tw;
+            }
+        }
+        for (int k = 0; k < K; k++) {
+            float w = weights[k] * c->routed_scale;
+            const float *src = contrib + (size_t)k * D;
+            for (int i = 0; i < D; i++) out[i] += w * src[i];
+        }
+        free(contrib);
+        async_done = 1;
+    }
 
     /* G2: compute the whole expert sum on the GPU (weights cached in VRAM),
      * falling back to the CPU loop below on any failure. Skipped in validation
@@ -1544,7 +1901,7 @@ static void moe_forward(float *out, const float *x, Model *m,
             gpu_done = 1;
     }
 
-    for (int k = 0; !gpu_done && k < K; k++) {
+    for (int k = 0; !gpu_done && !async_done && k < K; k++) {
         ESlot *es = slots[k];
         if (es->eid < 0) continue;  /* load error */
 
@@ -2296,6 +2653,18 @@ static void stats_dump(Model *m) {
                 ? 100.0 * m->hits / (m->hits + m->miss) : 0.0);
     fprintf(stderr, "disk reads: %llu (%.2f s total)\n",
             (unsigned long long)m->ereq, m->t_edisk);
+    if (g_flat.reads > 0)
+        fprintf(stderr, "flat reads: %llu (%.2f GB aligned)\n",
+                (unsigned long long)g_flat.reads, g_flat.bytes / 1e9);
+    if (g_flat.direct_fallbacks)
+        fprintf(stderr, "flat direct fallbacks: %llu\n",
+                (unsigned long long)g_flat.direct_fallbacks);
+    if (g_flat.corruptions)
+        fprintf(stderr, "flat corruptions: %llu (safetensors fallback used)\n",
+                (unsigned long long)g_flat.corruptions);
+    if (m->async_jobs > 0)
+        fprintf(stderr, "async MoE:  %llu batches, %.3f s exposed wait\n",
+                (unsigned long long)m->async_jobs, m->t_async_wait);
     fprintf(stderr, "t_attn:     %.2f s\n", m->t_attn);
     fprintf(stderr, "t_moe:      %.2f s\n", m->t_moe);
     fprintf(stderr, "t_head:     %.2f s\n", m->t_head);
@@ -2630,6 +2999,24 @@ static int self_test(void) {
             return 1;
         }
         fprintf(stderr, " ✓\n");
+    }
+
+    fprintf(stderr, "  test async MoE canonical reduction...");
+    {
+        float x[64], sync_out[64], async_out[64];
+        for (int i = 0; i < c->hidden; i++)
+            x[i] = (float)((i % 13) - 6) * 0.03125f;
+        g_async_moe_enabled = 0;
+        moe_forward(sync_out, x, &m, 0, c);
+        g_async_moe_enabled = 1;  /* all synthetic experts are resident */
+        moe_forward(async_out, x, &m, 0, c);
+        g_async_moe_enabled = 0;
+        if (memcmp(sync_out, async_out,
+                   (size_t)c->hidden * sizeof(float)) != 0) {
+            fprintf(stderr, " FAIL: async output differs from sync\n");
+            return 1;
+        }
+        fprintf(stderr, " OK (byte-identical)\n");
     }
 
     fprintf(stderr, "  test RoPE...");
@@ -3761,6 +4148,40 @@ int main(int argc, char **argv) {
     /* Make the DB accessible to the expert loader */
     g_db = &db;
 
+    /* Optional aligned expert store. Auto-detect experts.picchioflat next to
+     * the model; FLAT=<path> overrides it and FLAT=0 disables discovery. A
+     * partial store is valid and falls back to safetensors for missing layers. */
+    {
+        const char *fv = getenv("FLAT");
+        if (!(fv && strcmp(fv, "0") == 0)) {
+            char flat_path[768];
+            int explicit_path = fv && *fv && strcmp(fv, "1") != 0;
+            if (explicit_path)
+                snprintf(flat_path, sizeof(flat_path), "%s", fv);
+            else
+                snprintf(flat_path, sizeof(flat_path), "%s/experts.picchioflat",
+                         model_path);
+            FILE *ff = fopen(flat_path, "rb");
+            if (ff) {
+                fclose(ff);
+                const char *vv = getenv("FLAT_VERIFY");
+                int verify = vv && atoi(vv) != 0;
+                if (flat_open(&g_flat, flat_path, m.c.hidden, m.c.n_layers,
+                              m.c.n_experts, m.c.topk, m.c.moe_inter, verify)) {
+                    fprintf(stderr, "  flat experts: %u/%u indexed, 4 KiB aligned%s\n",
+                            g_flat.n_entries,
+                            g_flat.n_layers * g_flat.n_experts,
+                            verify ? ", payload verification ON" : "");
+                    atexit(flat_global_shutdown);
+                } else {
+                    fprintf(stderr, "  warning: flat store rejected; using safetensors\n");
+                }
+            } else if (explicit_path) {
+                fprintf(stderr, "  warning: FLAT not found: %s\n", flat_path);
+            }
+        }
+    }
+
     /* ── 3. Allocate structures and load weights ── */
     Cfg *c = &m.c;
     m.L = calloc(c->n_layers, sizeof(Layer));
@@ -3899,6 +4320,20 @@ int main(int argc, char **argv) {
                 g_io_threads > 1 ? "parallel reads" : "serial");
     }
 
+    /* ASYNC_MOE=1: overlap current-layer expert reads with CPU expert compute.
+     * Kept opt-in until representative disk/CPU combinations are benchmarked. */
+    {
+        const char *v = getenv("ASYNC_MOE");
+        if (v && atoi(v) != 0) {
+            if (async_loader_init(&m)) {
+                atexit(async_loader_shutdown);
+                fprintf(stderr, "expert pipeline: completion-driven async MoE\n");
+            } else {
+                fprintf(stderr, "  warning: async MoE thread creation failed; using sync path\n");
+            }
+        }
+    }
+
     /* IDOT=1: faster integer expert kernel (INT8 activation × INT4 weight, AVX2).
      * Approximate (activation quantized to int8), so opt-in; F32 stays default. */
     {
@@ -3961,6 +4396,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "PIPE_SPLIT_CHECK tok=%d pos=%d cut=%d: %s\n",
                     toks[i], i, cut, ok ? "IDENTICAL" : "DIFFER");
         }
+        pilot_shutdown();
+        async_loader_shutdown();
         st_close(&db);
         return 0;
       } }
@@ -3996,6 +4433,7 @@ int main(int argc, char **argv) {
         }
         net_close(ls);
         stats_dump(&m); hotstore_save(&m); pilot_shutdown();
+        async_loader_shutdown();
         if (has_tokenizer) tok_free(&tok);
         st_close(&db);
         return 0;
@@ -4025,12 +4463,14 @@ int main(int argc, char **argv) {
             int rc = service_loop(&m, initial_ctx);
             net_close(g_pipe_sock);
             stats_dump(&m); hotstore_save(&m); pilot_shutdown();
+            async_loader_shutdown();
             if (has_tokenizer) tok_free(&tok);
             st_close(&db);
             return rc;
         }
         int rc = pipe_coord_run(&m, peer, g_pipe_cut, max_tokens);
         stats_dump(&m); hotstore_save(&m); pilot_shutdown();
+        async_loader_shutdown();
         if (has_tokenizer) tok_free(&tok);
         st_close(&db);
         return rc;
@@ -4045,6 +4485,7 @@ int main(int argc, char **argv) {
         stats_dump(&m);
         hotstore_save(&m);
         pilot_shutdown();
+        async_loader_shutdown();
         if (has_tokenizer) tok_free(&tok);
         st_close(&db);
         return rc;
@@ -4273,6 +4714,7 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     pilot_shutdown();
+    async_loader_shutdown();
     if (prompt_tokens_owned) free(prompt_tokens);
     if (has_tokenizer) tok_free(&tok);
     st_close(&db);

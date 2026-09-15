@@ -16,7 +16,6 @@ import ctypes
 import ctypes.wintypes as w
 import os
 import random
-import struct
 import sys
 import time
 
@@ -41,19 +40,14 @@ class OVERLAPPED(ctypes.Structure):
 
 
 # ── read superblock + index ──
-with open(FLAT, "rb") as f:
-    sb = f.read(BS)
-    magic, ver, bs, NL, NE, n, idx_off, idx_len, data_off = struct.unpack_from(
-        "<8sIIIIIQQQ", sb)
-    assert magic == b"PCHIOFL1", magic
-    f.seek(idx_off)
-    raw = f.read(idx_len)
-index = [struct.unpack_from("<QII", raw, i * 16) for i in range(n)]
+meta, index = fc.read_flat(FLAT)
+n = meta["count"]
 random.seed(0)
 K = min(int(os.environ.get("FLAT_SAMPLE", "384")), n)
 sample = random.sample(index, K)
-per_pass = sum(pd for _, _, pd in sample)
-print(f"flat: {n} experts, {idx_off/n/1e6:.2f} MB/expert, disk {FLAT[0]}:  "
+per_pass = sum(pd for _, _, pd, _ in sample)
+avg = sum(pd for _, _, pd, _ in index) / n / 1e6
+print(f"flat: {n} experts, {avg:.2f} MB/expert, disk {FLAT[0]}:  "
       f"set={K} experts, {per_pass/1e6:.0f} MB/pass")
 
 
@@ -64,7 +58,7 @@ def qd_read(entries, qd):
     port = k.CreateIoCompletionPort(ctypes.c_void_p(h), None, 0, 0)
     if not port:
         raise OSError("CreateIoCompletionPort failed")
-    maxlen = max(pd for _, _, pd in entries)
+    maxlen = max(pd for _, _, pd, _ in entries)
     bufs = [k.VirtualAlloc(None, ctypes.c_size_t(maxlen), 0x3000, 4) for _ in range(qd)]
     ovs = [OVERLAPPED() for _ in range(qd)]
     addr2slot = {ctypes.addressof(ovs[j]): j for j in range(qd)}

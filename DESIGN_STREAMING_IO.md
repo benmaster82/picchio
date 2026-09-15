@@ -1,8 +1,10 @@
 # Streaming I/O roadmap: aligned expert store and OS-bypass
 
-Status: S1 prototyped and S2/S3 measured in a standalone harness
-(`flat_pack.py`, `flat_bench.py`, `flat_bench_qd.py`); integration into the core
-engine is pending. See section 8 for the measured results. This document
+Status: S1 integrated in the core engine; S2 is available and S3 has both the
+completion-driven runtime scheduler and an IOCP measurement harness
+(`flat_pack.py`, `flat_bench.py`, `flat_bench_qd.py`). Native IOCP/io_uring
+submission in the engine is still pending. See section 8 for measured results.
+This document
 specifies a fast storage path for Picchio's expert streaming and the roadmap that
 leads to a full OS-bypass data path. It is deliberately incremental: each phase is
 useful on its own, is measured before the next is started, and keeps the current
@@ -59,10 +61,10 @@ reads).
 ```
 [ Superblock ]  (one BS block at offset 0)
   u64  magic          "PCHIOFL1"
-  u32  version
+  u32  version        (2)
   u32  block_size     BS (4096)
   u32  hidden, n_layers, n_experts, topk, moe_inter   (arch echo, sanity check)
-  u32  n_experts_total    (= n_layers * n_experts)
+  u32  n_entries          (normally n_layers * n_experts; may be partial for tests)
   u64  index_offset       (BS-aligned start of the expert index)
   u64  index_len
   u64  data_offset        (BS-aligned start of the payload region)
@@ -84,9 +86,13 @@ reads).
     gate_up_proj scales (f32, group-scaled 64)
     down_proj    packed (INT4)
     down_proj    scales (f32)
-    gate_up bias (f32, if present)   down bias (f32, if present)
     (pad to a multiple of BS so the next expert starts aligned)
 ```
+
+Expert biases remain in safetensors in v2. GPT-OSS stores them in small
+layer-aggregated tensors and Qwen has none; keeping them outside the streamed
+weight payload avoids format flags while the four bandwidth-dominant tensors
+still arrive in one aligned read.
 
 The sub-tensor sizes are fully determined by `config.json` (`moe_inter`, `hidden`,
 group size), so the runtime slices the single expert buffer without per-sub-tensor
@@ -109,20 +115,26 @@ which becomes useful for the raw-partition phase.
 
 ### 1.4 Producer
 
-A converter post-pass (or a new writer in `convert.py` / `convert_streaming*.py`)
+A converter post-pass (`flat_pack.py`)
 walks the converted INT4 experts in `(layer, eid)` order, writes each expert's
 sub-tensors contiguously, pads to `BS`, and records `offset/len/padded_len/hash`.
 Picchio's experts are already contiguous in the current container, so this is a
-repack, not a re-quantization. It runs from the converted model, no re-download.
+repack, not a re-quantization. It runs from the converted model, no re-download,
+and atomically renames the completed temporary image. The default packs every
+layer to `<model>/experts.picchioflat`; `FLAT_LAYERS` can create a prefix-only
+store for tests.
 
 ### 1.5 Consumer (interception point)
 
-The natural hook is `expert_load` / `cache_load_batch` in `picchio.c` (backed by
-`st.h`). If a `.picchioflat` file is present next to the model, the expert backend
-switches to: `loc = index[layer*n_experts + eid]; read(fd, aligned_buf,
-loc.padded_len, loc.offset)`, then slice. No `st_find`, no path walk. If the flat
-file is absent, the current safetensors path is used unchanged. The flat store is
-an optional fast lane produced by one extra convert step.
+The hook is integrated at `expert_load` / `cache_load_batch` in `picchio.c`. If
+`experts.picchioflat` is present next to the model, the backend switches to:
+`loc = index[layer*n_experts + eid]; read(fd, aligned_buf, loc.padded_len,
+loc.offset)`, then slices gate-up/scales/down/scales from that allocation. With
+`DIRECT=1` this reads straight into the LRU slot without the safetensors bounce
+buffer. The superblock dimensions and index SHA-256 are always checked;
+`FLAT_VERIFY=1` additionally checks each payload hash. A missing partial-store
+entry, rejected header, short read, or bad verified hash falls back to the current
+safetensors path. `FLAT=<path>` overrides auto-discovery and `FLAT=0` disables it.
 
 ## 2. Phase S2: unbuffered DMA (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`)
 
@@ -292,3 +304,28 @@ and MB/s, so the S3 headroom grows with faster hardware.
 **Ranked wins on this hardware:** (1) put the model on the internal NVMe (4.6x),
 (2) async QD for small experts (about 1.3x), (3) unbuffered reads to protect the
 LRU. S1 is the enabler that makes (2) and (3) possible, and it is byte-exact.
+
+### 8.1 Integrated runtime A/B (GPT-OSS-20B)
+
+After S1 was connected to `expert_load`, a constrained-cache decode test used
+`ECAP=4`, `OMP_NUM_THREADS=6`, `IO_THREADS=4`, `ASYNC_MOE=1`, `DIRECT=1`, one raw
+prompt token, 24 deterministic output tokens, and a complete 768-expert store on
+the same internal `C:` device as the source model. Two runs averaged 19.905 s
+(1.206 tok/s) with `.picchioflat`, versus 21.745 s (1.104 tok/s) through the
+safetensors path: **+9.2% tokens/s**. Average `t_moe` fell 10.7%, direct-read time
+10.2%, and exposed asynchronous wait 15.2%. Every generated token ID matched.
+
+The earlier two-layer partial-store trial was neutral because only 64/768 experts
+were packed (80 flat reads out of 694); its roughly +/-1% deltas were diluted by
+fallback reads and disk variance. The complete-store A/B supersedes that result
+and demonstrates the expected benefit from aligned, zero-bounce direct reads.
+Against the synchronous safetensors reference (one 28.52 s run, 0.842 tok/s), the
+complete flat plus asynchronous path was about **43% faster**; unlike the main A/B,
+this last comparison has only one reference run.
+
+A complete 768-expert store was also placed on an attached `D:` device. It ran
+byte-identically but reached only 0.543 tok/s (12 tokens) versus 1.157 tok/s from
+the internal source, about 53% slower; `IO_THREADS=2` and `4` were equivalent.
+This is a device comparison, not a flat-versus-safetensors comparison: the pack
+write rate was only ~62 MB/s and the external storage dominated the layout gain.
+All compared greedy token IDs were identical.

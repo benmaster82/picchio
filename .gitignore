@@ -33,6 +33,7 @@ gptoss120b_meta/
 *.tmp
 __pycache__/
 do.sh
+.qwen_smoke_tmp/
 
 # Hot-store (generated at runtime)
 .picchio_usage

@@ -90,7 +90,8 @@ def _clear_status():
 class PicchioSession:
     """Persistent Picchio process in SERVICE mode."""
 
-    def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None):
+    def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None,
+                 async_moe=False, direct=False, io_threads=None):
         env = os.environ.copy()
         for name in ("INPUT", "PROMPT", "INPUT_FILE", "OUTPUT", "MODEL_AUX",
                      "TRACE_NUMERIC", "ORACLE_DIR"):
@@ -100,6 +101,12 @@ class PicchioSession:
                     "OMP_NUM_THREADS": str(threads)})
         if sampling:
             env.update({k: str(v) for k, v in sampling.items() if v is not None})
+        if async_moe:
+            env["ASYNC_MOE"] = "1"
+        if direct:
+            env["DIRECT"] = "1"
+        if io_threads is not None:
+            env["IO_THREADS"] = str(io_threads)
         # Default sampling sent with every TURN (a per-turn override is possible).
         s = sampling or {}
         self.temperature = 1.0 if s.get("TEMPERATURE") is None else float(s["TEMPERATURE"])
@@ -301,6 +308,12 @@ def main():
     parser.add_argument("--date", default=date.today().isoformat())
     parser.add_argument("--pin-gb", type=int, default=1)
     parser.add_argument("--threads", type=int, default=6)
+    parser.add_argument("--io-threads", type=int,
+                        help="parallel expert reads (engine default: 4)")
+    parser.add_argument("--async-moe", action="store_true",
+                        help="overlap routed expert reads with CPU expert compute")
+    parser.add_argument("--direct", action="store_true",
+                        help="use unbuffered expert reads (best paired with --async-moe)")
     parser.add_argument("--model-aux")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0 = deterministic greedy; values ~0.7-1.0 avoid loops")
@@ -338,8 +351,11 @@ def main():
 
     sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p,
                 "TOPK": args.top_k, "REP": args.rep, "SEED": args.seed}
-    session = PicchioSession(exe, model, args.ctx, args.pin_gb, args.threads,
-                             resolve_aux(model, args.model_aux), sampling)
+    session = PicchioSession(
+        exe, model, args.ctx, args.pin_gb, args.threads,
+        resolve_aux(model, args.model_aux), sampling,
+        async_moe=args.async_moe, direct=args.direct,
+        io_threads=args.io_threads)
     chat = HarmonyChat(session, args.reasoning, args.date, args.no_reasoning)
     single = args.prompt is not None
 

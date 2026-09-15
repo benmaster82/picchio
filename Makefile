@@ -13,7 +13,7 @@ endif
 
 # Sources (in the root, not in c/)
 SRC     := picchio.c
-HEADERS := quant.h json.h st.h
+HEADERS := quant.h json.h st.h flat.h
 TARGET  := picchio
 
 # CUDA (optional)

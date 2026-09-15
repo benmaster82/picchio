@@ -1,9 +1,11 @@
 # Porting Picchio to Qwen3-MoE
 
-Status: **implemented, pending validation on the real model.** The runtime and
-converter changes compile and the GPT-OSS self-test still passes (no regression).
-Token-exactness against `transformers` has not yet been run (needs the Qwen3
-weights + a converted container); see [Validation](#validation).
+Status: **implemented and smoke-tested; pending validation on the real model.**
+The runtime and converter compile, the GPT-OSS self-test still passes, and an
+all-MoE synthetic Qwen3 fixture now converts, loads, and generates through both
+the safetensors and flat expert backends. Token-level comparison against
+`transformers` on the real 30B checkpoint has not yet been run; see
+[Validation](#validation).
 
 Picchio was written for GPT-OSS. Qwen3-MoE (e.g. `Qwen/Qwen3-30B-A3B`) is the
 closest non-GPT-OSS family: GQA, RMSNorm, RoPE, SwiGLU experts, softmax router.
@@ -74,6 +76,17 @@ Verified so far:
 - `picchio --self-test` still PASSES (GPT-OSS path unchanged).
 - `interleave_qwen_experts` round-trip: dequantized even rows ≈ gate, odd ≈ up,
   down ≈ down, within INT4 gs64 noise; tensor names match the runtime reader.
+- End-to-end synthetic Qwen3-MoE smoke test: a two-layer, four-expert fixture
+  created with `transformers.Qwen3MoeForCausalLM` converted and loaded with QK-Norm,
+  top-2 routing, no sinks, and plain SwiGLU. Eight greedy output IDs matched
+  between safetensors and `.picchioflat + DIRECT + ASYNC_MOE`; all eight flat
+  expert payloads were byte-verified against the converted container.
+
+Reproduce the smoke test after building Picchio:
+
+```powershell
+python test_qwen_smoke.py
+```
 
 Still to do (needs the real weights + `transformers`):
 1. Convert a Qwen3-30B-A3B checkpoint and confirm the container loads
@@ -91,5 +104,6 @@ Still to do (needs the real weights + `transformers`):
 - Transient RAM in conversion: a shard's Qwen experts are held as F32 before
   quantization (~2× the BF16 shard). Fine for 30B on a roomy machine; watch it on
   16 GB.
-- `chat_qwen.py` is written but not yet exercised end-to-end (no converted model
-  available at implementation time).
+- The low-level Qwen service path is exercised end-to-end with raw token IDs, but
+  `chat_qwen.py` still needs a real tokenizer/model session to validate rendered
+  ChatML and multi-turn prefix reuse.

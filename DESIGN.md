@@ -698,6 +698,37 @@ at 12 was slower). The 120B stays disk-bound on a USB SSD (~70 % of wall is expe
 reads), where neither the GPU nor the integer kernel helps — only faster storage
 or a bigger RAM cache does.
 
+### 0.18 Completion-driven decode pipeline
+
+`ASYNC_MOE=1` adds the first S3-style scheduling layer without changing the
+safetensors container. Router misses are reserved in the LRU and submitted to a
+persistent loader; every expert slot is published independently with the existing
+release/acquire `loading` flag. The main thread computes any completed expert
+instead of waiting for the whole top-k read batch. Contributions are kept in
+separate buffers and reduced afterwards in canonical router top-k order, so I/O
+completion order cannot change the floating-point reduction. GPU, oracle, and
+numeric-trace modes retain the synchronous reference path.
+
+The first Windows 20B A/B (`ECAP=4`, `IO_THREADS=4`, raw one-token prompt, eight
+greedy decode tokens) confirms both the opportunity and the boundary. With
+buffered reads it was neutral (5.98 s sync versus 6.00 s async): page-cache copies
+and expert matmuls compete for the same memory bandwidth. With `DIRECT=1`, the
+same run fell from 7.91 s to 7.02 s, about **+13% tokens/s**, and `t_moe` fell from
+8.06 s to 7.11 s. All eight generated IDs were identical; INT3 was also exercised
+successfully. This is why the feature remains opt-in and why the recommended first
+trial is `ASYNC_MOE=1 DIRECT=1 IO_THREADS=4`. The exposed idle time is reported as
+`async MoE` in the runtime statistics, making queue-depth tuning empirical rather
+than assumed.
+
+S1's aligned flat container is now integrated and removes the safetensors bounce
+copy from aligned direct reads. A complete-store 24-token A/B on the internal NVMe
+(two runs per path) measured 1.206 tok/s versus 1.104 tok/s for safetensors with
+the same asynchronous pipeline, a **9.2% gain**; all IDs matched. Compared with a
+single synchronous safetensors reference at 0.842 tok/s, flat plus asynchronous
+execution was about **43% faster**. Native IOCP/io_uring submission is still
+expected to improve this result by removing worker-thread overhead and raising
+queue depth.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture

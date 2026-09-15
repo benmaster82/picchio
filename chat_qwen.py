@@ -90,7 +90,8 @@ def _clear_status():
 class PicchioSession:
     """Persistent Picchio process in SERVICE mode (identical transport to chat.py)."""
 
-    def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None):
+    def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None,
+                 async_moe=False, direct=False, io_threads=None):
         env = os.environ.copy()
         for name in ("INPUT", "PROMPT", "INPUT_FILE", "OUTPUT", "MODEL_AUX",
                      "TRACE_NUMERIC", "ORACLE_DIR"):
@@ -100,6 +101,12 @@ class PicchioSession:
                     "OMP_NUM_THREADS": str(threads)})
         if sampling:
             env.update({k: str(v) for k, v in sampling.items() if v is not None})
+        if async_moe:
+            env["ASYNC_MOE"] = "1"
+        if direct:
+            env["DIRECT"] = "1"
+        if io_threads is not None:
+            env["IO_THREADS"] = str(io_threads)
         s = sampling or {}
         self.temperature = 1.0 if s.get("TEMPERATURE") is None else float(s["TEMPERATURE"])
         self.top_p = 0.95 if s.get("TOPP") is None else float(s["TOPP"])
@@ -265,6 +272,12 @@ def main():
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--pin-gb", type=float, default=8)
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 6)
+    ap.add_argument("--io-threads", type=int,
+                    help="parallel expert reads (engine default: 4)")
+    ap.add_argument("--async-moe", action="store_true",
+                    help="overlap routed expert reads with CPU expert compute")
+    ap.add_argument("--direct", action="store_true",
+                    help="use unbuffered expert reads (best paired with --async-moe)")
     ap.add_argument("--model-aux", default=None)
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -285,7 +298,9 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.tokenizer or args.model, trust_remote_code=True)
     sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p, "TOPK": args.top_k}
     session = PicchioSession(args.exe, args.model, args.ctx, args.pin_gb,
-                             args.threads, args.model_aux, sampling)
+                             args.threads, args.model_aux, sampling,
+                             async_moe=args.async_moe, direct=args.direct,
+                             io_threads=args.io_threads)
     chat = Qwen3Chat(session, tok, no_reasoning=args.no_reasoning, system=args.system)
     single = args.prompt is not None
 

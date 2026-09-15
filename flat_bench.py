@@ -14,7 +14,6 @@ Env: FLAT_MODEL, FLAT_OUT, FLAT_SAMPLE (experts to bench, default 384).
 """
 import os
 import random
-import struct
 import sys
 import time
 
@@ -24,16 +23,10 @@ MODEL = os.environ.get("FLAT_MODEL", "D:/qwen3_30b_i4")
 FLAT = os.environ.get("FLAT_OUT", "D:/qwen3_flat.picchioflat")
 BS = fc.BS
 
-with open(FLAT, "rb") as f:
-    sb = f.read(BS)
-    (magic, ver, bs, NL, NE, n, idx_off, idx_len, data_off) = struct.unpack_from(
-        "<8sIIIIIQQQ", sb)
-    assert magic == b"PCHIOFL1", magic
-    f.seek(idx_off)
-    raw = f.read(idx_len)
-index = [struct.unpack_from("<QII", raw, i * 16) for i in range(n)]
-avg = idx_off / n / 1e6
-print(f"flat: {n} experts, {avg:.2f} MB/expert, payload {idx_off/1e9:.2f} GB, "
+meta, index = fc.read_flat(FLAT)
+NL, NE, n = meta["layers"], meta["experts"], meta["count"]
+avg = sum(pd for _, _, pd, _ in index) / n / 1e6
+print(f"flat: {n} experts, {avg:.2f} MB/expert, "
       f"disk {FLAT[0]}:")
 
 cfg, cNL, cNE, name2shard, scheme = fc.load(MODEL)
@@ -48,9 +41,10 @@ bad = 0
 with open(FLAT, "rb") as f:
     for i in range(n):
         L, E = divmod(i, NE)
-        off, ln, pd = index[i]
+        off, ln, pd, expected_hash = index[i]
         f.seek(off)
-        if f.read(ln) != st_payload(L, E):
+        payload = f.read(ln)
+        if payload != st_payload(L, E) or fc.hash64(payload) != expected_hash:
             bad += 1
 print(f"byte-verify: {n-bad}/{n} identical" + (" OK" if bad == 0 else f"  FAIL ({bad})"))
 if bad:
@@ -60,7 +54,7 @@ if bad:
 random.seed(0)
 K = min(int(os.environ.get("FLAT_SAMPLE", "384")), n)
 sample = random.sample(index, K)
-per_pass = sum(pd for _, _, pd in sample) / 1e6
+per_pass = sum(pd for _, _, pd, _ in sample) / 1e6
 
 
 def report(name, times, total):
@@ -76,7 +70,7 @@ def report(name, times, total):
 def buffered(entries):
     fd = os.open(FLAT, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     times, total = [], 0
-    for off, ln, pd in entries:
+    for off, ln, pd, _ in entries:
         t = time.perf_counter()
         os.lseek(fd, off, 0)
         b = os.read(fd, pd)
@@ -95,12 +89,12 @@ def unbuffered_win(entries):
     h = k.CreateFileW(FLAT, 0x80000000, 1, None, 3, 0x20000000, None)  # NO_BUFFERING
     if h == ctypes.c_void_p(-1).value:
         raise OSError("CreateFileW failed")
-    maxlen = max(pd for _, _, pd in entries)
+    maxlen = max(pd for _, _, pd, _ in entries)
     buf = k.VirtualAlloc(None, ctypes.c_size_t(maxlen), 0x3000, 4)
     read = w.DWORD()
     times, total = [], 0
     try:
-        for off, ln, pd in entries:
+        for off, ln, pd, _ in entries:
             k.SetFilePointerEx(ctypes.c_void_p(h), ctypes.c_longlong(off), None, 0)
             t = time.perf_counter()
             ok = k.ReadFile(ctypes.c_void_p(h), ctypes.c_void_p(buf), pd,

@@ -36,10 +36,16 @@ top-k routing, and full attention (no sinks, no sliding window) are switched on
 only for Qwen checkpoints. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
 and [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
 
-**It can also split a model across two machines on a LAN** and run them as one, so
-a model too big for any single computer can run by pooling their RAM. Only the
-small residual-stream vector crosses the network, and the output is byte-identical
-to a single node. See [Distributed inference across two machines](#13-distributed-inference-across-two-machines).
+The converter and complete runtime path are covered by a synthetic Qwen3-MoE
+smoke test. A real 30B checkpoint was not available on the development machine,
+so token-level validation against `transformers` on the full model is still
+pending; the README does not claim that stronger validation yet.
+
+**It can also split inference across two machines on a LAN.** Each node loads only
+its assigned dense layers and KV state, although both currently still need the
+converted model files on local disk. Only the small residual-stream vector crosses
+the network, and the output is byte-identical to a single node. See
+[Distributed inference across two machines](#13-distributed-inference-across-two-machines).
 
 > **New to this?** Read the sections in order. Every command below is complete:
 > nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
@@ -74,7 +80,7 @@ to a single node. See [Distributed inference across two machines](#13-distribute
 |---|---|---|---|
 | **CPU** | x86-64 **with AVX2** | 6+ cores with AVX2/FMA | Almost every desktop/laptop CPU since ~2013 has AVX2. Without it the build fails or runs very slowly. |
 | **RAM** | 8 GB | 16 GB | The 20B needs ~3 GB always resident + expert cache. More RAM = more cache = less disk reading = faster. |
-| **Disk** | ~30 GB free | SSD/NVMe, ~30 GB free | The model is read from disk **constantly**, so an internal SSD matters a lot. A USB drive roughly doubles the I/O time. |
+| **Disk** | ~30 GB free | SSD/NVMe, ~30 GB free | The model is read from disk **constantly**, so an internal SSD matters a lot. A slow USB bridge can more than double the I/O time. |
 
 The 120B model additionally needs ~70 GB of free disk and benefits from as much
 RAM as you can give it (see [section 7](#7-running-the-big-model-120b)).
@@ -134,6 +140,8 @@ from the [Releases page](https://github.com/benmaster82/picchio/releases/latest)
   `--exe <name>` to `chat.py` / `server.py`. Every command below assumes the file
   is called `picchio.exe`.
 - It is a **static build**: no MinGW DLLs, runs from anywhere.
+- Releases can lag the source tree. Compile from source to use the newest
+  experimental options such as `.picchioflat` and `ASYNC_MOE`.
 - Requires **Windows x64 with an AVX2/FMA CPU** (2013 or newer). The binary is
   unsigned, so Windows SmartScreen may warn on first run ("More info" then "Run
   anyway").
@@ -307,6 +315,7 @@ Type your message after the `you ❯` prompt. Type `/exit` or `/quit` to leave.
 | `--no-reasoning` | Skip the internal "analysis" (chain-of-thought) and answer directly. Faster, but **can degrade multi-turn chats on large models** (see Troubleshooting) — prefer `--reasoning low` if answers deteriorate after a few turns. |
 | `--show-analysis` | Deprecated: the reasoning is now always streamed live (dimmed, under a `thinking ❯` header) next to the answer. |
 | `--top-p`, `--top-k`, `--seed` | Standard sampling controls. |
+| `--async-moe --direct` | Experimental decode pipeline: overlap unbuffered expert reads with CPU expert compute. Tune read concurrency with `--io-threads` (start from `4`). |
 | `--reasoning low\|medium\|high` | How much the model thinks before answering. |
 | `--json` | Print the structured reply as JSON. |
 | `--dry-run` | Show the exact tokens that would be sent, without loading the model (handy for debugging). |
@@ -528,6 +537,9 @@ flags map onto these). The most useful:
 | `TOPP` / `TOPK` | 0.95 / 50 | Nucleus / top-k sampling. |
 | `SEED` | fixed | RNG seed for reproducible sampling. |
 | `IO_THREADS` | 4 | Threads used for reading experts from disk in parallel. |
+| `ASYNC_MOE` | `0` | `1` = experimental completion-driven pipeline: compute ready CPU experts while the remaining routed experts are still being read. The final reduction keeps canonical top-k order. |
+| `FLAT` | auto | Auto-detects `<model>/experts.picchioflat`; set a path to override or `0` to disable. Build it with `FLAT_MODEL=<model> python flat_pack.py`. |
+| `FLAT_VERIFY` | `0` | `1` = verify the truncated SHA-256 of every flat expert payload while loading (diagnostic; index SHA-256 is always verified). |
 | `MODEL_AUX` | (none) | Extra model files on other disks (semicolon-separated). |
 | `IDOT` | `0` | `1` = integer expert kernel (int8 activation × int4 weight). Uses AVX-VNNI (`dpbusd`) where the CPU supports it, else AVX2; a small approximation, so off by default. |
 | `DROP` | `0` | `1` = drop just-read pages from the OS page cache after each read (Linux), keeping peak RAM at "dense + cache" when streaming a model larger than RAM. |
@@ -535,10 +547,28 @@ flags map onto these). The most useful:
 
 Performance notes:
 
-- On the 20B (6 cores, model on NVMe) expect roughly **~0.6 s per token**.
+- On the tested 6-core machine with the 20B on internal NVMe, observed decode
+  rates span roughly **0.8-1.7 tok/s**, depending on INT3/INT4, cache size, and
+  storage path; treat these as local measurements, not a hardware guarantee.
 - Keep the model on an **internal SSD**. From USB the I/O time roughly doubles.
 - More RAM devoted to `PIN_GB` is almost always the best speedup: going from a
   small cache to full residency on the 20B cut disk reads by ~53% in testing.
+
+To build the optional aligned expert store after conversion (about the size of
+the converted expert tensors, so check free disk space first):
+
+```powershell
+$env:FLAT_MODEL = "C:\models\gptoss20b_i4"
+python flat_pack.py
+```
+
+Picchio discovers the resulting `experts.picchioflat` automatically. Pair it
+with `DIRECT=1 ASYNC_MOE=1` (or `--direct --async-moe` in the Python frontends)
+to exercise the full aligned decode path. On the tested GPT-OSS-20B, a complete
+flat store averaged 1.206 tok/s versus 1.104 tok/s through safetensors with the
+same asynchronous pipeline (**+9.2%** over two runs per path). Against one
+synchronous safetensors reference it was about **43% faster**. These results do
+not predict the gain on a different SSD, cache size, or model.
 
 For the design rationale and measurements, see [`DESIGN.md`](DESIGN.md).
 
@@ -636,6 +666,7 @@ and output head are INT8, attention is F32. The engine reads every dimension fro
 
 ```
 picchio.c              The engine (single translation unit)
+flat.h                 Aligned `.picchioflat` reader and integrity checks
 quant.h                Quantized matmul kernels (F32 / INT8 / INT4) with AVX2/NEON
 st.h                   safetensors reader (multi-shard, multi-disk)
 json.h                 config.json parser
@@ -656,6 +687,7 @@ requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
 
 make_test_model.py     Generate a tiny synthetic model for validation
 test_forward.py        Numeric oracle to validate the forward pass
+test_qwen_smoke.py     End-to-end synthetic Qwen3-MoE smoke test (optional deps)
 
 net_bench.py           Measure LAN latency/throughput (sizing the distributed split)
 pipe_node.py           Prototype of the 2-stage pipeline with byte-identity check
@@ -731,9 +763,10 @@ python chat_qwen.py --model C:\models\qwen3_30b_i4 --no-reasoning --ctx 2048 --p
 ```
 
 The options mirror `chat.py`: `--no-reasoning` disables Qwen's thinking
-(`enable_thinking=False`), and `--temperature` / `--top-p` / `--top-k` control
-sampling. Omit the prompt for an interactive multi-turn session with KV-prefix
-reuse between turns.
+(`enable_thinking=False`), `--temperature` / `--top-p` / `--top-k` control
+sampling, and `--direct --async-moe --io-threads 4` enables the experimental
+aligned/overlapped expert path. Omit the prompt for an interactive multi-turn
+session with KV-prefix reuse between turns.
 
 ### What differs under the hood
 
@@ -745,22 +778,29 @@ ChatML end-of-turn token as the stop id. Everything is config-gated, so the
 GPT-OSS path is unchanged. For the full list and the validation status, see
 [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
 
+Current validation status: a small all-MoE Qwen3 fixture created with the official
+`transformers` architecture converts, loads, and generates successfully. Its
+safetensors path and `.picchioflat + DIRECT + ASYNC_MOE` path produced the same
+greedy token sequence. Full-model comparison against the real 30B checkpoint is
+still pending.
+
 ---
 
 ## 13. Distributed inference across two machines
 
-Picchio can split a model across **two machines on the same network** and run them
-as one, so a model that does not fit in one computer's RAM can run on two smaller
-ones. The layers are cut at a boundary: the **coordinator** (machine A) holds the
-first layers plus the embedding, the **worker** (machine B) holds the rest plus the
-output head. For each token only the small residual-stream vector (a few KB)
-crosses the network; each machine keeps its own layers' KV cache locally. The
-result is **byte-identical** to running the whole model on one node.
+Picchio can split inference across **two machines on the same network**. The layers
+are cut at a boundary: the **coordinator** (machine A) loads the first layers plus
+the embedding, while the **worker** (machine B) loads the rest plus the output
+head. For each token only the small residual-stream vector (a few KB) crosses the
+network; each machine keeps its own layers' KV cache locally. The result is
+**byte-identical** to running the whole model on one node.
 
-> **When to use it.** Only when the model does not fit on one machine. If it fits,
-> a single machine is always faster (the network adds latency per token). This is
-> the way to run a model that is *too big for any one of your computers*, by pooling
-> their RAM. Wired Ethernet is strongly preferred over WiFi.
+> **When to use it.** This experimental mode divides resident dense/KV memory and
+> layer compute between the machines. It does not currently pool disk capacity:
+> both machines need the converted model files. Picchio already streams experts
+> when weights exceed RAM, and a single machine is usually faster when it has
+> enough resident memory because the split adds a network round-trip. Wired
+> Ethernet is strongly preferred over WiFi.
 
 ### How the split works
 
