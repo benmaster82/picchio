@@ -7,7 +7,6 @@ KV-cache is reused, because the Harmony re-render is not prefix-preserving
 (the analysis is dropped and `<|return|>` becomes `<|end|>`).
 """
 import argparse
-import itertools
 import json
 import os
 import shutil
@@ -23,7 +22,7 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
-import picchio_logo
+import chat_ui as ui
 
 KEEP_ANALYSIS = RenderConversationConfig(auto_drop_analysis=False)
 
@@ -32,61 +31,6 @@ KEEP_ANALYSIS = RenderConversationConfig(auto_drop_analysis=False)
 # All decoration is written to stderr; stdout carries only the model's text,
 # so piping or redirecting the answer stays clean. Colour is used only when
 # stderr is an interactive terminal (and NO_COLOR is not set).
-
-def _enable_ansi():
-    if os.environ.get("NO_COLOR") or not sys.stderr.isatty():
-        return False
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            k = ctypes.windll.kernel32
-            k.SetConsoleOutputCP(65001)               # UTF-8 output
-            h = k.GetStdHandle(-12)                    # STD_ERROR_HANDLE
-            mode = ctypes.c_uint32()
-            if not k.GetConsoleMode(h, ctypes.byref(mode)):
-                return False
-            k.SetConsoleMode(h, mode.value | 0x0004)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        except Exception:
-            return False
-    return True
-
-
-_ANSI = _enable_ansi()
-
-
-def _paint(code):
-    return (lambda s: f"\x1b[{code}m{s}\x1b[0m") if _ANSI else (lambda s: str(s))
-
-
-GREEN = _paint("38;2;55;161;89")   # brand green (#37a159)
-RED   = _paint("38;2;226;74;58")   # brand red   (#e24a3a)
-CYAN  = _paint("36")
-DIM   = _paint("2")
-BOLD  = _paint("1")
-
-_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-
-def _err(text="", end="\n"):
-    sys.stderr.write(text + end)
-    sys.stderr.flush()
-
-
-def _status(text):
-    """Overwrite the current stderr line with a transient status/spinner.
-    Only animates on an interactive terminal; a no-op when redirected."""
-    if not _ANSI:
-        return
-    sys.stderr.write("\r\x1b[2K" + text)
-    sys.stderr.flush()
-
-
-def _clear_status():
-    if not _ANSI:
-        return
-    sys.stderr.write("\r\x1b[2K")
-    sys.stderr.flush()
-
 
 def _resolve_exe(exe):
     """Resolve exe to an absolute path. Windows' CreateProcess (used by
@@ -192,6 +136,7 @@ class HarmonyChat:
                   .with_conversation_start_date(current_date))
         self.messages = [Message.from_role_and_content(Role.SYSTEM, system)]
         self.committed = []
+        self.last_stats = None
         # No-reasoning mode: pre-commit the `final` channel, so the assistant's
         # turn cannot emit an `analysis` message. The model consumes these tokens
         # (it does not regenerate them), so they must be pre-fed to the parser and
@@ -229,7 +174,6 @@ class HarmonyChat:
             parser.process(tok)
 
         t0 = time.time()
-        spin = itertools.cycle(_SPIN)
         # Stream BOTH channels live so the user always sees what is happening: the
         # reasoning prints dimmed on stderr under a "thinking ❯" header, the answer
         # prints on stdout under "picchio ❯". Keeping the answer alone on stdout
@@ -237,10 +181,10 @@ class HarmonyChat:
         state = {"n": 0, "channel": None}
 
         def _header(ch):
-            _clear_status()
-            label = DIM(BOLD("thinking")) if ch == "analysis" else GREEN(BOLD("picchio"))
-            sys.stderr.write(f"  {label} {DIM('❯')} ")
-            sys.stderr.flush()
+            if ch == "analysis":
+                ui.begin_thinking()
+            else:
+                ui.begin_answer()
 
         def on_token(token):
             parser.process(token)
@@ -250,8 +194,7 @@ class HarmonyChat:
             if not (live and chunk and ch in ("analysis", "final")):
                 # Header/role tokens, or non-live (JSON) mode: just animate the spinner.
                 if state["channel"] is None:
-                    _status(DIM(f"  {next(spin)} thinking · {state['n']} tokens · "
-                                f"{time.time() - t0:.1f}s"))
+                    ui.thinking(state["n"], time.time() - t0)
                 return
             if state["channel"] != ch:
                 # Channel switch: close the previous line on its own stream, then
@@ -265,7 +208,7 @@ class HarmonyChat:
             if ch == "final":
                 sys.stdout.write(chunk); sys.stdout.flush()
             else:
-                sys.stderr.write(DIM(chunk)); sys.stderr.flush()
+                sys.stderr.write(ui.DIM(chunk)); sys.stderr.flush()
 
         produced, reason, pos = self.session.turn(delta, max_new, keep, on_token)
         self.committed = full + self.final_prefill + produced
@@ -276,19 +219,22 @@ class HarmonyChat:
         elif state["channel"] == "analysis":
             sys.stderr.write("\n"); sys.stderr.flush()
         else:
-            _clear_status()
+            ui.clear_status()
 
         dt = time.time() - t0
         n = len(produced)
-        tps = n / dt if dt > 0 else 0.0
-        _err(DIM(f"  {n} tokens · {dt:.1f}s · {tps:.1f} tok/s · reused {keep}/{len(full)}"))
+        self.last_stats = {
+            "tokens": n, "elapsed": dt, "pos": pos, "ctx": self.session.ctx,
+            "reused": keep, "prompt_tokens": len(full), "reason": reason,
+        }
+        ui.metrics(**self.last_stats)
 
         try:
             replies = self.encoding.parse_messages_from_completion_tokens(
                 self.final_prefill + produced, Role.ASSISTANT)
         except Exception as exc:
             replies = parser.messages
-            _err(DIM(f"  (incomplete response, {reason}: {exc})"))
+            ui.write(ui.DIM(f"  Incomplete response ({reason}: {exc})"))
         self.messages.append(Message.from_role_and_content(Role.USER, user_text))
         self.messages.extend(replies)
         return replies, reason, pos
@@ -302,11 +248,7 @@ def resolve_aux(model, override):
 
 
 def main():
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+    ui.configure_utf8()
 
     parser = argparse.ArgumentParser(description="GPT-OSS chat with Picchio")
     parser.add_argument("prompt", nargs="?", help="single question; omit to start the chat")
@@ -372,46 +314,56 @@ def main():
     chat = HarmonyChat(session, args.reasoning, args.date, args.no_reasoning)
     single = args.prompt is not None
 
-    # header banner (stderr only)
-    detail = f"{model.name} · ctx {session.ctx} · pin {args.pin_gb} GB · temp {args.temperature}"
-    if args.no_reasoning:
-        detail += " · no-reasoning"
-    picchio_logo.banner("GPT-OSS · 20B/120B · int4 · streaming CPU")
-    _err()
-    _err(f"  {DIM(detail)}")
-    if not single:
-        _err(f"  {DIM('type a message · /exit to quit')}")
-    _err(f"  {DIM('─' * 46)}")
+    def show_header():
+        reasoning = "off" if args.no_reasoning else args.reasoning
+        ui.header("GPT-OSS", model, session.ctx, args.pin_gb, args.temperature,
+                  args.threads, not single, reasoning, args.async_moe,
+                  args.direct, args.io_threads)
+
+    show_header()
 
     try:
         while True:
             if single:
                 text = args.prompt
-                _err(f"\n  {BOLD(CYAN('you'))} {DIM('❯')} {text}")
+                ui.show_user(text)
             else:
                 try:
-                    sys.stderr.write(f"\n  {BOLD(CYAN('you'))} {DIM('❯')} ")
-                    sys.stderr.flush()
-                    text = input().strip()
+                    text = ui.prompt()
                 except EOFError:
-                    _err()
+                    ui.write()
                     break
                 if not text:
                     continue
-                if text in ("/exit", "/quit"):
+                command = text.lower()
+                if command in ("/exit", "/quit"):
                     break
+                if command == "/help":
+                    ui.help_text()
+                    continue
+                if command == "/clear":
+                    ui.clear_screen()
+                    show_header()
+                    continue
+                if command == "/stats":
+                    ui.show_stats(chat.last_stats)
+                    continue
+                if command == "/settings":
+                    show_header()
+                    continue
+                if command.startswith("/"):
+                    ui.warning(f"Unknown command: {text} · use /help")
+                    continue
             replies, reason, pos = chat.ask(text, args.max_tokens,
                                             live=not args.json)
             if args.json:
                 print(json.dumps({"reason": reason, "pos": pos,
                                   "messages": [m.to_dict() for m in replies]},
                                  ensure_ascii=False, default=str, indent=2))
-            elif reason not in ("RETURN", "CALL"):
-                _err(f"  {RED('⚠')} {DIM('stopped: ' + reason)}")
             if single:
                 break
     except KeyboardInterrupt:
-        _err("\n" + DIM("  interrupted"))
+        ui.interrupted()
     finally:
         session.close()
 

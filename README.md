@@ -303,7 +303,11 @@ between turns:
 python chat.py --model C:\models\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
 ```
 
-Type your message after the `you ❯` prompt. Type `/exit` or `/quit` to leave.
+Type your message after the blue `YOU` prompt. Type `/exit` or `/quit` to leave.
+
+The interactive chat also accepts `/help`, `/clear`, `/stats`, and `/settings`.
+Both model families use the same terminal interface, with a compact model
+summary, live generation status, and per-response performance metrics.
 
 ### Useful chat options
 

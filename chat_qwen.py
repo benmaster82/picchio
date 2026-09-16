@@ -19,7 +19,6 @@ Run:
       --ctx 2048 --pin-gb 8 --max-tokens 256 --temperature 0.7
 """
 import argparse
-import itertools
 import os
 import shutil
 import subprocess
@@ -33,61 +32,11 @@ except ImportError:
     print("pip install transformers", file=sys.stderr)
     sys.exit(1)
 
-import picchio_logo
+import chat_ui as ui
 
 
 # ── Terminal UI (mirrors chat.py) ────────────────────────────────────
 # Decoration goes to stderr; stdout carries only the model's text.
-
-def _enable_ansi():
-    if os.environ.get("NO_COLOR") or not sys.stderr.isatty():
-        return False
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            k = ctypes.windll.kernel32
-            k.SetConsoleOutputCP(65001)
-            h = k.GetStdHandle(-12)
-            mode = ctypes.c_uint32()
-            if not k.GetConsoleMode(h, ctypes.byref(mode)):
-                return False
-            k.SetConsoleMode(h, mode.value | 0x0004)
-        except Exception:
-            return False
-    return True
-
-
-_ANSI = _enable_ansi()
-
-
-def _paint(code):
-    return (lambda s: f"\x1b[{code}m{s}\x1b[0m") if _ANSI else (lambda s: str(s))
-
-
-GREEN = _paint("38;2;55;161;89")
-RED = _paint("38;2;226;74;58")
-CYAN = _paint("36")
-DIM = _paint("2")
-BOLD = _paint("1")
-_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-
-def _err(text="", end="\n"):
-    sys.stderr.write(text + end)
-    sys.stderr.flush()
-
-
-def _status(text):
-    if _ANSI:
-        sys.stderr.write("\r\x1b[2K" + text)
-        sys.stderr.flush()
-
-
-def _clear_status():
-    if _ANSI:
-        sys.stderr.write("\r\x1b[2K")
-        sys.stderr.flush()
-
 
 def _resolve_exe(exe):
     """Resolve exe to an absolute path. Windows' CreateProcess (used by
@@ -192,11 +141,12 @@ class Qwen3Chat:
         if system:
             self.messages.append({"role": "system", "content": system})
         self.committed = []          # exact token stream the model has consumed
+        self.last_stats = None
         # Sanity: the runtime's stop id should be the tokenizer's eos.
         eos = tokenizer.eos_token_id
         if session is not None and eos is not None and eos not in session.stop_ids:
-            print(f"  ! warning: runtime stop_ids {session.stop_ids} do not include "
-                  f"tokenizer eos {eos}", file=sys.stderr)
+            ui.warning(f"Runtime stop IDs {session.stop_ids} do not include "
+                       f"tokenizer EOS {eos}")
 
     def _render(self):
         """Render the whole conversation to token IDs, adding the assistant prompt."""
@@ -228,7 +178,6 @@ class Qwen3Chat:
         t0 = time.time()
         acc = []          # ids produced so far
         printed = 0       # chars already streamed to stdout
-        spin = itertools.cycle(_SPIN)
         state = {"shown": False}
 
         def on_token(token):
@@ -243,17 +192,14 @@ class Qwen3Chat:
             new = text[printed:]
             if new.strip() and not state["shown"]:
                 # First real content: clear the spinner and print the label.
-                _clear_status()
-                sys.stderr.write(f"  {GREEN(BOLD('picchio'))} {DIM('❯')} ")
-                sys.stderr.flush()
+                ui.begin_answer()
                 state["shown"] = True
             if state["shown"]:
                 sys.stdout.write(new)
                 sys.stdout.flush()
                 printed = len(text)
             else:
-                _status(DIM(f"  {next(spin)} thinking · {len(acc)} tokens · "
-                            f"{time.time() - t0:.1f}s"))
+                ui.thinking(len(acc), time.time() - t0)
 
         produced, reason, pos = self.s.turn(
             delta, max_new, keep, on_token, temperature=temperature)
@@ -267,12 +213,14 @@ class Qwen3Chat:
             sys.stdout.write("\n")
             sys.stdout.flush()
         else:
-            _clear_status()
+            ui.clear_status()
         dt = time.time() - t0
         n = len(produced)
-        tps = n / dt if dt > 0 else 0.0
-        _err(DIM(f"  {n} tokens · {dt:.1f}s · {tps:.1f} tok/s · "
-                 f"reused {keep}/{len(full)} · {reason}"))
+        self.last_stats = {
+            "tokens": n, "elapsed": dt, "pos": pos, "ctx": self.s.ctx,
+            "reused": keep, "prompt_tokens": len(full), "reason": reason,
+        }
+        ui.metrics(**self.last_stats)
         return text
 
 
@@ -302,13 +250,8 @@ def main():
     ap.add_argument("--system", default=None, help="optional system prompt")
     args = ap.parse_args()
 
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+    ui.configure_utf8()
 
-    picchio_logo.banner("Qwen3-MoE · int4 · streaming CPU")
     tok = AutoTokenizer.from_pretrained(args.tokenizer or args.model, trust_remote_code=True)
     sampling = {"TEMPERATURE": args.temperature, "TOPP": args.top_p, "TOPK": args.top_k}
     session = PicchioSession(args.exe, args.model, args.ctx, args.pin_gb,
@@ -318,33 +261,45 @@ def main():
     chat = Qwen3Chat(session, tok, no_reasoning=args.no_reasoning, system=args.system)
     single = args.prompt is not None
 
-    name = os.path.basename(str(args.model).rstrip("/\\"))
-    detail = (f"{name} · ctx {session.ctx} · pin {args.pin_gb} GB · "
-              f"temp {args.temperature}")
-    if args.no_reasoning:
-        detail += " · no-reasoning"
-    _err()
-    _err(f"  {DIM(detail)}")
-    if not single:
-        _err(f"  {DIM('type a message · /exit to quit')}")
-    _err(f"  {DIM('─' * 46)}")
+    def show_header():
+        reasoning = "off" if args.no_reasoning else "on"
+        ui.header("Qwen3-MoE", args.model, session.ctx, args.pin_gb,
+                  args.temperature, args.threads, not single, reasoning,
+                  args.async_moe, args.direct, args.io_threads)
+
+    show_header()
 
     try:
         if single:
-            _err(f"\n  {BOLD(CYAN('you'))} {DIM('❯')} {args.prompt}")
+            ui.show_user(args.prompt)
             chat.ask(args.prompt, args.max_tokens, temperature=args.temperature)
         else:
             while True:
                 try:
-                    sys.stderr.write(f"\n  {BOLD(CYAN('you'))} {DIM('❯')} ")
-                    sys.stderr.flush()
-                    user = input().strip()
+                    user = ui.prompt()
                 except (EOFError, KeyboardInterrupt):
-                    _err()
+                    ui.write()
                     break
-                if user in ("/exit", "/quit"):
+                command = user.lower()
+                if command in ("/exit", "/quit"):
                     break
                 if not user:
+                    continue
+                if command == "/help":
+                    ui.help_text()
+                    continue
+                if command == "/clear":
+                    ui.clear_screen()
+                    show_header()
+                    continue
+                if command == "/stats":
+                    ui.show_stats(chat.last_stats)
+                    continue
+                if command == "/settings":
+                    show_header()
+                    continue
+                if command.startswith("/"):
+                    ui.warning(f"Unknown command: {user} · use /help")
                     continue
                 chat.ask(user, args.max_tokens, temperature=args.temperature)
     finally:

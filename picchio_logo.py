@@ -41,7 +41,29 @@ def _fg(rgb, s):
     return f"\x1b[38;2;{r};{g};{b}m{s}\x1b[0m"
 
 
-def banner(spec="int4 · streaming CPU", stream=sys.stderr):
+def _compact_art(color):
+    """Compress the 10-row pixel bird into five terminal half-block rows."""
+    def cell(top, bottom):
+        if top == "." and bottom == ".":
+            return " "
+        if not color:
+            return "█"
+        if top == bottom:
+            return _fg(_PAL[top], "█")
+        if bottom == ".":
+            return _fg(_PAL[top], "▀")
+        if top == ".":
+            return _fg(_PAL[bottom], "▄")
+        tr, tg, tb = _PAL[top]
+        br, bg, bb = _PAL[bottom]
+        return f"\x1b[38;2;{tr};{tg};{tb};48;2;{br};{bg};{bb}m▀\x1b[0m"
+
+    return ["".join(cell(_ART[row][col], _ART[row + 1][col])
+                    for col in range(len(_ART[row])))
+            for row in range(0, len(_ART), 2)]
+
+
+def banner(spec="int4 · streaming CPU", stream=sys.stderr, compact=False):
     """Print the woodpecker logo and wordmark to `stream` (stderr by default)."""
     color = _color_on(stream)
 
@@ -50,15 +72,23 @@ def banner(spec="int4 · streaming CPU", stream=sys.stderr):
             return "  "
         return _fg(_PAL[ch], "██") if color else "██"
 
-    art = ["".join(px(c) for c in row) for row in _ART]
-    if color:
+    art = _compact_art(color) if compact else ["".join(px(c) for c in row) for row in _ART]
+    if color and compact:
+        text = {
+            1: "\x1b[1m" + _fg(_WORDMARK, "PICCHIO") + "\x1b[0m",
+            2: _fg(_GREY, "it drums the model off the disk"),
+            3: _fg(_GREY, spec),
+        }
+    elif color:
         text = {
             3: "\x1b[1m" + _fg(_WORDMARK, "picchio") + "\x1b[0m",
             4: _fg(_GREY, "\x1b[3mit drums the model off the disk\x1b[0m"),
             5: _fg(_GREY, spec),
         }
     else:
-        text = {3: "picchio", 4: "it drums the model off the disk", 5: spec}
+        text = ({1: "PICCHIO", 2: "it drums the model off the disk", 3: spec}
+                if compact else
+                {3: "PICCHIO", 4: "it drums the model off the disk", 5: spec})
 
     lines = ["  " + row + ("   " + text[i] if i in text else "")
              for i, row in enumerate(art)]
