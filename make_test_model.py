@@ -107,6 +107,9 @@ def make_test_model(output_dir: str = "test_model"):
         tensors[f"{prefix}.self_attn.v_proj.bias"] = np.zeros(KVH * hd, dtype=np.float32)
         tensors[f"{prefix}.self_attn.o_proj.bias"] = np.zeros(D, dtype=np.float32)
 
+        # Attention sinks (required by picchio.c for gpt_oss, use_sinks=1)
+        tensors[f"{prefix}.self_attn.sinks"] = np.zeros(H, dtype=np.float32)
+
         # Router
         tensors[f"{prefix}.mlp.router.weight"] = np.random.randn(E, D).astype(np.float32) * 0.1
         tensors[f"{prefix}.mlp.router.bias"] = np.zeros(E, dtype=np.float32)
