@@ -21,9 +21,11 @@ Run:
 import argparse
 import itertools
 import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 try:
     from transformers import AutoTokenizer
@@ -87,6 +89,18 @@ def _clear_status():
         sys.stderr.flush()
 
 
+def _resolve_exe(exe):
+    """Resolve exe to an absolute path. Windows' CreateProcess (used by
+    subprocess.Popen with an explicit executable) doesn't reliably find a
+    bare relative name like "picchio.exe" without a "./" prefix, even when
+    it sits in the current directory. """
+    p = Path(exe)
+    if p.is_file():
+        return str(p.resolve())
+    found = shutil.which(str(exe))
+    return found if found else exe
+
+
 class PicchioSession:
     """Persistent Picchio process in SERVICE mode (identical transport to chat.py)."""
 
@@ -114,7 +128,7 @@ class PicchioSession:
         if model_aux:
             env["MODEL_AUX"] = model_aux
         self.proc = subprocess.Popen(
-            [str(exe), str(model)], env=env, stdin=subprocess.PIPE,
+            [_resolve_exe(exe), str(model)], env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, text=True, encoding="ascii",
             errors="replace", bufsize=1)
         ready = self._line()
