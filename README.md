@@ -2,6 +2,16 @@
   <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS 20B/120B · Qwen3-MoE · int4 · streaming CPU" width="560">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/gpt--oss--20b-3.3_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-20b: 3.3 tok/s">
+  <img src="https://img.shields.io/badge/Qwen3--30B--A3B-2.9_tok%2Fs-2ea44f?style=flat-square" alt="Qwen3-30B-A3B: 2.9 tok/s">
+  <img src="https://img.shields.io/badge/gpt--oss--120b-1.24_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-120b: 1.24 tok/s">
+  <br>
+  <img src="https://img.shields.io/badge/language-pure_C-00599C?style=flat-square" alt="pure C">
+  <img src="https://img.shields.io/badge/runs-larger_than_RAM-blue?style=flat-square" alt="runs models larger than RAM">
+  <img src="https://img.shields.io/badge/66_GB_model-on_16_GB_RAM-orange?style=flat-square" alt="66 GB model on 16 GB RAM">
+</p>
+
 > *The woodpecker drums a hundred times a second on a huge trunk;
 > we drum 128 experts on a huge disk.*
 
@@ -18,6 +28,23 @@ without a datacenter GPU.
 
 Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
 GPT-OSS architecture.
+
+### Measured performance
+
+Warm, greedy decode on a **6-core AVX2 laptop, 16 GB RAM, internal NVMe, GTX 1650
+4 GB (idle)** — no datacenter GPU. The lever is **INT8 attention** (`--dense-bits 8`):
+attention was the largest chunk of per-token byte movement, and quantizing it
+near-losslessly roughly halves it and frees RAM for the expert cache.
+
+| Model | Converted size | F32 attention | **INT8 attention** | |
+|---|---|---:|---:|---|
+| **gpt-oss-20b** | ~14 GB | 1.4 tok/s | **3.3 tok/s** | **+136%** — matches/beats Ollama here |
+| **Qwen3-30B-A3B** | ~20 GB | 2.2 tok/s | **2.9 tok/s** | **+32%**, dense resident 4.3 → 1.6 GB |
+| **gpt-oss-120b** | ~66 GB | 0.5 tok/s | **1.24 tok/s** | streamed from disk; prefill ~60 s |
+
+The 120B — **66 GB of weights on a 16 GB machine** — runs at over a token per
+second by streaming its experts. Full methodology, a cold-start worst case, and the
+GPU analysis are in [Measured performance](#measured-performance-a-deliberate-worst-case).
 
 ### Supported models
 
