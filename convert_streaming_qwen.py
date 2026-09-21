@@ -174,7 +174,8 @@ def main():
 
         t0 = time.time()
         output_tensors = {}
-        convert_shard(raw_path, output_tensors, cfg, stats, is_qwen=True)
+        convert_shard(raw_path, output_tensors, cfg, stats,
+                      dense_bits=int(os.environ.get("DENSE_BITS", "4")), is_qwen=True)
         interleave_qwen_experts(output_tensors, pending, stats)
 
         save_file(output_tensors, str(out_path))

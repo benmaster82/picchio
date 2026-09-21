@@ -158,6 +158,12 @@ compile it yourself instead (any OS), continue below.
 This produces a **self-contained `picchio.exe`** (statically linked, it does not
 need any MinGW DLLs and runs from anywhere).
 
+The GPU-guided I/O path is also built into this executable. It loads the
+installed NVIDIA driver (`nvcuda.dll`) dynamically and JITs embedded PTX; using
+`GPU_PREFETCH=1` or `GPU_DENSE=1` does **not** require the CUDA Toolkit, CUDA Runtime, or
+`picchio_cuda.dll`. The separate CUDA DLL is needed only by the experimental
+`GPU_EXPERTS`/`GPU_LMHEAD` paths.
+
 Or compile by hand from the MSYS2 MinGW terminal:
 ```bash
 gcc -O2 -Wall -fopenmp -mavx2 -mfma -Wno-misleading-indentation \
@@ -184,8 +190,28 @@ make
 
 ```powershell
 .\picchio.exe --self-test        # Windows
+.\picchio.exe --gpu-router-test  # NVIDIA router kernel, no model required
+.\picchio.exe --gpu-dense-test   # FP16 attention GEMV, real 4096x2880 shape
 ./picchio --self-test            # Linux/macOS
 ```
+
+To benchmark the production INT3 gs64 expert kernel at the exact GPT-OSS-120B
+dimensions, without loading a model:
+
+```powershell
+$env:OMP_NUM_THREADS = "8"
+.\picchio.exe --bench-int3 100
+```
+
+Before loading a large checkpoint, inspect its minimum memory requirement
+without opening any weight shard:
+
+```powershell
+.\picchio.exe --plan D:\gptoss_i3
+```
+
+Exit status `2` means the model is valid but the currently available RAM is
+below the safe minimum; close other applications and run the plan again.
 
 This runs the full forward pass on a tiny synthetic model, **no model download
 needed**. You should see `── self-test PASSED ──`. If you
@@ -241,6 +267,22 @@ output folder. It only needs to be done once.
 > attention, etc. copied unchanged), writing a marked container — no download.
 > Slightly lower quality than converting from the original (INT4→INT3 compounds a
 > little error), but validated to keep answers correct on a real 20B.
+
+> **Faster attention (`--dense-bits 8`).** By default attention (Q/K/V/O) is kept
+> F32. Adding `--dense-bits 8` stores it as INT8 (per-row scales) — near-lossless,
+> ~4× fewer attention bytes. Attention is the single largest chunk of per-token
+> byte movement, so this is the **biggest measured speedup lever**: **+32% decode
+> on Qwen3-30B-A3B, +~130% on gpt-oss-20b** (where attention dominates), plus a few
+> GB of resident RAM freed for the expert cache. The runtime executes INT8
+> attention via `matmul_q8`; no runtime flag is needed, and quality is preserved
+> (validated on 30B and 120B). Combine with `--expert-bits 3/4` freely.
+>
+> **No re-download: transcode attention to INT8.** Retrofit an existing converted
+> model with [`transcode_attn_to_int8.py`](transcode_attn_to_int8.py) — it
+> requantizes only the attention weights (experts copied unchanged), no download:
+> ```powershell
+> python transcode_attn_to_int8.py --input C:\models\gptoss20b_i4 --output C:\models\gptoss20b_i4d8
+> ```
 
 > **Reclaim space after converting.** The raw Hugging Face download is left in a
 > sibling folder named `<output>_raw` (e.g. `C:\models\gptoss20b_i4_raw`). Only the
@@ -303,9 +345,22 @@ between turns:
 python chat.py --model C:\models\gptoss20b_i4 --pin-gb 4 --ctx 1024 --max-tokens 200 --temperature 0.7
 ```
 
+For the Windows 120B INT3 setup in this repository, start the preconfigured
+launcher from `C:\gpu`:
+
+```powershell
+.\scripts\chat-gptoss120b.ps1
+```
+
+It reads `C:\gpu\models\gptoss_i3` directly from SafeTensors (`--flat 0`),
+enables asynchronous direct I/O and GPU-guided prefetch, and keeps the engine
+process alive across turns.
+
 Type your message after the blue `YOU` prompt. Type `/exit` or `/quit` to leave.
 
-The interactive chat also accepts `/help`, `/clear`, `/stats`, and `/settings`.
+The interactive chat also accepts `/help`, `/clear`, `/reset`, `/stats`, and
+`/settings`. `/reset` clears conversation history and the engine KV cache
+without unloading the model.
 Both model families use the same terminal interface, with a compact model
 summary, live generation status, and per-response performance metrics.
 
@@ -319,9 +374,29 @@ summary, live generation status, and per-response performance metrics.
 | `--show-analysis` | Deprecated: the reasoning is now always streamed live (dimmed, under a `thinking ❯` header) next to the answer. |
 | `--top-p`, `--top-k`, `--seed` | Standard sampling controls. |
 | `--async-moe --direct` | Experimental decode pipeline: overlap unbuffered expert reads with CPU expert compute. Tune read concurrency with `--io-threads` (start from `4`). |
+| `--flat 0` | Disable the flat store and read the original SafeTensors shards. |
+| `--gpu-router` | Run the resident layer routers on the native CUDA Driver backend. |
+| `--gpu-prefetch` | Use the GPU router to predict layer L+1 and prefetch experts while the current layer runs. Recommended for the 4 GB GTX 1650. |
+| `--gpu-dense` | Keep all 144 attention Q/K/V/O matrices resident as FP16 in VRAM and execute their GEMVs through embedded PTX. Uses about 1.78 GiB on GPT-OSS-120B. |
+| `--gpu-experts` | Experimental full expert offload; not recommended on a 4 GB GPU. |
 | `--reasoning low\|medium\|high` | How much the model thinks before answering. |
 | `--json` | Print the structured reply as JSON. |
 | `--dry-run` | Show the exact tokens that would be sent, without loading the model (handy for debugging). |
+
+### Reproducible multi-turn benchmark
+
+The repository-level Windows launcher runs a deterministic three-turn memory
+test in one persistent service and writes complete JSON plus per-turn CSV:
+
+```powershell
+Set-Location C:\gpu
+.\scripts\bench-chat-gptoss120b.ps1
+```
+
+The service protocol's `STATS` command exposes cumulative engine counters. The
+benchmark snapshots it around every turn to report TTFT, KV reuse, expert-cache
+hits, expert loads, async wait, attention/MoE time, GPU-router cost and prefetch
+accuracy. Default answers are also checked for the expected remembered values.
 
 ### The bare-metal path (advanced / quick test)
 
@@ -532,7 +607,7 @@ flags map onto these). The most useful:
 | Variable | Default | Meaning |
 |---|---|---|
 | `MODEL` | (none) | Path to the converted model folder (or pass it as the first argument). |
-| `PIN_GB` | **auto** | GB of RAM for the expert cache. **The single biggest performance knob.** By default it's sized automatically from your physical RAM (all RAM minus a ~6 GB reserve). A bigger cache means fewer disk reads. Setting a value overrides the auto-sizing. |
+| `PIN_GB` | **auto** | GB of RAM for the expert cache. **The single biggest performance knob.** Auto-sizing considers physical RAM, RAM currently available, the estimated dense allocation, and the exact INT3/INT4 expert size. A bigger cache means fewer disk reads. Setting a value overrides the auto-sizing. |
 | `CTX` | 512 | KV-cache size in tokens (max prompt+generation length). |
 | `OMP_NUM_THREADS` | all cores | Number of CPU threads for the matmuls. |
 | `MAX` | 128 | Max tokens to generate (bare-metal run only). |
@@ -543,10 +618,32 @@ flags map onto these). The most useful:
 | `ASYNC_MOE` | `0` | `1` = experimental completion-driven pipeline: compute ready CPU experts while the remaining routed experts are still being read. The final reduction keeps canonical top-k order. |
 | `FLAT` | auto | Auto-detects `<model>/experts.picchioflat`; set a path to override or `0` to disable. Build it with `FLAT_MODEL=<model> python flat_pack.py`. |
 | `FLAT_VERIFY` | `0` | `1` = verify the truncated SHA-256 of every flat expert payload while loading (diagnostic; index SHA-256 is always verified). |
+| `GPU_ROUTER` | `0` | `1` = keep every router resident in VRAM and compute routing logits on the GPU. Expert compute stays on the CPU. |
+| `GPU_PREFETCH` | `0` | `1` = GPU router predicts layer L+1 before current MoE I/O/compute, then the prefetch thread populates the RAM LRU concurrently. Implies the router backend and prefetch. |
+| `GPU_DENSE` | `0` | `1` = keep Q/K/V/O projections resident as FP16 and run attention GEMVs on the dependency-free native CUDA Driver backend. |
+| `GPU_DENSE_RELEASE_HOST` | `0` | With `GPU_DENSE=1`, free F32 host projection weights after all uploads succeed (about 3.56 GiB on this 120B). GPU errors terminate inference; CPU fallback is unavailable. Failed startup uploads reject this mode. Chat flag: `--gpu-dense-release-host`. |
+| `EXPERT_REUSE` | `1` | Reuse aligned cache-slot storage for converted gs64 INT3/INT4 experts and read shard tensors directly into it. Unsupported layouts retain the legacy loader. Set `0` for allocating-reader comparisons; chat: `--no-expert-reuse`. |
+| `TENSOR_INDEX` | `1` | Immutable tensor-name hash index built after opening shards; preserves first-match lookup semantics. Set `0` for linear lookup comparisons; chat: `--no-tensor-index`. |
+| `GPU_EXPERTS` | `0` | `1` = experimental full expert offload. Separate from `GPU_PREFETCH`; not recommended on a 4 GB GTX 1650. |
+| `PIN_VRAM_GB` | auto | VRAM budget only for `GPU_EXPERTS`; router-only mode uses about 53 MB for GPT-OSS-120B. |
 | `MODEL_AUX` | (none) | Extra model files on other disks (semicolon-separated). |
 | `IDOT` | `0` | `1` = integer expert kernel (int8 activation × int4 weight). Uses AVX-VNNI (`dpbusd`) where the CPU supports it, else AVX2; a small approximation, so off by default. |
 | `DROP` | `0` | `1` = drop just-read pages from the OS page cache after each read (Linux), keeping peak RAM at "dense + cache" when streaming a model larger than RAM. |
 | `DIRECT` | `0` | `1` = unbuffered expert reads (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`), bypassing the OS page cache. A win on fast internal NVMe where the buffered path is page-cache-bound; little effect on a USB bridge. Opt-in, with a buffered fallback per read. |
+| `ECAP` | auto | Expert cache slots **per layer** (override of the auto-sizing derived from `PIN_GB`). Set `= num_experts` to keep the whole expert tier resident once the model fits in RAM (e.g. `ECAP=32` for a 20B) — after a warm-up pass no expert is streamed again. |
+| `DRAFT_MODEL` | (none) | Path to a small **draft model** for speculative decoding (bare-metal path). The draft is a tiny dense model converted as a 1-expert MoE (see `convert.py` on a dense checkpoint) and is loaded fully resident. Experimental. |
+| `SPEC_K` | `4` | Draft tokens proposed per verify round when `DRAFT_MODEL` is set. |
+| `SPEC_PROBE` | `0` | Diagnostic (no effect on generation): records per-token expert routing + token stream, then reports n-gram acceptance and expert-union at exit. |
+| `SELF_DRAFT_PROBE` / `SELF_DRAFT_K` | `0` / `1` | Diagnostic: measures how often a reduced top-`k` routing (a free self-draft) matches the full top-`k` next token. |
+
+> **Speculative decoding (experimental).** With `DRAFT_MODEL` set, a small draft
+> proposes `SPEC_K` tokens that the target verifies in one batched forward
+> (`forward_verify`), accepting the longest matching prefix + one bonus token;
+> output is byte-identical to greedy. It **wins only when the target is
+> memory-resident** (so batching amortizes RAM/compute) **and the draft has high
+> acceptance**. On a disk-bound target where `ASYNC_MOE` already hides the I/O, the
+> batched verify's expert-union I/O is exposed and speculation is a net loss —
+> measured on this hardware. Kept as scaffolding for larger-RAM / GPU setups.
 
 Performance notes:
 
@@ -660,10 +757,14 @@ token, total disk traffic is a fraction of the model size.
 | Activation | clipped SwiGLU | clipped SwiGLU | plain SwiGLU (SiLU) |
 | Converted size | ~14 GB | ~66 GB | ~20 GB |
 
-Quantization (both families): experts are INT4 (group-scaled, 64), the embedding
-and output head are INT8, attention is F32. The engine reads every dimension from
-`config.json` and flips the family-specific behaviors from the model's
-`model_type`, so the GPT-OSS path is byte-for-byte unchanged.
+Quantization (both families): experts are INT4 (group-scaled, 64) — or INT3 gs64
+with `--expert-bits 3`; the embedding and output head are INT8; attention is F32 by
+default, or **INT8 with `--dense-bits 8`** (near-lossless, the biggest speedup lever
+— see section 4). The engine reads every dimension from `config.json` and flips the
+family-specific behaviors from the model's `model_type`, so the GPT-OSS path is
+byte-for-byte unchanged. A dense (non-MoE) checkpoint is converted as a 1-expert MoE
+(single MLP as expert 0 + a zero router), so the streaming engine runs it unchanged
+— handy for a small resident draft model.
 
 ### Files in this repository
 
@@ -681,6 +782,8 @@ convert_streaming.py   Shard-by-shard download+convert for the GPT-OSS 120B
 convert_streaming_qwen.py  Shard-by-shard download+convert for a Qwen3-MoE model
 export_vocab.py        Build the binary tokenizer file
 download_expert_biases.py  Regenerate the 120B expert-bias sidecar
+transcode_i4_to_i3.py  Requantize experts INT4 -> INT3 in place (no re-download)
+transcode_attn_to_int8.py  Requantize attention F32 -> INT8 in place (no re-download)
 
 chat.py                Token-exact GPT-OSS chat bridge (Harmony)
 chat_qwen.py           Qwen3-MoE chat bridge (ChatML via transformers)
@@ -697,6 +800,7 @@ pipe_node.py           Prototype of the 2-stage pipeline with byte-identity chec
 
 flat_common.py         Shared helpers for the .picchioflat store (model-agnostic)
 flat_pack.py           Repack converted experts into a flat, block-aligned store
+flat_verify.py         Validate flat index/layout and sampled payload hashes
 flat_bench.py          Byte-verify the flat store and microbench expert I/O
 flat_bench_qd.py       Async high-queue-depth read benchmark (overlapped + IOCP)
 

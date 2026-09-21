@@ -10,10 +10,8 @@
  * Scope of this first prototype (low-VRAM friendly, GTX 1650 4 GB target):
  *   - pgpu_matmul_i8    : lm_head — INT8 weight kept RESIDENT in VRAM (uploaded
  *                         once, cached by weight_id), recomputed every token.
- *   - pgpu_matmul_i4gs  : expert gate_up / down — INT4 group-scaled, streamed
- *                         through a small reusable VRAM SCRATCH (upload → compute
- *                         → discard). No residency required: even ~200 MB of VRAM
- *                         offloads the expert matmul compute.
+ *   - pgpu_matmul_i4gs / pgpu_matmul_i3gs: group-scaled expert kernels.
+ *   - pgpu_moe_layer   : complete INT3/INT4 expert tier with a bounded VRAM LRU.
  *
  * Every entry point returns 0 on success and -1 to tell the caller to fall back
  * to the CPU path for that single call (e.g. transient cudaMalloc failure).
@@ -53,11 +51,26 @@ PGPU_API int  pgpu_matmul_i8(float *y, const float *x,
                              const int8_t *w, const float *scale,
                              int O, int I, const void *weight_id);
 
+/* Keep one router matrix [E,D] (and optional bias [E]) resident in VRAM.
+ * pgpu_router_scores returns all E logits so routing semantics/top-k remain in
+ * the C engine. `weight_id` is the stable host router pointer used as cache key. */
+PGPU_API int  pgpu_router_upload(const float *w, const float *bias,
+                                 int E, int D, const void *weight_id);
+PGPU_API int  pgpu_router_scores(float *scores, const float *x,
+                                 const float *w, const float *bias,
+                                 int E, int D, const void *weight_id);
+
 /* y[O] = sum_g scale[o*ngroups + g] * sum_{i in group g} x[i] * (nibble(i) - 8)
  * q4 is INT4 packed (2 nibbles/byte, low nibble = even i), gs = group size (64).
  * Streamed through scratch — nothing is cached (expert weights change per token). */
 PGPU_API int  pgpu_matmul_i4gs(float *y, const float *x,
                                const uint8_t *q4, const float *scale,
+                               int O, int I, int gs);
+
+/* Same operation for Picchio INT3 gs64 bit planes: each 64-value group is
+ * stored as 16 low-plane bytes plus 8 high-plane bytes (24 bytes total). */
+PGPU_API int  pgpu_matmul_i3gs(float *y, const float *x,
+                               const uint8_t *q3, const float *scale,
                                int O, int I, int gs);
 
 /* ── G2: full MoE expert tier on GPU (residency + batching) ──────────────── */
@@ -79,9 +92,16 @@ typedef struct {
  * is overwritten. Returns 0 on success, -1 to fall back to the CPU expert loop. */
 PGPU_API int  pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
                              int layer, const PgpuExpert *experts,
-                             const float *wsum, int nexp, int gs,
+                             const float *wsum, int nexp, int gs, int bits,
                              int swiglu_clipped, float swiglu_limit,
                              float swiglu_alpha);
+
+/* 1 if expert (layer, eid) is currently resident in the VRAM LRU, else 0 (also 0
+ * if the backend is inactive). Lets the engine skip the host/disk read for an
+ * expert the GPU already holds: pass such experts to pgpu_moe_layer with NULL
+ * host pointers. Racing eviction is safe — pgpu_moe_layer returns -1 (CPU
+ * fallback) if a NULL-pointer expert is not actually resident when computed. */
+PGPU_API int  pgpu_moe_resident(int layer, int eid);
 
 #ifdef __cplusplus
 }

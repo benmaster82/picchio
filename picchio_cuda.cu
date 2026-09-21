@@ -3,6 +3,7 @@
  * Kernels:
  *   lm_head_i8     : one block per output row, coalesced INT8 reads, block reduce.
  *   expert_i4gs    : one thread per output row, INT4 group-scaled dequant matmul.
+ *   expert_i3gs    : one thread per output row, INT3 gs64 bit-plane matmul.
  *
  * The math mirrors quant.h exactly (matmul_q8 / matmul_i4_gs) so the GPU top-1
  * token matches the CPU oracle; only the FP reduction order differs, so results
@@ -63,6 +64,28 @@ __global__ void lm_head_i8(const int8_t *__restrict__ W,
     if (threadIdx.x == 0) y[o] = sm[0] * scale[o];
 }
 
+/* One resident router row per block. Only E floats return to the host; the
+ * [E,D] matrix remains in VRAM across every token and prediction. */
+__global__ void router_f32(const float *__restrict__ W,
+                           const float *__restrict__ bias,
+                           const float *__restrict__ x,
+                           float *__restrict__ scores, int E, int D) {
+    int e = blockIdx.x;
+    if (e >= E) return;
+    const float *w = W + (long long)e * D;
+    float a = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x)
+        a += x[i] * w[i];
+    __shared__ float sm[256];
+    sm[threadIdx.x] = a;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) scores[e] = sm[0] + (bias ? bias[e] : 0.f);
+}
+
 /* expert INT4 group-scaled: y[o] = sum_g sc[o,g] * sum_{i in g} x[i]*(nib(i)-8).
  * One thread per output row (O is small: 5760 gate_up / 2880 down). */
 __global__ void expert_i4gs(const uint8_t *__restrict__ Q,
@@ -86,6 +109,35 @@ __global__ void expert_i4gs(const uint8_t *__restrict__ Q,
             unsigned char byte = w[i >> 1];
             int nib = (i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
             ga += x[i] * (float)(nib - 8);
+        }
+        a += ga * sc[g];
+    }
+    y[o] = a;
+}
+
+/* Picchio INT3 gs64. Per output row and group of 64 values the low two bits
+ * occupy 16 bytes and the high bit occupies 8 bytes. Code [0,7] maps to [-4,3]. */
+__global__ void expert_i3gs(const uint8_t *__restrict__ Q,
+                            const float *__restrict__ S,
+                            const float *__restrict__ x,
+                            float *__restrict__ y,
+                            int O, int I) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= O) return;
+    int ng = (I + 63) / 64;
+    const uint8_t *row = Q + (long long)o * ng * 24;
+    const float *sc = S + (long long)o * ng;
+    float a = 0.f;
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *lo = row + (long long)g * 24;
+        const uint8_t *hi = lo + 16;
+        int base = g * 64;
+        int n = I - base; if (n > 64) n = 64;
+        float ga = 0.f;
+        for (int j = 0; j < n; j++) {
+            int low2 = (lo[j >> 2] >> ((j & 3) * 2)) & 3;
+            int high1 = (hi[j >> 3] >> (j & 7)) & 1;
+            ga += x[base + j] * (float)((low2 | (high1 << 2)) - 4);
         }
         a += ga * sc[g];
     }
@@ -130,6 +182,8 @@ __global__ void zero_k(float *p, int n) {
 
 struct DevW { int8_t *w; float *s; };
 static std::unordered_map<const void *, DevW> g_wcache;   /* resident weights */
+struct DevRouter { float *w; float *bias; int E, D; };
+static std::unordered_map<const void *, DevRouter> g_rcache;
 
 static float   *g_dx   = nullptr;  size_t g_dx_cap   = 0;  /* activation scratch */
 static float   *g_dy   = nullptr;  size_t g_dy_cap   = 0;  /* output scratch */
@@ -190,8 +244,7 @@ extern "C" int pgpu_init(void) {
     double gb = v ? atof(v) : 0.0;
     if (gb <= 0.0) { gb = (double)freeb / 1e9 - 0.6; if (gb < 0.2) gb = 0.2; }
     g_vram_budget = (size_t)(gb * 1e9);
-    fprintf(stderr, "[gpu] expert VRAM budget: %.2f GB (~%.0f experts of ~14 MB)\n",
-            g_vram_budget / 1e9, g_vram_budget / 14.0e6);
+    fprintf(stderr, "[gpu] expert VRAM budget: %.2f GB\n", g_vram_budget / 1e9);
 
     g_ok = 1;
     return 1;
@@ -205,8 +258,9 @@ extern "C" void pgpu_shutdown(void) {
                 (unsigned long long)g_ehit, (unsigned long long)g_emiss,
                 100.0 * g_ehit / (g_ehit + g_emiss), g_vram_used / 1e9);
     for (auto &kv : g_wcache)  { cudaFree(kv.second.w); cudaFree(kv.second.s); }
+    for (auto &kv : g_rcache)  { cudaFree(kv.second.w); cudaFree(kv.second.bias); }
     for (auto &kv : g_ecache)  { free_dev_expert(kv.second); }
-    g_wcache.clear(); g_ecache.clear();
+    g_wcache.clear(); g_rcache.clear(); g_ecache.clear();
     g_vram_used = 0;
     if (g_dx)   cudaFree(g_dx);
     if (g_dy)   cudaFree(g_dy);
@@ -253,6 +307,42 @@ extern "C" int pgpu_matmul_i8(float *y, const float *x,
     return 0;
 }
 
+extern "C" int pgpu_router_upload(const float *w, const float *bias,
+                                   int E, int D, const void *weight_id) {
+    if (!g_ok || !w || !weight_id || E <= 0 || D <= 0) return -1;
+    if (g_rcache.find(weight_id) != g_rcache.end()) return 0;
+    DevRouter r{nullptr, nullptr, E, D};
+    if (cudaMalloc(&r.w, (size_t)E * D * sizeof(float)) != cudaSuccess)
+        return -1;
+    if (bias && cudaMalloc(&r.bias, (size_t)E * sizeof(float)) != cudaSuccess) {
+        cudaFree(r.w); return -1;
+    }
+    if (cudaMemcpy(r.w, w, (size_t)E * D * sizeof(float),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        (bias && cudaMemcpy(r.bias, bias, (size_t)E * sizeof(float),
+                            cudaMemcpyHostToDevice) != cudaSuccess)) {
+        cudaFree(r.w); cudaFree(r.bias); return -1;
+    }
+    g_rcache.emplace(weight_id, r);
+    return 0;
+}
+
+extern "C" int pgpu_router_scores(float *scores, const float *x,
+                                   const float *w, const float *bias,
+                                   int E, int D, const void *weight_id) {
+    if (!g_ok || !scores || !x) return -1;
+    if (pgpu_router_upload(w, bias, E, D, weight_id) != 0) return -1;
+    auto it = g_rcache.find(weight_id);
+    if (it == g_rcache.end() || it->second.E != E || it->second.D != D) return -1;
+    if (ensure((void **)&g_dx, &g_dx_cap, (size_t)D * sizeof(float)) != 0) return -1;
+    if (ensure((void **)&g_dy, &g_dy_cap, (size_t)E * sizeof(float)) != 0) return -1;
+    CU_TRY(cudaMemcpy(g_dx, x, (size_t)D * sizeof(float), cudaMemcpyHostToDevice));
+    router_f32<<<E, 256>>>(it->second.w, it->second.bias, g_dx, g_dy, E, D);
+    CU_TRY(cudaGetLastError());
+    CU_TRY(cudaMemcpy(scores, g_dy, (size_t)E * sizeof(float), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
 extern "C" int pgpu_matmul_i4gs(float *y, const float *x,
                                 const uint8_t *q4, const float *scale,
                                 int O, int I, int gs) {
@@ -276,6 +366,29 @@ extern "C" int pgpu_matmul_i4gs(float *y, const float *x,
     return 0;
 }
 
+extern "C" int pgpu_matmul_i3gs(float *y, const float *x,
+                                 const uint8_t *q3, const float *scale,
+                                 int O, int I, int gs) {
+    if (!g_ok || gs != 64) return -1;
+    int ng = (I + 63) / 64;
+    size_t qbytes = (size_t)O * ng * 24;
+
+    if (ensure((void **)&g_dx,  &g_dx_cap,  (size_t)I * sizeof(float)) != 0) return -1;
+    if (ensure((void **)&g_dy,  &g_dy_cap,  (size_t)O * sizeof(float)) != 0) return -1;
+    if (ensure((void **)&g_dq4, &g_dq4_cap, qbytes) != 0) return -1;
+    if (ensure((void **)&g_ds,  &g_ds_cap,  (size_t)O * ng * sizeof(float)) != 0) return -1;
+
+    CU_TRY(cudaMemcpy(g_dx,  x,     (size_t)I * sizeof(float),      cudaMemcpyHostToDevice));
+    CU_TRY(cudaMemcpy(g_dq4, q3,    qbytes,                         cudaMemcpyHostToDevice));
+    CU_TRY(cudaMemcpy(g_ds,  scale, (size_t)O * ng * sizeof(float), cudaMemcpyHostToDevice));
+
+    int threads = 128, blocks = (O + threads - 1) / threads;
+    expert_i3gs<<<blocks, threads>>>(g_dq4, g_ds, g_dx, g_dy, O, I);
+    CU_TRY(cudaGetLastError());
+    CU_TRY(cudaMemcpy(y, g_dy, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
 /* Resolve an expert in the VRAM cache, uploading (and evicting LRU) on a miss.
  * Returns a stable pointer into g_ecache, or NULL on allocation failure. */
 static DevExpert *get_expert(uint64_t key, const PgpuExpert *e,
@@ -283,6 +396,10 @@ static DevExpert *get_expert(uint64_t key, const PgpuExpert *e,
                              size_t d_wb, size_t d_sb, size_t d_bb) {
     auto it = g_ecache.find(key);
     if (it != g_ecache.end()) { g_ehit++; return &it->second; }
+    /* A resident-only expert (host weights intentionally not loaded, NULL ptrs)
+     * that is no longer cached — e.g. evicted before we reached it. Signal the
+     * caller to fall back rather than dereference the absent host pointers. */
+    if (!e->gu_q4 || !e->d_q4) return NULL;
     g_emiss++;
 
     size_t need = gu_wb + gu_sb + d_wb + d_sb
@@ -323,15 +440,17 @@ static DevExpert *get_expert(uint64_t key, const PgpuExpert *e,
 
 extern "C" int pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
                               int layer, const PgpuExpert *experts,
-                              const float *wsum, int nexp, int gs,
+                              const float *wsum, int nexp, int gs, int bits,
                               int swiglu_clipped, float swiglu_limit,
                               float swiglu_alpha) {
-    if (!g_ok) return -1;
+    if (!g_ok || (bits != 3 && bits != 4) || gs != 64) return -1;
     int half  = moe_inter / 2;
-    int gu_rb = (D + 1) / 2,    gu_ng = (D + gs - 1) / gs;
-    int d_rb  = (half + 1) / 2, d_ng  = (half + gs - 1) / gs;
-    size_t gu_wb = (size_t)moe_inter * gu_rb, gu_sb = (size_t)moe_inter * gu_ng * 4;
-    size_t d_wb  = (size_t)D * d_rb,          d_sb  = (size_t)D * d_ng * 4;
+    int gu_ng = (D + gs - 1) / gs;
+    int d_ng  = (half + gs - 1) / gs;
+    size_t gu_rowb = bits == 3 ? (size_t)gu_ng * 24 : (size_t)(D + 1) / 2;
+    size_t d_rowb  = bits == 3 ? (size_t)d_ng * 24 : (size_t)(half + 1) / 2;
+    size_t gu_wb = (size_t)moe_inter * gu_rowb, gu_sb = (size_t)moe_inter * gu_ng * 4;
+    size_t d_wb  = (size_t)D * d_rowb,          d_sb  = (size_t)D * d_ng * 4;
     size_t gu_bb = (size_t)moe_inter * 4,     d_bb  = (size_t)D * 4;
 
     if (ensure((void **)&g_dx,   &g_dx_cap,   (size_t)D * 4)         != 0) return -1;
@@ -343,6 +462,14 @@ extern "C" int pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
     if (cudaMemcpy(g_dx, x, (size_t)D * 4, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
     zero_k<<<(D + 127) / 128, 128>>>(g_dout, D);
 
+    /* Protect this call's already-resident experts from being evicted by the
+     * misses in this same call: bump their LRU stamp before any upload evicts. */
+    for (int k = 0; k < nexp; k++) {
+        uint64_t rk = ((uint64_t)(unsigned)layer << 32) | (unsigned)experts[k].eid;
+        auto rit = g_ecache.find(rk);
+        if (rit != g_ecache.end()) rit->second.used = ++g_eclock;
+    }
+
     for (int k = 0; k < nexp; k++) {
         const PgpuExpert *e = &experts[k];
         uint64_t key = ((uint64_t)(unsigned)layer << 32) | (unsigned)e->eid;
@@ -350,10 +477,16 @@ extern "C" int pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
         if (!de) return -1;
         de->used = ++g_eclock;
 
-        expert_i4gs<<<(moe_inter + 127) / 128, 128>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D, gs);
+        if (bits == 3)
+            expert_i3gs<<<(moe_inter + 127) / 128, 128>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D);
+        else
+            expert_i4gs<<<(moe_inter + 127) / 128, 128>>>(de->gu, de->gu_s, g_dx, g_dgu, moe_inter, D, gs);
         swiglu_k<<<(half + 127) / 128, 128>>>(g_dgu, de->gu_bias, g_dh, half,
                                               swiglu_clipped, swiglu_limit, swiglu_alpha);
-        expert_i4gs<<<(D + 127) / 128, 128>>>(de->d, de->d_s, g_dh, g_deo, D, half, gs);
+        if (bits == 3)
+            expert_i3gs<<<(D + 127) / 128, 128>>>(de->d, de->d_s, g_dh, g_deo, D, half);
+        else
+            expert_i4gs<<<(D + 127) / 128, 128>>>(de->d, de->d_s, g_dh, g_deo, D, half, gs);
         accum_k<<<(D + 127) / 128, 128>>>(g_dout, g_deo, de->d_bias, wsum[k], D);
     }
     if (cudaGetLastError() != cudaSuccess) return -1;
@@ -361,10 +494,49 @@ extern "C" int pgpu_moe_layer(float *out, const float *x, int D, int moe_inter,
     return 0;
 }
 
+extern "C" int pgpu_moe_resident(int layer, int eid) {
+    if (!g_ok) return 0;
+    uint64_t key = ((uint64_t)(unsigned)layer << 32) | (unsigned)eid;
+    return g_ecache.find(key) != g_ecache.end() ? 1 : 0;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  STANDALONE NUMERIC SELF-TEST + MICROBENCH (nvcc -DPGPU_TEST)
  * ══════════════════════════════════════════════════════════════════════════ */
-#ifdef PGPU_TEST
+#if defined(PGPU_ROUTER_TEST)
+int main(void) {
+    if (!pgpu_init()) { fprintf(stderr, "no CUDA device\n"); return 1; }
+    const int E = 128, D = 2880;
+    float *w = (float *)malloc((size_t)E * D * sizeof(float));
+    float *b = (float *)malloc((size_t)E * sizeof(float));
+    float *x = (float *)malloc((size_t)D * sizeof(float));
+    float *cpu = (float *)malloc((size_t)E * sizeof(float));
+    float *gpu = (float *)malloc((size_t)E * sizeof(float));
+    if (!w || !b || !x || !cpu || !gpu) return 2;
+    srand(1234);
+    for (int i = 0; i < E * D; i++) w[i] = (float)(rand() % 2001 - 1000) / 10000.f;
+    for (int i = 0; i < D; i++) x[i] = (float)(rand() % 2001 - 1000) / 1000.f;
+    for (int e = 0; e < E; e++) {
+        b[e] = (float)(rand() % 201 - 100) / 1000.f;
+        float a = b[e];
+        for (int i = 0; i < D; i++) a += x[i] * w[(long long)e * D + i];
+        cpu[e] = a;
+    }
+    if (pgpu_router_upload(w, b, E, D, w) != 0 ||
+        pgpu_router_scores(gpu, x, w, b, E, D, w) != 0) return 3;
+    float md = 0.f; int ct = 0, gt = 0;
+    for (int e = 0; e < E; e++) {
+        float d = fabsf(cpu[e] - gpu[e]); if (d > md) md = d;
+        if (cpu[e] > cpu[ct]) ct = e;
+        if (gpu[e] > gpu[gt]) gt = e;
+    }
+    printf("router F32 [%d x %d]: CPU top1=%d GPU top1=%d max_abs=%.7g %s\n",
+           E, D, ct, gt, md, ct == gt && md < 1e-4f ? "OK" : "FAIL");
+    pgpu_shutdown();
+    free(w); free(b); free(x); free(cpu); free(gpu);
+    return ct == gt && md < 1e-4f ? 0 : 4;
+}
+#elif defined(PGPU_TEST)
 #include <time.h>
 
 static double wall(void) { return (double)clock() / CLOCKS_PER_SEC; }

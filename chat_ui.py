@@ -98,9 +98,11 @@ def model_precision(model):
 
 
 def header(family, model, ctx, pin_gb, temperature, threads, interactive,
-           reasoning=None, async_moe=False, direct=False, io_threads=None):
+           reasoning=None, async_moe=False, direct=False, io_threads=None,
+           gpu_mode=None):
     precision = model_precision(model)
-    picchio_logo.banner(f"{family} · {precision} · CPU streaming", compact=True)
+    execution = "hybrid CPU/GPU" if gpu_mode else "CPU streaming"
+    picchio_logo.banner(f"{family} · {precision} · {execution}", compact=True)
 
     runtime = f"{threads} CPU threads · {pin_gb:g} GB expert cache"
     io = []
@@ -110,6 +112,8 @@ def header(family, model, ctx, pin_gb, temperature, threads, interactive,
         io.append("direct I/O")
     if io_threads:
         io.append(f"{io_threads} I/O threads")
+    if gpu_mode:
+        io.append(gpu_mode)
     if io:
         runtime += " · " + " / ".join(io)
 
@@ -164,12 +168,22 @@ def thinking(token_count, elapsed):
     status(DIM(f"  {glyph} Thinking · {token_count} tokens · {elapsed:.1f}s"))
 
 
-def metrics(tokens, elapsed, pos, ctx, reused, prompt_tokens, reason=None):
+def metrics(tokens, elapsed, pos, ctx, reused, prompt_tokens, reason=None,
+            ttft=None, prefill_seconds=None, prefill_tokens=None,
+            prefill_tokens_per_s=None, decode_seconds=None, decode_tokens=None,
+            decode_tokens_per_s=None):
     tps = tokens / elapsed if elapsed > 0 else 0.0
+    tps_text = f"{tps:.2f}" if tps < 1.0 else f"{tps:.1f}"
     used = min(pos, ctx)
     reuse = (100.0 * reused / prompt_tokens) if prompt_tokens else 0.0
-    parts = [f"{tokens} tokens", f"{elapsed:.1f}s", f"{tps:.1f} tok/s",
+    parts = [f"{tokens} tokens", f"{elapsed:.1f}s", f"{tps_text} tok/s total",
              f"context {used:,}/{ctx:,}", f"reused {reuse:.0f}%"]
+    if decode_tokens_per_s is not None:
+        parts.insert(2, f"decode {decode_tokens_per_s:.2f} tok/s")
+    if prefill_seconds is not None:
+        parts.insert(2, f"prefill {prefill_seconds:.1f}s")
+    if ttft is not None:
+        parts.insert(2, f"TTFT {ttft:.1f}s")
     if reason and reason not in ("RETURN", "CALL", "EOS"):
         parts.append(reason.lower())
     lines = []
@@ -209,6 +223,7 @@ def help_text():
     write(f"  {BOLD('COMMANDS')}")
     write("  /help       Show this list")
     write("  /clear      Clear the terminal")
+    write("  /reset      Reset conversation and KV cache")
     write("  /stats      Show the latest generation metrics")
     write("  /settings   Show the active model settings")
     write("  /exit       Close the chat")
