@@ -729,6 +729,33 @@ execution was about **43% faster**. Native IOCP/io_uring submission is still
 expected to improve this result by removing worker-thread overhead and raising
 queue depth.
 
+### 0.19 GPU-guided I/O: resident routers and early L+1 prefetch
+
+The first CUDA experiments used the GPU as another matrix-multiply device. That
+was not the founding design: on a 4 GB card the useful role is to reduce and hide
+storage traffic while the expert weights stay next to the CPU that consumes
+them. `GPU_PREFETCH=1` implements the first part of that design. On Windows the
+router backend is part of the C executable: it resolves `nvcuda.dll` at runtime
+and JITs embedded PTX, without CUDA headers, import libraries, CUDA Runtime, or
+the optional `picchio_cuda.dll`.
+
+All 36 F32 router matrices (about 53 MB for GPT-OSS-120B) are uploaded once and
+kept resident in VRAM. After the exact routing of layer L, but before loading or
+computing its experts, the GPU applies router L+1 to L's normalized pre-MoE
+activation. The predicted top-k is submitted to the existing prefetch-to-LRU
+worker. Its reads therefore overlap the entire expert I/O and compute of L, not
+only the short attention window of L+1. The real L+1 router still decides the
+answer; a wrong prediction only wastes a cache read and cannot alter model math.
+`GPU_EXPERTS` remains a separate experimental switch and is not implied.
+
+On the GTX 1650 Max-Q, the 128x2880 router takes 0.232 ms/call. A minimal real
+120B INT3 A/B (`PIN_GB=2`, five slots/layer, greedy, two forwards) preserved the
+next token and measured 78.6% expert-overlap accuracy versus 3.1% random. Cache
+hits rose 8.7% to 30.9%, exposed asynchronous wait fell 3.199 to 3.043 s, and
+`t_moe` fell 4.38 to 4.20 s. End-to-end improved only about 3-4% because the last
+12 layers still use the USB model disk; this is a control/I/O feature, not a
+claim that the weak GPU can overcome that device.
+
 ---
 
 ## 1. Analysis of the GPT-OSS-120B architecture

@@ -364,10 +364,18 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                         output_tensors[key] = t_f32
                         stats["bias"] += t_f32.nbytes
                     elif is_attn:
-                        # Attention: do NOT quantize (modules_to_not_convert)
-                        # Keep F32 to preserve quality
-                        output_tensors[key] = t_f32
-                        stats["dense_i4"] += t_f32.nbytes
+                        if dense_bits == 8 and t_f32.ndim == 2:
+                            # INT8 attention (--dense-bits 8): 4x fewer bytes than F32;
+                            # the runtime loads it as fmt 1 and runs matmul_q8.
+                            t_2d = t_f32.reshape(-1, t_f32.shape[-1])
+                            q8, scales = quantize_int8(t_2d)
+                            output_tensors[key] = q8
+                            output_tensors[key + ".qs"] = scales
+                            stats["dense_i4"] += q8.nbytes + scales.nbytes
+                        else:
+                            # Default: keep attention F32 to preserve quality.
+                            output_tensors[key] = t_f32
+                            stats["dense_i4"] += t_f32.nbytes
                     else:
                         # Embedding/lm_head: INT8 per row, not INT4.
                         # They are excluded from the official quantization: at INT4
@@ -377,6 +385,12 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
                         output_tensors[key] = q8
                         output_tensors[key + ".qs"] = scales
                         stats["dense_i4"] += q8.nbytes + scales.nbytes
+                        # Tied embeddings (e.g. Qwen3-0.6B): synthesize lm_head from
+                        # the embedding, since no separate lm_head.weight exists.
+                        if "embed_tokens" in key and cfg.get("tie_word_embeddings"):
+                            output_tensors["lm_head.weight"] = q8
+                            output_tensors["lm_head.weight.qs"] = scales
+                            stats["dense_i4"] += q8.nbytes + scales.nbytes
                 else:
                     output_tensors[key] = tensor_np.astype(np.float32)
                     stats["other"] += tensor_np.size * 4
@@ -390,6 +404,38 @@ def convert_shard(shard_path: str, output_tensors: dict, cfg: dict,
 
 _QWEN_EXPERT_RE = re.compile(
     r"^(model\.layers\.\d+\.mlp\.experts\.\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+_DENSE_MLP_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def densify_to_expert0(output_tensors: dict, pending: dict, cfg: dict, stats: dict):
+    """Turn a dense model's per-layer MLP into a single MoE expert (expert 0) plus
+    a zero router, so the runtime's 1-expert (top-1) path runs it unchanged. Mirrors
+    interleave_qwen_experts: fuse gate+up interleaved, quantize gate_up and down."""
+    D = cfg["hidden_size"]
+    for k in [k for k in list(output_tensors.keys()) if _DENSE_MLP_RE.match(k)]:
+        m = _DENSE_MLP_RE.match(k)
+        pending.setdefault(m.group(1), {})[m.group(2)] = output_tensors.pop(k)
+    for L in [l for l, p in pending.items()
+              if {"gate_proj", "up_proj", "down_proj"} <= set(p)]:
+        parts = pending.pop(L)
+        gate, up, down = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
+        moe_i, Dg = gate.shape
+        fused = np.empty((2 * moe_i, Dg), dtype=np.float32)
+        fused[0::2] = gate
+        fused[1::2] = up
+        base = f"model.layers.{L}.mlp.experts.0"
+        gp, gs = (quantize_int3(fused) if EXPERT_BITS == 3 else quantize_int4(fused))
+        output_tensors[base + ".gate_up_proj"] = gp
+        output_tensors[base + ".gate_up_proj.qs"] = gs
+        dp, ds = (quantize_int3(down) if EXPERT_BITS == 3 else quantize_int4(down))
+        output_tensors[base + ".down_proj"] = dp
+        output_tensors[base + ".down_proj.qs"] = ds
+        # zero router [1, D] under the Qwen alias the runtime probes (mlp.gate.weight)
+        output_tensors[f"model.layers.{L}.mlp.gate.weight"] = np.zeros((1, D), dtype=np.float32)
+        stats["expert_i4"] += gp.nbytes + gs.nbytes + dp.nbytes + ds.nbytes
 
 
 def interleave_qwen_experts(output_tensors: dict, pending: dict, stats: dict):
@@ -455,12 +501,29 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
 
     model_type = str(cfg.get("model_type", "gpt_oss"))
     is_qwen = "qwen" in model_type.lower()
+    # A dense model has no experts. We represent it as a 1-expert MoE (top-1) so the
+    # existing runtime path runs it unchanged — used for a small speculative draft.
+    is_dense = cfg.get("num_experts_per_tok") is None
     # Experts-per-layer key differs across families.
-    n_exp = cfg.get("num_local_experts", cfg.get("num_experts", "?"))
+    n_exp = cfg.get("num_local_experts", cfg.get("num_experts", 1 if is_dense else "?"))
 
-    print(f"\n  Model type: {model_type}" + (" (Qwen3-MoE)" if is_qwen else ""))
+    if is_dense:
+        # Rewrite the (already-copied) output config so the runtime loads it as a
+        # 1-expert MoE: gate_up = 2*intermediate_size, top-1, zero router.
+        ocfg_path = output_path / "config.json"
+        ocfg = json.load(open(ocfg_path))
+        ocfg["num_local_experts"] = 1
+        ocfg["num_experts_per_tok"] = 1
+        ocfg["moe_intermediate_size"] = cfg["intermediate_size"]
+        if EXPERT_BITS == 3:
+            ocfg["picchio_expert_bits"] = 3
+        json.dump(ocfg, open(ocfg_path, "w"), indent=2)
+        print("  ✓ dense model → 1-expert MoE (config rewritten)")
+
+    print(f"\n  Model type: {model_type}" +
+          (" (dense→1-expert)" if is_dense else " (Qwen3-MoE)" if is_qwen else ""))
     print(f"  D={cfg['hidden_size']} L={cfg['num_hidden_layers']} "
-          f"E={n_exp} top{cfg['num_experts_per_tok']}")
+          f"E={n_exp} top{cfg.get('num_experts_per_tok', 1)}")
     print(f"  Input format: " +
           ("BF16 (separate gate/up/down experts)" if is_qwen
            else "MXFP4 (experts) + BF16 (dense)"))
@@ -489,6 +552,7 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
     total_output_bytes = 0
     t_start = time.time()
     qwen_pending = {}  # cross-shard buffer for half-seen Qwen3 experts
+    dense_pending = {}  # cross-shard buffer for half-seen dense MLP halves
 
     for si, shard_path in enumerate(shard_files):
         print(f"\n  [{si+1}/{len(shard_files)}] {shard_path.name}...")
@@ -500,6 +564,10 @@ def convert_model(model_path: str, output_path: str, dense_bits: int = 4):
         # ── Qwen3: fuse gate+up and quantize experts to INT4 ──
         if is_qwen:
             interleave_qwen_experts(output_tensors, qwen_pending, stats)
+
+        # ── Dense model: represent per-layer MLP as expert 0 (+ zero router) ──
+        if is_dense:
+            densify_to_expert0(output_tensors, dense_pending, cfg, stats)
         
         # ── Post-processing: dequantize MXFP4 blocks+scales → INT4 ──
         blocks_keys = [k for k in list(output_tensors.keys()) if k.endswith("_blocks")]

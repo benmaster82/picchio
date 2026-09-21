@@ -24,6 +24,12 @@
 #include <time.h>
 #include <limits.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static int omp_get_max_threads(void) { return 1; }
+#endif
+
 #ifdef _WIN32
 #include <winsock2.h>  /* must precede windows.h */
 #include <ws2tcpip.h>
@@ -62,14 +68,59 @@ typedef int  (*pgpu_init_t)(void);
 typedef void (*pgpu_shutdown_t)(void);
 typedef int  (*pgpu_i8_t)(float *, const float *, const int8_t *, const float *,
                           int, int, const void *);
+typedef int  (*pgpu_router_upload_t)(const float *, const float *, int, int,
+                                    const void *);
+typedef int  (*pgpu_router_scores_t)(float *, const float *, const float *,
+                                    const float *, int, int, const void *);
 typedef int  (*pgpu_moe_t)(float *, const float *, int, int, int,
                            const PgpuExpert *, const float *, int, int,
-                           int, float, float);
+                           int, int, float, float);
+typedef int  (*pgpu_moe_resident_t)(int, int);  /* 1 if (layer,eid) is in VRAM */
+#include "gpu_router_native.h"
 static pgpu_shutdown_t g_pgpu_shutdown = NULL;
 static pgpu_i8_t       g_pgpu_i8 = NULL;    /* lm_head (opt-in: GPU_LMHEAD=1) */
+static pgpu_router_upload_t g_pgpu_router_upload = NULL;
+static pgpu_router_scores_t g_pgpu_router_scores = NULL;
 static pgpu_moe_t      g_pgpu_moe = NULL;   /* experts (the G2 win) */
+static pgpu_moe_resident_t g_pgpu_moe_resident = NULL; /* skip disk for VRAM-resident */
+static int             g_gpu_backend = 0;
+static int             g_gpu_router = 0;    /* resident routers + score kernel */
+static int             g_gpu_dense = 0;     /* resident FP16 Q/K/V/O projections */
+static uint64_t        g_gpu_dense_host_released = 0;
+static uint64_t        g_service_prefill_tokens = 0, g_service_decode_tokens = 0;
+static double          g_service_prefill_seconds = 0, g_service_decode_seconds = 0;
+static int             g_expert_reuse = 1;
+static uint64_t        g_expert_buffer_allocs = 0, g_expert_buffer_reuses = 0;
+static double          g_expert_compute_seconds = 0;
+/* SPEC_PROBE: measurement harness for n-gram speculative decoding. It does NOT
+ * change generation — it records per-decode-token expert routing and the token
+ * id stream, then reports n-gram acceptance and expert-union at exit. */
+static int   g_spec_probe = 0;
+static int  *g_probe_hist = NULL;
+static int   g_probe_hist_n = 0, g_probe_hist_cap = 0, g_probe_prompt_n = 0;
+static int  *g_probe_exp = NULL;
+static int   g_probe_ntok = 0, g_probe_captok = 0, g_probe_L = 0, g_probe_K = 0;
+/* SELF_DRAFT_PROBE: measures how often a top-1 routing (a free self-draft) picks
+ * the same next token as the real top-4 routing. g_force_top1 collapses the MoE
+ * mixture to its single top expert for the draft forward only. */
+static int   g_self_draft_probe = 0;
+static int   g_force_top1 = 0;
+static int   g_sd_draft_k = 1;   /* draft routing width (SELF_DRAFT_K), default top-1 */
+static long  g_sd_total = 0, g_sd_match = 0, g_sd_run = 0, g_sd_runhist[8] = {0};
+/* Speculative decoding: a small draft model (DRAFT_MODEL) proposes tokens that the
+ * target verifies in one batched forward. The draft is tiny and fully resident, so
+ * it never touches the global streaming db after load (no single-model conflict).
+ * The draft Model/StDB are declared near load_draft (after those types exist). */
+static int   g_have_draft = 0;
+static int   g_spec_k = 4;       /* draft tokens proposed per round (SPEC_K) */
 static int             g_gpu_on = 0;        /* experts on GPU */
 static int             g_gpu_lmhead = 0;    /* lm_head on GPU (off by default) */
+static int             g_gpu_prefetch = 0;  /* early L+1 proxy during current MoE */
+static uint64_t        g_gpu_router_calls = 0;
+static double          g_gpu_router_time = 0.0;
+static uint64_t        g_gpu_dense_calls = 0;
+static uint64_t        g_gpu_dense_fallbacks = 0;
+static double          g_gpu_dense_time = 0.0;
 
 /* ═══════════════════════════════════════════════════════════
  *  CONFIGURATION (read from the model's config.json)
@@ -167,6 +218,7 @@ typedef struct {
     float *fslab;         /* scale buffer */
     int64_t slab_cap;     /* allocated capacity */
     int64_t fslab_cap;
+    int slab_reusable;    /* aligned SafeTensors cache storage, retained on eviction */
     uint64_t last_used;   /* timestamp for LRU eviction */
     int loading;          /* 1 = prefetch in progress on this slot (atomic) */
 } ESlot;
@@ -380,6 +432,64 @@ static int64_t physical_ram_bytes(void) {
 #endif
 }
 
+/* RAM that can be committed without immediately reclaiming or paging other
+ * processes. The physical total alone is not enough on a 16 GB workstation:
+ * browsers, IDEs and the OS can already consume most of it before Picchio
+ * starts. */
+static int64_t available_ram_bytes(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) return (int64_t)ms.ullAvailPhys;
+    return 0;
+#elif defined(__linux__)
+    long pages = sysconf(_SC_AVPHYS_PAGES);
+    long psize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psize > 0) return (int64_t)pages * (int64_t)psize;
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+/* Conservative estimate of weights that load after cache sizing. Converted
+ * Picchio models keep embed/head in INT8 and attention/router/bias tensors in
+ * F32. This estimate is used only to protect the OS from an over-optimistic
+ * automatic expert budget; PIN_GB remains an explicit override. */
+static int64_t dense_weight_estimate_bytes(const Cfg *c) {
+    int64_t D = c->hidden;
+    int64_t qdim = (int64_t)c->n_heads * c->head_dim;
+    int64_t kvdim = (int64_t)c->n_kv_heads * c->head_dim;
+    int64_t embed_head = 2LL * c->vocab * (D + 4); /* INT8 rows + F32 scales */
+    int64_t attention = (int64_t)c->n_layers *
+        (2LL * qdim * D + 2LL * kvdim * D) * 4;
+    int64_t routers = (int64_t)c->n_layers * c->n_experts * D * 4;
+    int64_t expert_biases = (int64_t)c->n_layers * c->n_experts *
+        ((int64_t)c->moe_inter + D) * 4;
+    int64_t margin = 64LL * 1024 * 1024; /* norms, sinks and projection biases */
+    return embed_head + attention + routers + expert_biases + margin;
+}
+
+static int64_t expert_slot_estimate_bytes(const Cfg *c) {
+    int64_t D = c->hidden;
+    int64_t I = c->moe_inter;
+    int64_t H = I / 2;
+    int64_t gu_groups = (D + 63) / 64;
+    int64_t d_groups = (H + 63) / 64;
+    int64_t gu_packed;
+    int64_t d_packed;
+    if (c->expert_bits == 3) {
+        gu_packed = I * gu_groups * 24;
+        d_packed = D * d_groups * 24;
+    } else {
+        gu_packed = I * ((D + 1) / 2);
+        d_packed = D * ((H + 1) / 2);
+    }
+    return gu_packed + d_packed
+         + (I * gu_groups + D * d_groups) * 4
+         + (I + D) * 4; /* biases */
+}
+
 /* ═══════════════════════════════════════════════════════════
  *  CONFIG LOADER (from config.json)
  * ═══════════════════════════════════════════════════════════ */
@@ -580,6 +690,27 @@ static void rmsnorm_heads(float *x, const float *w, int nheads, int hd, float ep
     }
 }
 
+/* Native FP16 projections with FP32 accumulation. CPU fallback is available
+ * while host weights are retained; release-host mode must fail closed. */
+static void attention_projection(float *y, const float *x, QT *w) {
+    if (g_gpu_dense && w->fmt == 0) {
+        double t0 = now_s();
+        int rc = pgr_native_dense_matmul(y, x, w->qf, w->O, w->I, w);
+        g_gpu_dense_time += now_s() - t0;
+        g_gpu_dense_calls++;
+        if (rc == 0) return;
+        if (g_gpu_dense_host_released) {
+            fprintf(stderr, "[gpu-dense] fatal: GPU failure after host weights were released; "
+                    "restart without GPU_DENSE_RELEASE_HOST to enable CPU fallback\n");
+            exit(1);
+        }
+        g_gpu_dense_fallbacks++;
+        g_gpu_dense = 0;
+        fprintf(stderr, "[gpu-dense] disabled after backend failure; using CPU\n");
+    }
+    matmul_qt(y, x, w, 1);
+}
+
 /* ═══════════════════════════════════════════════════════════
  *  GQA ATTENTION (decode, single token)
  * ═══════════════════════════════════════════════════════════ */
@@ -598,9 +729,9 @@ static void gqa_attention(float *out, const float *x, Layer *l,
     float *v = falloc(kv_dim);
 
     /* Q, K, V projections */
-    matmul_qt(q, x, &l->wq, 1);
-    matmul_qt(k, x, &l->wk, 1);
-    matmul_qt(v, x, &l->wv, 1);
+    attention_projection(q, x, &l->wq);
+    attention_projection(k, x, &l->wk);
+    attention_projection(v, x, &l->wv);
     if (g_oracle_dir) {
         char n[128]; int64_t sq[3] = {1, 1, H * hd};
         int64_t sk[3] = {1, 1, kv_dim};
@@ -701,7 +832,7 @@ static void gqa_attention(float *out, const float *x, Layer *l,
         snprintf(n, sizeof(n), "layer%d.attn_concat", layer);
         oracle_dump(n, attn_out, 3, sh);
     }
-    matmul_qt(out, attn_out, &l->wo, 1);
+    attention_projection(out, attn_out, &l->wo);
     if (l->bo) for (int i = 0; i < D; i++) out[i] += l->bo[i];
     if (g_oracle_dir) {
         char n[128]; snprintf(n, sizeof(n), "layer%d.attn_out", layer);
@@ -840,6 +971,78 @@ static int expert_load_flat(Model *m, int layer, int eid, ESlot *s) {
     return 1;
 }
 
+static void free_slot_buffers(ESlot *s);
+
+/* Converted gs64 experts can be read straight into reusable cache storage.
+ * Four independently aligned regions preserve the original tensor bytes, even
+ * when the shard offsets are not sector aligned. No disk re-layout required.
+ * Return 0 for unsupported layouts, 1 for success; read errors are fatal rather
+ * than silently dropping a selected expert or using stale slot contents. */
+static int expert_load_reusable(Model *m, int layer, int eid, ESlot *s) {
+    if (!g_expert_reuse || !g_db ||
+        (m->c.expert_bits != 3 && m->c.expert_bits != 4)) return 0;
+    int D = m->c.hidden, I = m->c.moe_inter, down_I = I / 2;
+    if (D % 64 || down_I % 64) return 0;
+    const char *parts[4] = {"gate_up_proj", "gate_up_proj", "down_proj", "down_proj"};
+    StTensor *tensor[4];
+    size_t region[4], total = 0;
+    int64_t group_bytes = m->c.expert_bits == 3 ? 24 : 32;
+    int64_t expected[4] = {(int64_t)I * (D / 64) * group_bytes,
+                           (int64_t)I * (D / 64) * 4,
+                           (int64_t)D * (down_I / 64) * group_bytes,
+                           (int64_t)D * (down_I / 64) * 4};
+    for (int j = 0; j < 4; j++) {
+        char name[256];
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.experts.%s.%d%s",
+                 layer, parts[j], eid, (j & 1) ? ".qs" : "");
+        tensor[j] = st_find(g_db, name);
+        if (!tensor[j] || tensor[j]->dtype != ((j & 1) ? ST_F32 : ST_U8) ||
+            st_bytes(tensor[j]) != expected[j]) return 0;
+        int64_t absolute = g_db->files[tensor[j]->file_idx].data_offset + tensor[j]->offset_start;
+        if (absolute < 0 || ((j & 1) && (absolute & 3))) return 0;
+        region[j] = (size_t)((expected[j] + (absolute & (ST_ALIGN - 1)) + ST_ALIGN - 1)
+                            & ~(int64_t)(ST_ALIGN - 1));
+        if (region[j] > SIZE_MAX - total) return 0;
+        total += region[j];
+    }
+    if (!s->slab_reusable || (uint64_t)s->slab_cap < total) {
+        free_slot_buffers(s);
+        s->slab = flat_aligned_alloc(total);
+        if (!s->slab) {
+            fprintf(stderr, "OOM reusable expert buffer\n"); fflush(stderr);
+            _Exit(1); /* may be an I/O worker: atexit joins would deadlock */
+        }
+        s->slab_cap = (int64_t)total;
+        s->slab_reusable = 1;
+        __atomic_fetch_add(&g_expert_buffer_allocs, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&g_expert_buffer_reuses, 1, __ATOMIC_RELAXED);
+    }
+    uint8_t *ptr[4];
+    size_t offset = 0;
+    for (int j = 0; j < 4; j++) {
+        if (st_read_raw_aligned(g_db, tensor[j], s->slab + offset, region[j], &ptr[j]) != expected[j]) {
+            fprintf(stderr, "fatal: incomplete expert read L=%d E=%d tensor=%s\n",
+                    layer, eid, tensor[j]->name);
+            fflush(stderr);
+            _Exit(1); /* never wait for the worker pool from inside that pool */
+        }
+        offset += region[j];
+    }
+    memset(&s->gu, 0, sizeof(s->gu));
+    memset(&s->d, 0, sizeof(s->d));
+    s->gu.fmt = s->d.fmt = m->c.expert_bits == 3 ? 5 : 2;
+    /* Legacy reader represents a single group as per-row scaling (block_size=0).
+     * Preserve that dispatch as well as the bytes, including for tiny fixtures. */
+    s->gu.block_size = D > 64 ? 64 : 0;
+    s->d.block_size = down_I > 64 ? 64 : 0;
+    s->gu.O = I; s->gu.I = D; s->gu.q4 = ptr[0]; s->gu.s = (float *)ptr[1];
+    s->d.O = D; s->d.I = down_I; s->d.q4 = ptr[2]; s->d.s = (float *)ptr[3];
+    s->gu_bias = load_expert_bias(layer, eid, "gate_up_proj_bias", m->c.n_experts, I);
+    s->d_bias = load_expert_bias(layer, eid, "down_proj_bias", m->c.n_experts, D);
+    return 1;
+}
+
 static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -849,7 +1052,10 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
     s->eid = eid;
     s->layer = layer;
 
+    if (s->slab_reusable && flat_loc(&g_flat, layer, eid)) free_slot_buffers(s);
     if (expert_load_flat(m, layer, eid, s)) return;
+    if (expert_load_reusable(m, layer, eid, s)) return;
+    if (s->slab_reusable) free_slot_buffers(s); /* fallback to another storage layout */
 
     if (!g_db) {
         /* No safetensors DB — mark expert as unavailable */
@@ -882,7 +1088,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s) {
 
     /* Load as F32 and quantize to INT4 */
     int64_t gu_numel = (int64_t)I * D;
-    float *gu_f32 = falloc(gu_numel);
+    float *gu_f32 = t_gu->dtype == ST_U8 ? NULL : falloc(gu_numel);
 
     if (t_gu->dtype == ST_F32) {
         st_read_raw(g_db, t_gu, gu_f32, gu_numel * 4);
@@ -976,7 +1182,7 @@ gate_up_loaded:
     int down_I = I / 2;  /* input dimension of down = intermediate_size */
     if (t_d) {
         int64_t d_numel = (int64_t)D * down_I;
-        float *d_f32 = falloc(d_numel);
+        float *d_f32 = t_d->dtype == ST_U8 ? NULL : falloc(d_numel);
 
         if (t_d->dtype == ST_F32) {
             st_read_raw(g_db, t_d, d_f32, d_numel * 4);
@@ -1100,6 +1306,16 @@ static void free_slot_buffers(ESlot *s) {
     free(s->d_bias);  s->d_bias = NULL;
     free(s->fslab);   s->fslab = NULL;
     s->slab_cap = s->fslab_cap = 0;
+    s->slab_reusable = 0;
+}
+
+static void recycle_slot_buffers(ESlot *s) {
+    if (!g_expert_reuse || !s->slab_reusable) { free_slot_buffers(s); return; }
+    /* Workers have completed before eviction; preserve only the owning slab. */
+    free(s->gu_bias); s->gu_bias = NULL;
+    free(s->d_bias); s->d_bias = NULL;
+    memset(&s->gu, 0, sizeof(s->gu));
+    memset(&s->d, 0, sizeof(s->d));
 }
 
 static ESlot *cache_lookup(Model *m, int layer, int eid) {
@@ -1146,7 +1362,7 @@ static ESlot *cache_lookup(Model *m, int layer, int eid) {
 
     /* Free old data if the slot was occupied (eviction) */
     if (victim->eid >= 0) {
-        free_slot_buffers(victim);
+        recycle_slot_buffers(victim);
     }
     
     expert_load(m, layer, eid, victim);
@@ -1211,7 +1427,7 @@ static void cache_load_batch(Model *m, int layer, const int *eids, int n,
                 victim = &pool[0]; slot_wait_ready(victim);
             }
         }
-        if (victim->eid >= 0) free_slot_buffers(victim);
+        if (victim->eid >= 0) recycle_slot_buffers(victim);
         victim->eid = eids[i];   /* reserved: it will be populated in pass 3 */
         victim->layer = layer;
         victim->last_used = ++m->eclock;
@@ -1467,7 +1683,7 @@ static void cache_load_batch_async(Model *m, int layer, const int *eids, int n,
                 slot_wait_ready(victim);
             }
         }
-        if (victim->eid >= 0) free_slot_buffers(victim);
+        if (victim->eid >= 0) recycle_slot_buffers(victim);
         victim->eid = eids[i];
         victim->layer = layer;
         victim->last_used = ++m->eclock;
@@ -1520,6 +1736,7 @@ typedef struct {
     volatile int has_job;
     volatile int shutdown;
     uint64_t issued;      /* total experts submitted for prefetch */
+    double read_seconds;  /* wall time spent by the prefetch worker */
 #ifdef _WIN32
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
@@ -1553,6 +1770,7 @@ static void pf_signal(void)  { pthread_cond_signal(&g_pf.cond); }
 static void prefetch_run_job(void) {
     int n = g_pf.n, layer = g_pf.layer;
     Model *m = g_pf.m;
+    double t0 = now_s();
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 1) num_threads(g_io_threads) \
             if(g_io_threads > 1 && n > 1)
@@ -1562,6 +1780,7 @@ static void prefetch_run_job(void) {
             expert_load(m, layer, g_pf.eids[i], g_pf.slots[i]);
         slot_set_loading(g_pf.slots[i], 0);  /* ready (or aborted by shutdown) */
     }
+    g_pf.read_seconds += now_s() - t0;
 }
 
 #ifdef _WIN32
@@ -1660,7 +1879,7 @@ static void prefetch_issue(Model *m, int layer, const int *pred, int k) {
             }
         }
         if (!victim) break;
-        if (victim->eid >= 0) free_slot_buffers(victim);
+        if (victim->eid >= 0) recycle_slot_buffers(victim);
         victim->eid = eid;
         victim->layer = layer;
         victim->last_used = ++m->eclock;
@@ -1703,19 +1922,44 @@ static void pilot_shutdown(void) {
  *  MOE FORWARD (single token)
  * ═══════════════════════════════════════════════════════════ */
 
+/* Compute router logits. GPU_ROUTER keeps all router matrices resident in VRAM;
+ * any backend failure falls back to the reference C loop for this call. */
+static void router_scores_into(Model *m, int layer, const float *x,
+                               const Cfg *c, float *scores) {
+    int D = c->hidden, E = c->n_experts;
+    Layer *l = &m->L[layer];
+    if (g_gpu_router && g_pgpu_router_scores) {
+        double t0 = now_s();
+        int rc = g_pgpu_router_scores(scores, x, l->router, l->router_bias,
+                                      E, D, l->router);
+        g_gpu_router_time += now_s() - t0;
+        g_gpu_router_calls++;
+        if (rc == 0) return;
+    }
+    for (int e = 0; e < E; e++) {
+        float dot = l->router_bias ? l->router_bias[e] : 0.0f;
+        const float *rw = l->router + (int64_t)e * D;
+        for (int i = 0; i < D; i++) dot += x[i] * rw[i];
+        scores[e] = dot;
+    }
+}
+
 /* Probe: predicts the top-k of layer `nl`'s router applied to the input `x`
  * (already normalized) and writes it into `out`. Does not alter the math: it
  * only measures the accuracy of two proxies for the prefetch. */
 static void predict_topk_into(Model *m, int nl, const float *x,
                               const Cfg *c, int *out) {
-    int D = c->hidden, E = c->n_experts, K = c->topk;
-    Layer *l = &m->L[nl];
+    int E = c->n_experts, K = c->topk;
+    float scores[512];
+    if (E > (int)(sizeof(scores) / sizeof(scores[0]))) {
+        for (int k = 0; k < K; k++) out[k] = -1;
+        return;
+    }
+    router_scores_into(m, nl, x, c, scores);
     float best_s[64];
     for (int k = 0; k < K; k++) { out[k] = -1; best_s[k] = -1e30f; }
     for (int e = 0; e < E; e++) {
-        float dot = l->router_bias ? l->router_bias[e] : 0.0f;
-        const float *rw = l->router + (int64_t)e * D;
-        for (int i = 0; i < D; i++) dot += x[i] * rw[i];
+        float dot = scores[e];
         for (int k = 0; k < K; k++) {
             if (dot > best_s[k]) {
                 for (int j = K - 1; j > k; j--) {
@@ -1754,17 +1998,9 @@ static void moe_forward(float *out, const float *x, Model *m,
     int D = c->hidden;
     int E = c->n_experts;
     int K = c->topk;
-    Layer *l = &m->L[layer];
-
     /* 1. Router: compute a score for each expert */
     float *scores = falloc(E);
-    for (int e = 0; e < E; e++) {
-        float dot = 0;
-        const float *rw = l->router + (int64_t)e * D;
-        for (int i = 0; i < D; i++) dot += x[i] * rw[i];
-        if (l->router_bias) dot += l->router_bias[e];
-        scores[e] = dot;
-    }
+    router_scores_into(m, layer, x, c, scores);
 
     /* 2. Top-K selection */
     int sel[64];          /* selected experts */
@@ -1782,9 +2018,17 @@ static void moe_forward(float *out, const float *x, Model *m,
         weights[k] = best_s;
     }
 
+    /* SPEC_PROBE: record this decode token's routing (top-k experts per layer).
+     * moe_forward runs only in single-token decode (prefill uses its own batched
+     * expert loop), so this captures exactly the decode positions. */
+    if (g_spec_probe && g_probe_ntok < g_probe_captok && layer < g_probe_L) {
+        int *dst = g_probe_exp + ((size_t)g_probe_ntok * g_probe_L + layer) * g_probe_K;
+        for (int k = 0; k < K && k < g_probe_K; k++) dst[k] = sel[k];
+    }
+
     /* Probe: compare this layer's real routing with the two proxies predicted
      * for it during the previous layer. */
-    if (g_predict_probe && m->pred_layer == layer) {
+    if ((g_predict_probe || g_gpu_prefetch) && m->pred_layer == layer) {
         for (int k = 0; k < K; k++) {
             for (int j = 0; j < K; j++)
                 if (sel[k] == m->pred_next[j])  { m->pred_hit++;  break; }
@@ -1794,7 +2038,18 @@ static void moe_forward(float *out, const float *x, Model *m,
         m->pred_total += K;
     }
 
+    /* GPU-guided early prefetch. At this point the current layer's routing has
+     * already consumed the previous prediction, while its expert I/O and
+     * compute have not started. Use the current pre-MoE activation as the L+1
+     * proxy and overlap those predicted reads with the whole current MoE. */
+    if (g_gpu_prefetch && layer + 1 < c->n_layers) {
+        predict_topk_into(m, layer + 1, x, c, m->pred_next);
+        m->pred_layer = layer + 1;
+        prefetch_issue(m, layer + 1, m->pred_next, c->topk);
+    }
+
     /* 3. Normalize weights (GPT-OSS: over top-k; Qwen3: over all, renorm top-k) */
+    if (g_force_top1 && g_sd_draft_k < K) K = g_sd_draft_k;  /* self-draft width */
     router_weights(c, scores, sel, weights, K, E);
     if (g_trace_numeric) {
         fprintf(stderr, "  numeric route L=%d:", layer);
@@ -1815,7 +2070,9 @@ static void moe_forward(float *out, const float *x, Model *m,
         free(sel_f);
     }
 
-    /* 4. Update routing statistics */
+    /* 4. Update routing statistics (skip on the transient self-draft forward so
+     * the learned hot-store is not polluted by top-1 routing). */
+    if (!g_force_top1)
     for (int k = 0; k < K; k++) {
         if (m->eusage[layer])
             m->eusage[layer][sel[k]]++;
@@ -1833,10 +2090,33 @@ static void moe_forward(float *out, const float *x, Model *m,
     int async_done = 0;
     int use_async = g_async_moe_enabled && !g_gpu_on &&
                     !g_oracle_dir && !g_trace_numeric;
-    if (use_async)
+    /* When experts run on GPU and the backend can report VRAM residency, skip the
+     * host/disk read for experts the GPU already holds — the redundant read the
+     * naive offload paid on every hot expert. slots[k]==NULL marks a resident,
+     * unread expert; the GPU uses its VRAM copy. Any GPU failure re-reads them
+     * below so the CPU fallback stays correct. */
+    int gpu_skip_reads = g_gpu_on && g_pgpu_moe && g_pgpu_moe_resident &&
+                         !g_oracle_dir && !g_trace_numeric;
+    if (use_async) {
         cache_load_batch_async(m, layer, sel, K, slots);
-    else
+    } else if (gpu_skip_reads) {
+        int need_eids[64], need_i[64], nneed = 0;
+        for (int k = 0; k < K; k++) {
+            slots[k] = NULL;
+            if (!g_pgpu_moe_resident(layer, sel[k])) {
+                need_eids[nneed] = sel[k];
+                need_i[nneed] = k;
+                nneed++;
+            }
+        }
+        if (nneed > 0) {
+            ESlot *nslots[64];
+            cache_load_batch(m, layer, need_eids, nneed, nslots);
+            for (int j = 0; j < nneed; j++) slots[need_i[j]] = nslots[j];
+        }
+    } else {
         cache_load_batch(m, layer, sel, K, slots);
+    }
 
     if (use_async) {
         /* Compute in completion order, but keep each contribution separate.
@@ -1886,24 +2166,45 @@ static void moe_forward(float *out, const float *x, Model *m,
         int ok = 1, bs = 0;
         for (int k = 0; k < K; k++) {
             ESlot *es = slots[k];
-            if (es->eid < 0 || es->gu.fmt != 2 || es->d.fmt != 2 ||
+            wsum[k] = weights[k] * c->routed_scale;
+            ge[k].eid = sel[k];
+            if (es == NULL) {  /* resident in VRAM: no host copy, GPU uses its own */
+                ge[k].gu_q4 = NULL; ge[k].gu_s = NULL; ge[k].gu_bias = NULL;
+                ge[k].d_q4  = NULL; ge[k].d_s  = NULL; ge[k].d_bias  = NULL;
+                continue;
+            }
+            if (es->eid < 0 ||
+                !((es->gu.fmt == 2 && es->d.fmt == 2) ||
+                  (es->gu.fmt == 5 && es->d.fmt == 5)) ||
                 es->gu.block_size <= 0 || es->gu.block_size != es->d.block_size) {
                 ok = 0; break;
             }
             bs = es->gu.block_size;
-            ge[k].eid = es->eid;
             ge[k].gu_q4 = es->gu.q4; ge[k].gu_s = es->gu.s; ge[k].gu_bias = es->gu_bias;
             ge[k].d_q4  = es->d.q4;  ge[k].d_s  = es->d.s;  ge[k].d_bias  = es->d_bias;
-            wsum[k] = weights[k] * c->routed_scale;
         }
+        if (bs == 0) bs = 64;  /* all experts resident: group size is gs64 for this tier */
         if (ok && g_pgpu_moe(out, x, D, c->moe_inter, layer, ge, wsum, K, bs,
+                             c->expert_bits,
                              c->swiglu_clipped, c->swiglu_limit, c->swiglu_alpha) == 0)
             gpu_done = 1;
+    }
+
+    /* GPU path failed or was skipped: the CPU loop needs every expert on the
+     * host, but resident ones were left unread above. Read them now. */
+    if (!gpu_done && !async_done) {
+        for (int k = 0; k < K; k++) {
+            if (slots[k] == NULL) {
+                int e1 = sel[k];
+                cache_load_batch(m, layer, &e1, 1, &slots[k]);
+            }
+        }
     }
 
     for (int k = 0; !gpu_done && !async_done && k < K; k++) {
         ESlot *es = slots[k];
         if (es->eid < 0) continue;  /* load error */
+        double compute_start = now_s();
 
         int I = c->moe_inter;  /* 5760 = gate_up fused */
         float *gu = falloc(I);
@@ -1974,6 +2275,7 @@ static void moe_forward(float *out, const float *x, Model *m,
             out[i] += w * expert_out[i];
 
         free(gu);
+        g_expert_compute_seconds += now_s() - compute_start;
     }
 
     /* 6. (GPT-OSS has no shared expert — all layers are pure MoE) */
@@ -2234,7 +2536,7 @@ static void run_layer_range(Model *m, float *h, int pos, int l_lo, int l_hi) {
 
         /* Probe proxy A: predict the top-k of l+1 from hn (pre-MoE norm of l). hn
          * is no longer needed after moe_forward, so it will be reused as scratch. */
-        if (g_predict_probe && l + 1 < c->n_layers)
+        if (g_predict_probe && !g_gpu_prefetch && l + 1 < c->n_layers)
             predict_topk_into(m, l + 1, hn, c, m->pred_next);
         m->t_moe += now_s() - tm;
 
@@ -2249,7 +2551,7 @@ static void run_layer_range(Model *m, float *h, int pos, int l_lo, int l_hi) {
             rmsnorm(hn, h, m->L[l + 1].post_ln, D, c->eps);
             predict_topk_into(m, l + 1, hn, c, m->pred_next2);
             m->pred_layer = l + 1;
-            if (g_pilot_enabled)
+            if (g_pilot_enabled && !g_gpu_prefetch)
                 prefetch_issue(m, l + 1, m->pred_next2, c->topk);
         }
         trace_vector("post_moe", l, h, D);
@@ -2284,27 +2586,123 @@ static void *gpu_sym(void *lib, const char *name) {
 }
 
 static void gpu_backend_shutdown(void) {
-    if (g_gpu_on && g_pgpu_shutdown) g_pgpu_shutdown();
+    if (g_gpu_backend && g_pgpu_shutdown) g_pgpu_shutdown();
+    g_gpu_backend = 0;
+    g_gpu_router = 0;
+    g_gpu_dense = 0;
     g_gpu_on = 0;
 }
 
-static void gpu_backend_load(void) {
-    const char *want = getenv("GPU");
-    if (!want || atoi(want) == 0) return;   /* opt-in: GPU=1 */
+static void gpu_backend_load(Model *m) {
+    const char *legacy = getenv("GPU");
+    const char *wr = getenv("GPU_ROUTER");
+    const char *wp = getenv("GPU_PREFETCH");
+    const char *wd = getenv("GPU_DENSE");
+    const char *we = getenv("GPU_EXPERTS");
+    int want_legacy = legacy && atoi(legacy) != 0;
+    int want_router = want_legacy || (wr && atoi(wr) != 0) || (wp && atoi(wp) != 0);
+    int want_dense = wd && atoi(wd) != 0;
+    int want_experts = want_legacy || (we && atoi(we) != 0);
+    const char *lh = getenv("GPU_LMHEAD");
+    int want_lmhead = lh && atoi(lh) != 0;
+    if (!want_router && !want_dense && !want_experts && !want_lmhead) return;
+
+    /* Router/prefetch/dense mode is part of the C engine itself. It loads the
+     * installed NVIDIA driver and JITs embedded PTX; no CUDA runtime DLL or
+     * separately built picchio_cuda.dll is involved. */
+    if ((want_router || want_dense) && !want_experts && !want_lmhead &&
+        pgr_native_init()) {
+        int uploaded = 0;
+        if (want_router) {
+            for (int l = 0; l < m->c.n_layers; l++) {
+                Layer *ly = &m->L[l];
+                if (ly->router && pgr_native_upload(ly->router, ly->router_bias,
+                                                    m->c.n_experts, m->c.hidden,
+                                                    ly->router) == 0)
+                    uploaded++;
+            }
+        }
+        int dense_uploaded = 0, dense_ok = want_dense;
+        if (want_dense) {
+            for (int l = 0; l < m->c.n_layers && dense_ok; l++) {
+                Layer *ly = &m->L[l];
+                QT *matrix[4] = {&ly->wq, &ly->wk, &ly->wv, &ly->wo};
+                for (int j = 0; j < 4; j++) {
+                    QT *q = matrix[j];
+                    if (!q->qf || q->fmt != 0) continue; /* unowned pipeline layer */
+                    if (pgr_native_dense_upload(q->qf, q->O, q->I, q) != 0) {
+                        dense_ok = 0;
+                        break;
+                    }
+                    dense_uploaded++;
+                }
+            }
+            if (!dense_ok || dense_uploaded == 0) {
+                pgr_native_dense_clear();
+                dense_uploaded = 0;
+                fprintf(stderr, "[gpu-dense] resident upload unavailable; using CPU attention\n");
+            }
+        }
+        if (uploaded > 0 || dense_uploaded > 0) {
+            g_pgpu_shutdown = pgr_native_shutdown;
+            g_pgpu_router_upload = pgr_native_upload;
+            g_pgpu_router_scores = pgr_native_scores;
+            g_gpu_backend = 1;
+            g_gpu_router = uploaded > 0;
+            g_gpu_dense = dense_uploaded > 0;
+            const char *release_host = getenv("GPU_DENSE_RELEASE_HOST");
+            if (g_gpu_dense && release_host && atoi(release_host)) {
+                /* Upload is transactional: no host weights are freed until every
+                 * eligible projection is resident. Keys are stable QT addresses. */
+                for (int l = 0; l < m->c.n_layers; l++) {
+                    Layer *ly = &m->L[l];
+                    QT *matrix[4] = {&ly->wq, &ly->wk, &ly->wv, &ly->wo};
+                    for (int j = 0; j < 4; j++) {
+                        QT *q = matrix[j];
+                        if (q->fmt != 0 || !q->qf) continue;
+                        uint64_t bytes = (uint64_t)q->O * q->I * sizeof(float);
+                        free(q->qf);
+                        q->qf = NULL;
+                        g_gpu_dense_host_released += bytes;
+                        m->resident_bytes -= (int64_t)bytes;
+                    }
+                }
+                fprintf(stderr, "[gpu-dense] released %.2f GiB host weights; "
+                        "GPU errors now stop inference (no CPU fallback)\n",
+                        g_gpu_dense_host_released / 1073741824.0);
+            }
+            atexit(gpu_backend_shutdown);
+            if (uploaded > 0)
+                fprintf(stderr, "[gpu] %d routers resident in VRAM (native C backend)\n",
+                        uploaded);
+            if (dense_uploaded > 0)
+                fprintf(stderr, "[gpu] %d attention matrices resident as FP16 "
+                        "(%.2f GiB, native C backend)\n", dense_uploaded,
+                        pgr_native_dense_bytes() / 1073741824.0);
+            return;
+        }
+        pgr_native_shutdown();
+    }
 #ifdef _WIN32
     void *lib = (void *)LoadLibraryA("picchio_cuda.dll");
 #else
     void *lib = dlopen("libpicchio_cuda.so", RTLD_NOW);
 #endif
     if (!lib) {
-        fprintf(stderr, "[gpu] GPU=1 but backend library not found — using CPU\n");
+        fprintf(stderr, "[gpu] backend library not found — using CPU\n");
         return;
     }
     pgpu_init_t init = (pgpu_init_t)(uintptr_t)gpu_sym(lib, "pgpu_init");
     pgpu_moe_t  moe  = (pgpu_moe_t)(uintptr_t)gpu_sym(lib, "pgpu_moe_layer");
+    pgpu_moe_resident_t mres = (pgpu_moe_resident_t)(uintptr_t)
+                               gpu_sym(lib, "pgpu_moe_resident");
     pgpu_i8_t   i8   = (pgpu_i8_t)(uintptr_t)gpu_sym(lib, "pgpu_matmul_i8");
+    pgpu_router_upload_t rup = (pgpu_router_upload_t)(uintptr_t)
+                              gpu_sym(lib, "pgpu_router_upload");
+    pgpu_router_scores_t rsc = (pgpu_router_scores_t)(uintptr_t)
+                              gpu_sym(lib, "pgpu_router_scores");
     g_pgpu_shutdown  = (pgpu_shutdown_t)(uintptr_t)gpu_sym(lib, "pgpu_shutdown");
-    if (!init || !moe || !g_pgpu_shutdown) {
+    if (!init || !g_pgpu_shutdown) {
         fprintf(stderr, "[gpu] backend symbols missing — using CPU\n");
         return;
     }
@@ -2312,14 +2710,35 @@ static void gpu_backend_load(void) {
         fprintf(stderr, "[gpu] no CUDA device — using CPU\n");
         return;
     }
-    g_pgpu_moe = moe;
-    g_gpu_on = 1;
+    g_gpu_backend = 1;
     atexit(gpu_backend_shutdown);
-    fprintf(stderr, "[gpu] backend active — MoE experts offloaded to GPU\n");
+    if (want_router && rup && rsc) {
+        int uploaded = 0;
+        for (int l = 0; l < m->c.n_layers; l++) {
+            Layer *ly = &m->L[l];
+            if (ly->router && rup(ly->router, ly->router_bias,
+                                  m->c.n_experts, m->c.hidden, ly->router) == 0)
+                uploaded++;
+        }
+        if (uploaded > 0) {
+            g_pgpu_router_upload = rup;
+            g_pgpu_router_scores = rsc;
+            g_gpu_router = 1;
+            fprintf(stderr, "[gpu] %d routers resident in VRAM\n", uploaded);
+        }
+    } else if (want_router) {
+        fprintf(stderr, "[gpu] router symbols missing — router stays on CPU\n");
+    }
+    if (want_experts && moe) {
+        g_pgpu_moe = moe;
+        g_pgpu_moe_resident = mres;  /* NULL with an older DLL → no read-skip */
+        g_gpu_on = 1;
+        fprintf(stderr, "[gpu] MoE expert offload enabled%s\n",
+                mres ? " (VRAM-resident experts skip the disk read)" : "");
+    }
     /* lm_head offload is opt-in: on weak GPUs it is memory-bound and slower than
      * the CPU (see DESIGN 0.16), and it is not the bottleneck. */
-    const char *lh = getenv("GPU_LMHEAD");
-    if (lh && atoi(lh) != 0 && i8) {
+    if (want_lmhead && i8) {
         g_pgpu_i8 = i8;
         g_gpu_lmhead = 1;
         fprintf(stderr, "[gpu] lm_head also offloaded (GPU_LMHEAD=1)\n");
@@ -2343,6 +2762,87 @@ static void forward_head_logits(Model *m, const float *h, float *logits) {
     if (g_oracle_dir) oracle_dump_vec("logits", logits, c->vocab);
     m->t_head += now_s() - th;
     free(hn);
+}
+
+/* Post-generation report for SPEC_PROBE: n-gram acceptance + expert-union. */
+static void spec_probe_report(void) {
+    if (g_self_draft_probe && g_sd_total > 0) {
+        g_sd_runhist[g_sd_run < 7 ? g_sd_run : 7]++;   /* flush the final run */
+        double p = (double)g_sd_match / g_sd_total;
+        fprintf(stderr, "\n── SELF_DRAFT_PROBE (top-1 draft vs top-4 target) ──\n");
+        fprintf(stderr, "positions %ld · top-1==top-4: %ld (%.1f%% single-step acceptance)\n",
+                g_sd_total, g_sd_match, 100.0 * p);
+        fprintf(stderr, "accepted-run hist (consecutive matches):");
+        for (int r = 0; r <= 7; r++) fprintf(stderr, " %d:%ld", r, g_sd_runhist[r]);
+        fprintf(stderr, "\n  if i.i.d., expected accepted per draft-4 ≈ %.2f tokens "
+                "(→ ~%.2f produced/verify with the bonus)\n",
+                p + p*p + p*p*p + p*p*p*p, 1 + p + p*p + p*p*p + p*p*p*p);
+    }
+    if (!g_spec_probe || g_probe_ntok < 2) return;
+    const int NKEY = 3, NDRAFT = 4;
+    int L = g_probe_L, K = g_probe_K;
+
+    /* n-gram (prompt-lookup) acceptance over the token-id stream. At each decode
+     * position, propose the tokens after the most recent match of the last NKEY
+     * tokens, then count how many match the real continuation. */
+    long offered = 0, acc_sum = 0, dist[8] = {0};
+    for (int p = g_probe_prompt_n; p < g_probe_hist_n; p++) {
+        if (p < NKEY) continue;
+        int found = -1;
+        for (int i = p - NKEY - 1; i >= 0; i--) {
+            int mt = 1;
+            for (int j = 0; j < NKEY; j++)
+                if (g_probe_hist[i + j] != g_probe_hist[p - NKEY + j]) { mt = 0; break; }
+            if (mt) { found = i + NKEY; break; }
+        }
+        if (found < 0) continue;
+        offered++;
+        int a = 0;
+        while (a < NDRAFT && found + a < g_probe_hist_n && p + a < g_probe_hist_n &&
+               g_probe_hist[found + a] == g_probe_hist[p + a]) a++;
+        acc_sum += a; dist[a]++;
+    }
+
+    fprintf(stderr, "\n── SPEC_PROBE (n-gram key=%d, max draft=%d) ──\n", NKEY, NDRAFT);
+    fprintf(stderr, "decode tokens recorded: %d\n", g_probe_ntok);
+    if (offered > 0) {
+        fprintf(stderr, "n-gram acceptance: %ld drafts offered, mean %.2f accepted/draft\n",
+                offered, (double)acc_sum / offered);
+        fprintf(stderr, "  accepted-length hist:");
+        for (int a = 0; a <= NDRAFT; a++) fprintf(stderr, " len%d=%ld", a, dist[a]);
+        fprintf(stderr, "\n  → ~%.2f tokens per model-forward (accepted + 1 bonus, when drafting)\n",
+                (double)(acc_sum + offered) / offered);
+    } else {
+        fprintf(stderr, "n-gram acceptance: no matches (too little repetition in this text)\n");
+    }
+
+    /* Expert-union across W consecutive decode tokens: how many unique experts a
+     * batched verify of W tokens must read, vs one token. */
+    double base = (double)L * K;
+    fprintf(stderr, "expert-union (1 token = %.0f experts: %d layers x top-%d):\n",
+            base, L, K);
+    for (int W = 2; W <= 5; W++) {
+        if (W > g_probe_ntok) break;
+        double sum = 0; long wins = 0;
+        for (int t = 0; t + W <= g_probe_ntok; t++) {
+            long uniq = 0;
+            for (int l = 0; l < L; l++) {
+                int tmp[64], mct = 0;
+                for (int w = 0; w < W; w++)
+                    for (int k = 0; k < K; k++) {
+                        int e = g_probe_exp[((size_t)(t + w) * L + l) * K + k];
+                        int dup = 0;
+                        for (int x = 0; x < mct; x++) if (tmp[x] == e) { dup = 1; break; }
+                        if (!dup && mct < 64) tmp[mct++] = e;
+                    }
+                uniq += mct;
+            }
+            sum += uniq; wins++;
+        }
+        double avg = sum / wins;
+        fprintf(stderr, "  verify %d tokens: %.1f unique experts = %.2fx one token"
+                " (no-overlap would be %.0fx)\n", W, avg, avg / base, (double)W);
+    }
 }
 
 static int forward_token(Model *m, int tok, int pos) {
@@ -2410,6 +2910,7 @@ static int pipe_split_check(Model *m, int tok, int pos, int cut) {
 /* Apply an expert to x and accumulate w * output into dst. */
 static void expert_apply(ESlot *es, const float *x, float *dst, float w,
                          const Cfg *c) {
+    double compute_start = now_s();
     int D = c->hidden, I = c->moe_inter, half = I / 2;
     float *gu = falloc(I);
     float *eo = falloc(D);
@@ -2437,6 +2938,7 @@ static void expert_apply(ESlot *es, const float *x, float *dst, float w,
     for (int i = 0; i < D; i++) dst[i] += w * eo[i];
 
     free(gu); free(eo);
+    g_expert_compute_seconds += now_s() - compute_start;
 }
 
 /* Prefill n tokens starting at pos_base. Returns the token sampled from the last
@@ -2595,6 +3097,27 @@ static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
     return sampled;
 }
 
+/* Speculative verify: run n tokens through all layers in ONE batched forward
+ * (expert-union) and return, in pred[p], the greedy argmax the model predicts
+ * AFTER consuming toks[p]. Same math as n sequential forward_token calls; the
+ * only difference is the read order (each unique expert loaded once). Writes KV
+ * for positions [pos_base, pos_base+n). */
+static void forward_verify(Model *m, const int *toks, int n, int pos_base, int *pred) {
+    Cfg *c = &m->c; int D = c->hidden, V = c->vocab;
+    float *H = falloc((int64_t)n * D);
+    for (int p = 0; p < n; p++) embed_token(m, toks[p], H + (int64_t)p * D);
+    run_prefill_range(m, H, n, pos_base, 0, c->n_layers);
+    float *logits = falloc(V);
+    for (int p = 0; p < n; p++) {
+        forward_head_logits(m, H + (int64_t)p * D, logits);
+        int best = 0; float bs = logits[0];
+        for (int v = 1; v < V; v++) if (logits[v] > bs) { bs = logits[v]; best = v; }
+        pred[p] = best;
+    }
+    free(H); free(logits);
+    m->n_fw += n;
+}
+
 /* Block prefill. Falls back to the sequential path when the oracle dumps, the
  * tracing, or a repetition penalty that depends on the history are needed. */
 static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
@@ -2671,6 +3194,18 @@ static void stats_dump(Model *m) {
     fprintf(stderr, "RSS:        %.2f GB\n", rss_gb());
     fprintf(stderr, "resident:   %.2f GB (dense model)\n",
             m->resident_bytes / 1e9);
+    if (g_gpu_router_calls > 0)
+        fprintf(stderr, "GPU router: %llu calls, %.3f ms/call, %.3f s total\n",
+                (unsigned long long)g_gpu_router_calls,
+                1000.0 * g_gpu_router_time / g_gpu_router_calls,
+                g_gpu_router_time);
+    if (g_gpu_dense_calls > 0)
+        fprintf(stderr, "GPU dense:  %llu calls, %.3f ms/call, %.3f s total, "
+                "%llu fallbacks\n",
+                (unsigned long long)g_gpu_dense_calls,
+                1000.0 * g_gpu_dense_time / g_gpu_dense_calls,
+                g_gpu_dense_time,
+                (unsigned long long)g_gpu_dense_fallbacks);
     if (m->pred_total > 0) {
         double accA = 100.0 * m->pred_hit  / m->pred_total;
         double accB = 100.0 * m->pred_hit2 / m->pred_total;
@@ -2680,6 +3215,74 @@ static void stats_dump(Model *m) {
         fprintf(stderr, "  proxy A (hn pre-MoE):   %.1f%% correct experts\n", accA);
         fprintf(stderr, "  proxy B (post-MoE norm): %.1f%% correct experts\n", accB);
     }
+}
+
+/* Machine-readable cumulative counters for SERVICE clients. Keeping these
+ * cumulative makes the protocol cheap: callers snapshot around each TURN and
+ * calculate deltas without resetting global profiling state. */
+static void service_stats(Model *m, int pos, int cap) {
+    uint64_t cache_total = m->hits + m->miss;
+    int64_t expert_bytes = expert_slot_estimate_bytes(&m->c);
+    uint64_t process_faults = 0;
+    double private_gib = 0, peak_rss_gib = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+        process_faults = pmc.PageFaultCount; /* includes SOFT faults, not disk paging */
+        private_gib = pmc.PrivateUsage / 1073741824.0;
+        peak_rss_gib = pmc.PeakWorkingSetSize / 1073741824.0;
+    }
+#endif
+    printf("STATS {"
+           "\"position\":%d,\"capacity\":%d,"
+           "\"prefill_tokens\":%llu,\"decode_tokens\":%llu,"
+           "\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f,"
+           "\"gpu_dense_host_released_bytes\":%llu,\"expert_slots_per_layer\":%d,"
+           "\"available_ram_gib\":%.6f,"
+           "\"expert_buffer_allocs\":%llu,\"expert_buffer_reuses\":%llu,"
+           "\"expert_compute_seconds\":%.9f,"
+           "\"process_page_faults\":%llu,\"private_gib\":%.6f,\"peak_rss_gib\":%.6f,"
+           "\"forward\":%llu,\"tokens_emitted\":%llu,"
+           "\"cache_hits\":%llu,\"cache_misses\":%llu,"
+           "\"cache_requests\":%llu,\"expert_loads\":%llu,"
+           "\"expert_bytes_estimate\":%lld,\"disk_seconds\":%.9f,"
+           "\"async_batches\":%llu,\"async_wait_seconds\":%.9f,"
+           "\"attention_seconds\":%.9f,\"moe_seconds\":%.9f,"
+           "\"head_seconds\":%.9f,\"rss_gb\":%.6f,"
+           "\"resident_gb\":%.6f,\"gpu_router_calls\":%llu,"
+           "\"gpu_router_seconds\":%.9f,\"gpu_dense_calls\":%llu,"
+           "\"gpu_dense_seconds\":%.9f,\"gpu_dense_fallbacks\":%llu,"
+           "\"prefetch_issued\":%llu,"
+           "\"prefetch_read_seconds\":%.9f,\"predict_hits_a\":%llu,"
+           "\"predict_hits_b\":%llu,\"predict_total\":%llu}\n",
+           pos, cap,
+           (unsigned long long)g_service_prefill_tokens,
+           (unsigned long long)g_service_decode_tokens,
+           g_service_prefill_seconds, g_service_decode_seconds,
+           (unsigned long long)g_gpu_dense_host_released, m->ecap,
+           available_ram_bytes() / 1073741824.0,
+           (unsigned long long)__atomic_load_n(&g_expert_buffer_allocs, __ATOMIC_RELAXED),
+           (unsigned long long)__atomic_load_n(&g_expert_buffer_reuses, __ATOMIC_RELAXED),
+           g_expert_compute_seconds,
+           (unsigned long long)process_faults, private_gib, peak_rss_gib,
+           (unsigned long long)m->n_fw,
+           (unsigned long long)m->n_emit,
+           (unsigned long long)m->hits,
+           (unsigned long long)m->miss,
+           (unsigned long long)cache_total,
+           (unsigned long long)m->ereq,
+           (long long)expert_bytes, m->t_edisk,
+           (unsigned long long)m->async_jobs, m->t_async_wait,
+           m->t_attn, m->t_moe, m->t_head, rss_gb(),
+           m->resident_bytes / 1e9,
+           (unsigned long long)g_gpu_router_calls, g_gpu_router_time,
+           (unsigned long long)g_gpu_dense_calls, g_gpu_dense_time,
+           (unsigned long long)g_gpu_dense_fallbacks,
+           (unsigned long long)g_pf.issued, g_pf.read_seconds,
+           (unsigned long long)m->pred_hit,
+           (unsigned long long)m->pred_hit2,
+           (unsigned long long)m->pred_total);
+    fflush(stdout);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -3858,6 +4461,11 @@ static int service_loop(Model *m, int cap) {
     while (scanf("%31s", cmd) == 1) {
         if (strcmp(cmd, "SHUTDOWN") == 0) break;
 
+        if (strcmp(cmd, "STATS") == 0) {
+            service_stats(m, pos, cap);
+            continue;
+        }
+
         if (strcmp(cmd, "RESET") == 0) {
             pos = 0;
             g_history_len = 0;
@@ -3931,6 +4539,7 @@ static int service_loop(Model *m, int cap) {
          * after validation passed, so a rejected turn leaves the session intact. */
         g_history_len = 0;
 
+        double service_prefill_start = now_s();
         int next;
         if (g_pipe_coord) {   /* distributed: batched prefill through the worker */
             int batch = 64;
@@ -3946,6 +4555,8 @@ static int service_loop(Model *m, int cap) {
             next = prefill_tokens(m, ids, (int)n_ids, pos);
         }
         pos += (int)n_ids;
+        g_service_prefill_tokens += (uint64_t)n_ids;
+        g_service_prefill_seconds += now_s() - service_prefill_start;
         free(ids);
 
         const char *reason = "MAX_TOKENS";
@@ -3957,9 +4568,12 @@ static int service_loop(Model *m, int cap) {
             printf("TOKEN %d\n", tok);
             fflush(stdout);
             produced++;
+            double service_decode_start = now_s();
             int following = g_pipe_coord
                 ? pipe_coord_step(m, g_pipe_sock, tok, pos, g_pipe_cut)
                 : forward_token(m, tok, pos);
+            g_service_decode_seconds += now_s() - service_decode_start;
+            g_service_decode_tokens++;
             pos++;
             m->n_emit++;
             int stopped = 0;
@@ -3985,20 +4599,445 @@ static int service_loop(Model *m, int cap) {
  *  MAIN
  * ═══════════════════════════════════════════════════════════ */
 
+static int print_model_plan(const char *model_path) {
+    Cfg c;
+    if (cfg_load(&c, model_path) != 0) return 1;
+    int64_t dense = dense_weight_estimate_bytes(&c);
+    int64_t expert = expert_slot_estimate_bytes(&c);
+    int64_t minimum_cache = expert * c.n_layers * c.topk;
+    int64_t phys = physical_ram_bytes();
+    int64_t avail = available_ram_bytes();
+
+    fprintf(stderr, "\nmodel memory plan\n");
+    fprintf(stderr, "  path: %s\n", model_path);
+    fprintf(stderr, "  architecture: D=%d L=%d E=%d top-%d, expert INT%d\n",
+            c.hidden, c.n_layers, c.n_experts, c.topk, c.expert_bits);
+    fprintf(stderr, "  dense estimate: %.2f GiB\n", dense / 1073741824.0);
+    fprintf(stderr, "  one cached expert: %.2f MiB\n", expert / 1048576.0);
+    fprintf(stderr, "  minimum top-k cache: %.2f GiB (%d slots/layer)\n",
+            minimum_cache / 1073741824.0, c.topk);
+    fprintf(stderr, "  physical RAM: %.2f GiB; available now: %.2f GiB\n",
+            phys / 1073741824.0, avail / 1073741824.0);
+    fprintf(stderr, "  minimum practical available RAM: %.2f GiB\n",
+            (dense + minimum_cache + 512LL * 1024 * 1024) / 1073741824.0);
+    if (avail < dense + minimum_cache + 512LL * 1024 * 1024) {
+        fprintf(stderr, "  status: INSUFFICIENT NOW - close applications before loading\n");
+        return 2;
+    }
+    fprintf(stderr, "  status: enough RAM for the minimum streaming configuration\n");
+    return 0;
+}
+
+static int benchmark_int3_expert(int iterations) {
+    const int D = 2880;
+    const int I = 5760;
+    const int H = 2880;
+    const int groups = D / I3_GROUP;
+    const int64_t gu_qbytes = (int64_t)I * groups * I3_GBYTES;
+    const int64_t d_qbytes = (int64_t)D * groups * I3_GBYTES;
+    const int64_t gu_scales = (int64_t)I * groups;
+    const int64_t d_scales = (int64_t)D * groups;
+    QT gu = {0}, down = {0};
+    float *x = falloc(D);
+    float *gu_out = falloc(I);
+    float *hidden = falloc(H);
+    float *out = falloc(D);
+    uint32_t rng = 0x12345678u;
+
+    if (iterations < 1) iterations = 1;
+    gu.fmt = 5; gu.O = I; gu.I = D; gu.block_size = I3_GROUP;
+    down.fmt = 5; down.O = D; down.I = H; down.block_size = I3_GROUP;
+    gu.q4 = malloc((size_t)gu_qbytes);
+    gu.s = falloc(gu_scales);
+    down.q4 = malloc((size_t)d_qbytes);
+    down.s = falloc(d_scales);
+    if (!x || !gu_out || !hidden || !out || !gu.q4 || !gu.s ||
+        !down.q4 || !down.s) {
+        fprintf(stderr, "INT3 benchmark: allocation failed\n");
+        free(x); free(gu_out); free(hidden); free(out);
+        free(gu.q4); free(gu.s); free(down.q4); free(down.s);
+        return 1;
+    }
+
+    for (int i = 0; i < D; i++) x[i] = (float)((i % 101) - 50) / 50.f;
+    for (int64_t i = 0; i < gu_qbytes; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        gu.q4[i] = (uint8_t)(rng >> 24);
+    }
+    for (int64_t i = 0; i < d_qbytes; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        down.q4[i] = (uint8_t)(rng >> 24);
+    }
+    for (int64_t i = 0; i < gu_scales; i++) gu.s[i] = 0.02f;
+    for (int64_t i = 0; i < d_scales; i++) down.s[i] = 0.02f;
+
+    /* Warm-up and fault in every packed page before timing. */
+    matmul_qt(gu_out, x, &gu, 1);
+    for (int i = 0; i < H; i++) hidden[i] = gu_out[i] * gu_out[i + H];
+    matmul_qt(out, hidden, &down, 1);
+
+    double start = now_s();
+    for (int it = 0; it < iterations; it++) {
+        matmul_qt(gu_out, x, &gu, 1);
+        for (int i = 0; i < H; i++) hidden[i] = gu_out[i] * gu_out[i + H];
+        matmul_qt(out, hidden, &down, 1);
+    }
+    double elapsed = now_s() - start;
+    double bytes = (double)(gu_qbytes + d_qbytes) +
+                   (double)(gu_scales + d_scales) * sizeof(float);
+    double checksum = 0.0;
+    for (int i = 0; i < D; i++) checksum += out[i];
+
+    fprintf(stderr, "\nINT3 gs64 production expert benchmark\n");
+    fprintf(stderr, "  shape: gate_up %dx%d + down %dx%d\n", I, D, D, H);
+    fprintf(stderr, "  packed+scales: %.2f MiB, OpenMP threads: %d\n",
+            bytes / (1024.0 * 1024.0), omp_get_max_threads());
+    fprintf(stderr, "  latency: %.3f ms/expert\n",
+            elapsed * 1000.0 / iterations);
+    fprintf(stderr, "  effective packed bandwidth: %.2f GiB/s\n",
+            (bytes * iterations / (1024.0 * 1024.0 * 1024.0)) / elapsed);
+    fprintf(stderr, "  kernel-only upper bound: %.3f tok/s (144 experts/token)\n",
+            ((double)iterations / elapsed) / 144.0);
+    fprintf(stderr, "  checksum: %.6g\n", checksum);
+
+    free(x); free(gu_out); free(hidden); free(out);
+    free(gu.q4); free(gu.s); free(down.q4); free(down.s);
+    return 0;
+}
+
+static int native_router_self_test(void) {
+    const int E = 128, D = 2880;
+    float *w = falloc((int64_t)E * D), *b = falloc(E), *x = falloc(D);
+    float *cpu = falloc(E), *gpu = falloc(E);
+    uint32_t rng = 123456789u;
+    for (int i = 0; i < E * D; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        w[i] = ((int)(rng >> 16) - 32768) / 327680.0f;
+    }
+    for (int i = 0; i < D; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        x[i] = ((int)(rng >> 16) - 32768) / 32768.0f;
+    }
+    for (int e = 0; e < E; e++) {
+        b[e] = (e - 64) / 1000.0f;
+        float a = b[e];
+        for (int i = 0; i < D; i++) a += x[i] * w[(int64_t)e * D + i];
+        cpu[e] = a;
+    }
+    if (!pgr_native_init() || pgr_native_scores(gpu, x, w, b, E, D, w) != 0) {
+        fprintf(stderr, "native GPU router self-test: backend unavailable\n");
+        pgr_native_shutdown();
+        free(w); free(b); free(x); free(cpu); free(gpu);
+        return 1;
+    }
+    int ct = 0, gt = 0;
+    float max_abs = 0.0f;
+    for (int e = 0; e < E; e++) {
+        float d = fabsf(cpu[e] - gpu[e]);
+        if (d > max_abs) max_abs = d;
+        if (cpu[e] > cpu[ct]) ct = e;
+        if (gpu[e] > gpu[gt]) gt = e;
+    }
+    int ok = ct == gt && max_abs < 1e-4f;
+    fprintf(stderr, "native GPU router [128x2880]: CPU top1=%d GPU top1=%d "
+            "max_abs=%.7g %s\n", ct, gt, max_abs, ok ? "OK" : "FAIL");
+    pgr_native_shutdown();
+    free(w); free(b); free(x); free(cpu); free(gpu);
+    return ok ? 0 : 1;
+}
+
+static int native_dense_self_test(int fail_after_release) {
+    const int O = 4096, I = 2880;
+    float *w = falloc((int64_t)O * I), *x = falloc(I);
+    float *cpu = falloc(O), *gpu = falloc(O);
+    uint32_t rng = 246813579u;
+    for (int64_t i = 0; i < (int64_t)O * I; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        w[i] = ((int)(rng >> 16) - 32768) / 1048576.0f;
+    }
+    for (int i = 0; i < I; i++) {
+        rng = rng * 1664525u + 1013904223u;
+        x[i] = ((int)(rng >> 16) - 32768) / 32768.0f;
+    }
+    matmul_f32(cpu, x, w, 1, I, O);
+    if (!pgr_native_init() ||
+        pgr_native_dense_upload(w, O, I, &rng) != 0 ||
+        pgr_native_dense_matmul(gpu, x, w, O, I, &rng) != 0) {
+        fprintf(stderr, "native GPU dense self-test: backend unavailable\n");
+        pgr_native_shutdown();
+        free(w); free(x); free(cpu); free(gpu);
+        return 1;
+    }
+    float max_abs = 0.0f;
+    double mse = 0.0, ref = 0.0;
+    for (int o = 0; o < O; o++) {
+        float d = fabsf(cpu[o] - gpu[o]);
+        if (d > max_abs) max_abs = d;
+        mse += (double)d * d;
+        ref += (double)cpu[o] * cpu[o];
+    }
+    double rel_rms = ref > 0.0 ? sqrt(mse / ref) : 0.0;
+    free(w);
+    w = NULL; /* Exercise resident lookup after the host allocation is gone. */
+    const int iterations = 20;
+    int completed = 0;
+    double t0 = now_s();
+    for (int i = 0; i < iterations; i++) {
+        if (pgr_native_dense_matmul(gpu, x, NULL, O, I, &rng) != 0) break;
+        completed++;
+    }
+    double gpu_ms = 1000.0 * (now_s() - t0) / iterations;
+    int ok = max_abs < 0.01f && rel_rms < 0.002 && completed == iterations;
+    pgr_native_dense_clear();
+    if (pgr_native_dense_matmul(gpu, x, NULL, O, I, &rng) == 0) ok = 0;
+    if (fail_after_release) {
+        QT released = {0};
+        released.O = O; released.I = I;
+        g_gpu_dense = 1;
+        g_gpu_dense_host_released = (uint64_t)O * I * sizeof(float);
+        /* No resident matrix and no host weights: dispatch must stop, not
+         * dereference NULL or silently emit an incorrect CPU result. */
+        attention_projection(gpu, x, &released);
+        fprintf(stderr, "FAIL: released-host dispatch did not stop\n");
+        return 2;
+    }
+    fprintf(stderr, "native GPU dense FP16 [4096x2880]: max_abs=%.7g "
+            "rel_rms=%.7g %.3f ms/call %s\n", max_abs, rel_rms,
+            gpu_ms, ok ? "OK" : "FAIL");
+    pgr_native_shutdown();
+    free(w); free(x); free(cpu); free(gpu);
+    return ok ? 0 : 1;
+}
+
+static int expert_io_self_test(Model *m) {
+    if (g_db->name_index) {
+        for (int i = 0; i < g_db->n_tensors; i++) {
+            StTensor *indexed = st_find(g_db, g_db->tensors[i].name);
+            int *index = g_db->name_index;
+            g_db->name_index = NULL;
+            StTensor *linear = st_find(g_db, g_db->tensors[i].name);
+            g_db->name_index = index;
+            if (indexed != linear) { fprintf(stderr, "tensor index mismatch\n"); return 1; }
+        }
+        fprintf(stderr, "tensor name index: %d lookups match linear reference\n", g_db->n_tensors);
+    }
+    ESlot reference = {0}, reused = {0};
+    int checked = 0;
+    for (int direct = 0; direct <= 1; direct++) {
+        st_set_direct(direct);
+        for (int i = 0; i < 12; i++) {
+            int layer = (i * 7) % m->c.n_layers;
+            int eid = (i * 37) % m->c.n_experts;
+            if (i == 11) { layer = m->c.n_layers - 1; eid = m->c.n_experts - 1; }
+            g_expert_reuse = 0;
+            free_slot_buffers(&reference);
+            expert_load(m, layer, eid, &reference);
+            g_expert_reuse = 1;
+            recycle_slot_buffers(&reused);
+            expert_load(m, layer, eid, &reused);
+            QT *a[2] = {&reference.gu, &reference.d};
+            QT *b[2] = {&reused.gu, &reused.d};
+            int ok = reference.eid == eid && reused.eid == eid && reused.slab_reusable;
+            for (int j = 0; j < 2 && ok; j++) {
+                ok = a[j]->fmt == b[j]->fmt && a[j]->O == b[j]->O && a[j]->I == b[j]->I &&
+                     a[j]->block_size == b[j]->block_size &&
+                     a[j]->block_size == (a[j]->I > 64 ? 64 : 0);
+                size_t groups = (size_t)a[j]->O * ((a[j]->I + 63) / 64);
+                size_t packed = groups * (a[j]->fmt == 5 ? 24 : 32);
+                if (ok) ok = memcmp(a[j]->q4, b[j]->q4, packed) == 0 &&
+                             memcmp(a[j]->s, b[j]->s, groups * sizeof(float)) == 0;
+            }
+            if (ok) ok = !!reference.gu_bias == !!reused.gu_bias && !!reference.d_bias == !!reused.d_bias;
+            if (ok && reference.gu_bias) ok = !memcmp(reference.gu_bias, reused.gu_bias, m->c.moe_inter * sizeof(float));
+            if (ok && reference.d_bias) ok = !memcmp(reference.d_bias, reused.d_bias, m->c.hidden * sizeof(float));
+            if (!ok) {
+                fprintf(stderr, "expert I/O test FAIL direct=%d L=%d E=%d\n", direct, layer, eid);
+                free_slot_buffers(&reference); free_slot_buffers(&reused);
+                return 1;
+            }
+            checked++;
+        }
+    }
+    free_slot_buffers(&reference); free_slot_buffers(&reused);
+    fprintf(stderr, "expert I/O test: %d experts byte-identical, %llu allocations, %llu reuses %s\n",
+            checked, (unsigned long long)g_expert_buffer_allocs,
+            (unsigned long long)g_expert_buffer_reuses, g_expert_buffer_reuses ? "PASS" : "FAIL");
+    return g_expert_buffer_reuses ? 0 : 1;
+}
+
+/* ── Speculative decoding: draft model + verify loop ─────────────────────────
+ * The draft is a small model (e.g. Qwen3-0.6B as a 1-expert MoE). It is loaded
+ * fully resident: every layer's single expert is preloaded, so after load it
+ * never reads the global streaming db (which stays the target's). */
+static Model g_draft;
+static StDB  g_draft_db;
+
+static int load_draft(const char *path, int ctx) {
+    memset(&g_draft, 0, sizeof(g_draft));
+    g_draft.pred_layer = -1;
+    if (cfg_load(&g_draft.c, path) != 0) { fprintf(stderr, "[draft] bad config\n"); return -1; }
+    Cfg *dc = &g_draft.c;
+    st_init(&g_draft_db);
+    char p[512];
+    for (int i = 0; i < 200; i++) {
+        snprintf(p, sizeof(p), "%s/model-%05d.safetensors", path, i);
+        FILE *f = fopen(p, "rb"); if (f) { fclose(f); st_open_file(&g_draft_db, p); }
+    }
+    if (g_draft_db.n_tensors == 0) { fprintf(stderr, "[draft] no shards at %s\n", path); return -1; }
+    int ec = dc->topk < 1 ? 1 : dc->topk;
+    if (ec > dc->n_experts) ec = dc->n_experts;
+    g_draft.ecap   = ec;
+    g_draft.ecache = calloc(dc->n_layers, sizeof(ESlot *));
+    g_draft.ecn    = calloc(dc->n_layers, sizeof(int));
+    g_draft.pin    = calloc(dc->n_layers, sizeof(ESlot *));
+    g_draft.npin   = calloc(dc->n_layers, sizeof(int));
+    g_draft.eusage = calloc(dc->n_layers, sizeof(uint32_t *));
+    g_draft.eheat  = calloc(dc->n_layers, sizeof(uint32_t *));
+    for (int l = 0; l < dc->n_layers; l++) {
+        g_draft.ecache[l] = calloc(ec, sizeof(ESlot));
+        for (int i = 0; i < ec; i++) g_draft.ecache[l][i].eid = -1;
+        g_draft.eusage[l] = calloc(dc->n_experts, sizeof(uint32_t));
+        g_draft.eheat[l]  = calloc(dc->n_experts, sizeof(uint32_t));
+    }
+    g_draft.L = calloc(dc->n_layers, sizeof(Layer));
+    kv_init(&g_draft.kv, dc->n_layers, dc->n_kv_heads, dc->head_dim, ctx);
+    /* Swap the global streaming db + layer-range/model-path to the draft's for the
+     * duration of its load, then restore the target's. */
+    StDB *saved_db = g_db;
+    int s_lo = g_pipe_lo, s_hi = g_pipe_hi, s_emb = g_load_embed, s_head = g_load_head;
+    const char *s_path = g_model_path_global;
+    g_db = &g_draft_db;
+    g_pipe_lo = 0; g_pipe_hi = dc->n_layers; g_load_embed = 1; g_load_head = 1;
+    g_model_path_global = path;
+    int rc = load_dense_weights(&g_draft, &g_draft_db);
+    if (rc == 0)
+        for (int l = 0; l < dc->n_layers; l++) { ESlot *s[8]; int e0 = 0;
+            cache_load_batch(&g_draft, l, &e0, 1, s); }  /* preload → fully resident */
+    g_db = saved_db; g_pipe_lo = s_lo; g_pipe_hi = s_hi;
+    g_load_embed = s_emb; g_load_head = s_head; g_model_path_global = s_path;
+    if (rc != 0) { fprintf(stderr, "[draft] weight load failed\n"); return -1; }
+    g_have_draft = 1;
+    fprintf(stderr, "[draft] %s loaded (D=%d L=%d E=%d) — resident, spec K=%d\n",
+            path, dc->hidden, dc->n_layers, dc->n_experts, g_spec_k);
+    return 0;
+}
+
+/* The safetensors handle cache is per-thread and keyed by file_idx only, so the
+ * target and draft (which share file_idx 0..) would clobber each other on one
+ * thread. Load the draft on a throwaway thread: its file handles stay in that
+ * thread's TLS and never touch the main thread's target handles. The draft is
+ * fully resident after preload, so it never reads the db again. */
+#ifdef _WIN32
+static const char *g_ld_path; static int g_ld_ctx, g_ld_rc;
+static DWORD WINAPI load_draft_thread(LPVOID p) { (void)p; g_ld_rc = load_draft(g_ld_path, g_ld_ctx); return 0; }
+static int load_draft_isolated(const char *path, int ctx) {
+    g_ld_path = path; g_ld_ctx = ctx;
+    HANDLE t = CreateThread(NULL, 0, load_draft_thread, NULL, 0, NULL);
+    if (!t) return load_draft(path, ctx);
+    WaitForSingleObject(t, INFINITE); CloseHandle(t);
+    return g_ld_rc;
+}
+#else
+static int load_draft_isolated(const char *path, int ctx) { return load_draft(path, ctx); }
+#endif
+
+static void spec_decode(Model *tgt, int *prompt, int n_prompt, int max_tokens,
+                        Tokenizer *tok, int has_tokenizer) {
+    Cfg *c = &tgt->c;
+    StDB *target_db = g_db;                 /* the draft swaps g_db around its forwards */
+    int output_ids = 0;
+    { const char *v = getenv("OUTPUT"); if (v && strcmp(v, "ids") == 0) output_ids = 1; }
+    int K = g_spec_k; if (K < 1) K = 1; if (K > 16) K = 16;
+
+    int last = prefill_tokens(tgt, prompt, n_prompt, 0);   /* target: streams experts */
+    g_db = &g_draft_db;
+    prefill_tokens(&g_draft, prompt, n_prompt, 0);          /* draft: resident, no stream */
+    g_db = target_db;
+
+    uint64_t fw_before = tgt->n_fw;
+    long verifies = 0, accepted_sum = 0;
+    int cur = last, pos = n_prompt, produced = 0, stop = 0;
+    double t0 = now_s();
+
+    /* Emit the first token (target's prediction after the prompt). */
+    { if (output_ids) printf("%d\n", cur);
+      else if (has_tokenizer) { char b[512]; tok_decode_raw(tok, cur, b, sizeof(b)); printf("%s", b); }
+      else printf("[%d]", cur);
+      produced = 1;
+      for (int si = 0; si < c->n_stop; si++) if (cur == c->stop_ids[si]) stop = 1; }
+
+    while (!stop && produced < max_tokens && pos < c->ctx_len - K - 2) {
+        int dt[16], seq[17], pred[17];
+        g_db = &g_draft_db;                 /* 1) draft proposes K tokens */
+        int d = cur;
+        for (int i = 0; i < K; i++) { d = forward_token(&g_draft, d, pos + i); dt[i] = d; }
+        g_db = target_db;                   /* 2) target verifies in ONE batched forward */
+        seq[0] = cur; for (int i = 0; i < K; i++) seq[1 + i] = dt[i];
+        forward_verify(tgt, seq, K + 1, pos, pred);
+        int a = 0; while (a < K && pred[a] == dt[a]) a++;   /* 3) accept prefix + bonus */
+        verifies++; accepted_sum += a;
+        int out[17], nout = 0;
+        for (int i = 0; i < a; i++) out[nout++] = dt[i];
+        out[nout++] = pred[a];              /* bonus: target's own token (always valid) */
+        for (int i = 0; i < nout && produced < max_tokens; i++) {
+            int t = out[i];
+            if (output_ids) printf("%d\n", t);
+            else if (has_tokenizer) { char b[512]; tok_decode_raw(tok, t, b, sizeof(b)); printf("%s", b); }
+            else printf("[%d]", t);
+            produced++;
+            for (int si = 0; si < c->n_stop; si++) if (t == c->stop_ids[si]) { stop = 1; break; }
+            if (stop) break;
+        }
+        fflush(stdout);
+        cur = out[nout - 1]; pos += nout;   /* nout = a+1; KV rolls by overwrite next round */
+    }
+    double el = now_s() - t0;
+    printf("\n");
+    fprintf(stderr, "\n── SPEC DECODE (K=%d) ──\n", K);
+    fprintf(stderr, "produced %d tokens · %ld verifies · mean accepted %.2f/round"
+            " · %.2f tokens per target-forward\n", produced, verifies,
+            verifies ? (double)accepted_sum / verifies : 0.0,
+            verifies ? (double)produced / verifies : 0.0);
+    fprintf(stderr, "target forwards this decode: %llu · %.2f tok/s\n",
+            (unsigned long long)(tgt->n_fw - fw_before), el > 0 ? produced / el : 0.0);
+}
+
 int main(int argc, char **argv) {
+    { const char *v = getenv("EXPERT_REUSE"); if (v) g_expert_reuse = atoi(v) != 0; }
     fprintf(stderr, "🪶 picchio v0.6.0 — MoE streaming engine\n");
-    fprintf(stderr, "   GPT-OSS/Qwen3-MoE · INT3/INT4 · CPU streaming\n\n");
+    fprintf(stderr, "   GPT-OSS/Qwen3-MoE · INT3/INT4 · native CPU/GPU streaming\n\n");
 
     /* ── Self-test mode ── */
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
         return self_test();
+    }
+    if (argc > 1 && strcmp(argv[1], "--bench-int3") == 0) {
+        int iterations = argc > 2 ? atoi(argv[2]) : 20;
+        return benchmark_int3_expert(iterations);
+    }
+    if (argc > 1 && strcmp(argv[1], "--gpu-router-test") == 0) {
+        return native_router_self_test();
+    }
+    if (argc > 1 && strcmp(argv[1], "--gpu-dense-test") == 0) {
+        return native_dense_self_test(argc > 2 && strcmp(argv[2], "fail-after-release") == 0);
+    }
+    if (argc > 1 && strcmp(argv[1], "--plan") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: picchio --plan <model-directory>\n");
+            return 1;
+        }
+        return print_model_plan(argv[2]);
     }
     /* ── Pipeline self-test (2 TCP stages over loopback, synthetic model) ── */
     if (argc > 1 && strcmp(argv[1], "--pipe-self-test") == 0) {
         return pipe_self_test();
     }
 
-    const char *model_path = getenv("MODEL");
+    int test_expert_io = argc > 1 && strcmp(argv[1], "--expert-io-test") == 0;
+    if (test_expert_io && argc < 3) {
+        fprintf(stderr, "Usage: picchio --expert-io-test <model-directory>\n"); return 1;
+    }
+    const char *model_path = test_expert_io ? argv[2] : getenv("MODEL");
     if (!model_path) {
         if (argc > 1) model_path = argv[1];
         else {
@@ -4147,6 +5186,14 @@ int main(int argc, char **argv) {
 
     /* Make the DB accessible to the expert loader */
     g_db = &db;
+    { const char *v = getenv("TENSOR_INDEX");
+      if ((!v || atoi(v)) && !st_build_name_index(&db))
+          fprintf(stderr, "warning: tensor name index unavailable; using linear lookup\n"); }
+    if (test_expert_io) {
+        int rc = expert_io_self_test(&m);
+        st_close(&db);
+        return rc;
+    }
 
     /* Optional aligned expert store. Auto-detect experts.picchioflat next to
      * the model; FLAT=<path> overrides it and FLAT=0 disables discovery. A
@@ -4200,27 +5247,57 @@ int main(int argc, char **argv) {
      * slots/layer and 91.2%, with RSS ~8.5 GB (wide margin over the 15.8 GB
      * physical). Full residency of the 20B (32 experts/layer) is reached around
      * PIN_GB=9, beyond which there is no gain because there are only 32 experts
-     * per layer. The default is now adaptive: without PIN_GB it detects the
-     * physical RAM and assigns the experts everything except a reserve for
-     * dense/KV/OS. On 16 GB this gives ~10 GB of budget (full 20B residency); it
-     * scales up on larger machines and self-limits on small ones. The old estimate
+     * per layer. The default is now adaptive: without PIN_GB it considers both
+     * physical and currently available RAM, subtracts the model-specific dense
+     * estimate, and uses exact INT3/INT4 slot sizes. It scales up on larger
+     * machines and self-limits when other applications occupy RAM. The old estimate
      * that a low PIN_GB would saturate RAM was based on a broken RSS measurement on
      * Windows (see rss_gb), now fixed. */
-    int pin_gb_env = 0;
-    { const char *v = getenv("PIN_GB"); if (v) pin_gb_env = atoi(v); }
+    /* Exact bytes for one cached expert. INT3 uses 24 packed bytes plus one
+     * F32 scale for every group of 64 values (3.5 effective bits/weight). */
+    int64_t expert_bytes = expert_slot_estimate_bytes(c);
+
+    double pin_gb_env = 0;
+    { const char *v = getenv("PIN_GB");
+      if (v) {
+          char *end;
+          pin_gb_env = strtod(v, &end);
+          if (*end || !isfinite(pin_gb_env) || pin_gb_env < 0 || pin_gb_env > 1048576) {
+              fprintf(stderr, "error: PIN_GB must be a finite nonnegative GiB budget\n");
+              return 1;
+          }
+      } }
     int64_t GB = 1024LL * 1024 * 1024;
     int64_t avail_bytes;
     if (pin_gb_env > 0) {
-        avail_bytes = (int64_t)pin_gb_env * GB;   /* explicit override */
-        fprintf(stderr, "  PIN_GB=%d (explicit)\n", pin_gb_env);
+        avail_bytes = (int64_t)(pin_gb_env * GB);   /* explicit override */
+        fprintf(stderr, "  PIN_GB=%.3g (explicit)\n", pin_gb_env);
     } else {
         int64_t phys = physical_ram_bytes();
+        int64_t avail_now = available_ram_bytes();
         if (phys > 0) {
             /* Reserve for dense (~3–4.5 GB) + KV + OS overhead. The rest goes to
              * the experts. The cache self-limits to n_experts×n_layers anyway. */
             int64_t reserve = 6LL * GB;
             avail_bytes = phys - reserve;
-            if (avail_bytes < 2 * GB) avail_bytes = 2 * GB;  /* floor for scarce RAM */
+            int64_t min_cache = expert_bytes * c->n_layers * c->topk;
+            if (avail_now > 0) {
+                int64_t dense_est = dense_weight_estimate_bytes(c);
+                int64_t live_cap = avail_now - dense_est - 512LL * 1024 * 1024;
+                if (live_cap < min_cache) {
+                    fprintf(stderr,
+                            "  warning: only %.1f GB RAM available; model needs "
+                            "~%.1f GB dense + %.1f GB minimum expert cache. "
+                            "Close other applications to avoid paging.\n",
+                            (double)avail_now / 1e9, (double)dense_est / 1e9,
+                            (double)min_cache / 1e9);
+                    live_cap = min_cache;
+                }
+                if (live_cap < avail_bytes) avail_bytes = live_cap;
+            }
+            if (avail_bytes < min_cache) avail_bytes = min_cache;
+            fprintf(stderr, "  RAM currently available: %.1f GB\n",
+                    (double)avail_now / 1e9);
             fprintf(stderr, "  physical RAM %.1f GB → expert budget %.1f GB "
                     "(reserve %.0f GB for dense/KV/OS; override with PIN_GB)\n",
                     (double)phys / 1e9, (double)avail_bytes / 1e9,
@@ -4230,9 +5307,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  RAM undetectable → expert budget 8 GB\n");
         }
     }
-    int64_t expert_bytes = (int64_t)c->moe_inter * ((c->hidden + 1) / 2)  /* gate_up */
-                         + (int64_t)c->hidden * ((c->hidden + 1) / 2)     /* down */
-                         + (int64_t)(c->moe_inter + c->hidden) * 4;       /* scales+bias */
     int total_slots = (int)(avail_bytes / expert_bytes);
     m.ecap = total_slots / c->n_layers;
     if (m.ecap < 4) m.ecap = 4;
@@ -4291,9 +5365,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "✓ loaded in %.1f s · resident %.2f GB\n",
             now_s() - t0, m.resident_bytes / 1e9);
 
-    /* Optional GPU backend (GPU=1): offloads lm_head to the CUDA library if
-     * present, otherwise stays on the CPU path. */
-    gpu_backend_load();
+    /* Optional GPU backend. GPU_PREFETCH/GPU_ROUTER use the resident router
+     * tier without moving expert compute away from the CPU. */
+    gpu_backend_load(&m);
+    {
+        const char *release_host = getenv("GPU_DENSE_RELEASE_HOST");
+        if (release_host && atoi(release_host) && !g_gpu_dense_host_released) {
+            fprintf(stderr, "error: GPU_DENSE_RELEASE_HOST requested, but no host "
+                    "weights were released; refusing a CPU fallback with this cache budget\n");
+            return 1;
+        }
+    }
 
     /* ── 5. Sampling parameters ── */
     {
@@ -4367,14 +5449,24 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Prefetch → LRU (PREFETCH=1, historical alias PILOT=1). Predicts the next
-     * layer's experts (post-MoE proxy) and loads them during the attention. */
+    /* Prefetch → LRU. GPU_PREFETCH=1 runs the resident L+1 router before the
+     * current MoE and overlaps reads with current expert load+compute. The CPU
+     * PREFETCH/PILOT mode retains the later, more accurate post-MoE proxy. */
     {
         const char *v = getenv("PREFETCH");
         if (!v) v = getenv("PILOT");
-        if (v && atoi(v)) {
+        const char *gv = getenv("GPU_PREFETCH");
+        int want_gpu_pf = gv && atoi(gv) != 0;
+        if ((v && atoi(v)) || want_gpu_pf) {
             pilot_init(&m);
-            fprintf(stderr, "prefetch → LRU enabled (post-MoE proxy)\n");
+            g_gpu_prefetch = want_gpu_pf && g_gpu_router && g_pilot_enabled;
+            if (g_gpu_prefetch)
+                fprintf(stderr, "prefetch → LRU enabled (GPU early L+1 proxy)\n");
+            else {
+                if (want_gpu_pf && !g_gpu_router)
+                    fprintf(stderr, "  warning: GPU prefetch unavailable; using CPU post-MoE proxy\n");
+                fprintf(stderr, "prefetch → LRU enabled (post-MoE proxy)\n");
+            }
         }
     }
 
@@ -4598,6 +5690,40 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Speculative decoding: load a small draft (DRAFT_MODEL) and run the
+     * draft-propose / target-verify loop instead of plain decoding. */
+    {
+        const char *sk = getenv("SPEC_K"); if (sk && atoi(sk) > 0) g_spec_k = atoi(sk);
+        const char *dm = getenv("DRAFT_MODEL");
+        if (dm && *dm) load_draft_isolated(dm, m.kv.max_pos);
+    }
+    if (g_have_draft) {
+        spec_decode(&m, prompt_tokens, n_prompt, max_tokens, &tok, has_tokenizer);
+        if (prompt_tokens_owned) free(prompt_tokens);
+        if (has_tokenizer) tok_free(&tok);
+        st_close(&db);
+        return 0;
+    }
+
+    /* SPEC_VERIFY: validate the batched forward_verify against the sequential
+     * forward_token — per-position argmax must be identical. Core correctness
+     * check for speculative decoding; exits without generating. */
+    if (getenv("SPEC_VERIFY") && atoi(getenv("SPEC_VERIFY"))) {
+        int nv = n_prompt < 16 ? n_prompt : 16;
+        int *pb = (int *)malloc(nv * sizeof(int)), *ps = (int *)malloc(nv * sizeof(int));
+        forward_verify(&m, prompt_tokens, nv, 0, pb);                 /* one batched forward */
+        for (int p = 0; p < nv; p++) ps[p] = forward_token(&m, prompt_tokens[p], p); /* sequential */
+        int match = 0;
+        for (int p = 0; p < nv; p++) if (pb[p] == ps[p]) match++;
+        fprintf(stderr, "\n── SPEC_VERIFY: batched forward_verify vs sequential ──\n");
+        fprintf(stderr, "positions %d · argmax match %d/%d (%s)\n", nv, match, nv,
+                match == nv ? "IDENTICAL - forward_verify correct" : "MISMATCH");
+        for (int p = 0; p < nv; p++) if (pb[p] != ps[p])
+            fprintf(stderr, "  pos %d: batched=%d sequential=%d\n", p, pb[p], ps[p]);
+        free(pb); free(ps);
+        return match == nv ? 0 : 1;
+    }
+
     /* Prefill: process all the prompt tokens */
     fprintf(stderr, "prefill %d tokens...\n", n_prompt);
     double t_prefill = now_s();
@@ -4608,6 +5734,28 @@ int main(int argc, char **argv) {
     double t_gen = now_s();
     int pos = n_prompt;
     int tok_id = last_tok;
+    if (getenv("SPEC_PROBE") && atoi(getenv("SPEC_PROBE"))) {
+        g_spec_probe = 1;
+        g_probe_L = c->n_layers; g_probe_K = c->topk;
+        g_probe_captok = max_tokens < 8192 ? max_tokens : 8192;
+        g_probe_exp = (int *)malloc((size_t)g_probe_captok * g_probe_L * g_probe_K * sizeof(int));
+        g_probe_hist_cap = g_probe_captok + n_prompt + 8;
+        g_probe_hist = (int *)malloc((size_t)g_probe_hist_cap * sizeof(int));
+        if (!g_probe_exp || !g_probe_hist) {
+            g_spec_probe = 0; free(g_probe_exp); free(g_probe_hist);
+        } else {
+            for (int i = 0; i < n_prompt; i++) g_probe_hist[g_probe_hist_n++] = prompt_tokens[i];
+            g_probe_prompt_n = n_prompt;
+            fprintf(stderr, "SPEC_PROBE on: measuring n-gram acceptance + expert-union\n");
+        }
+    }
+    if (getenv("SELF_DRAFT_PROBE") && atoi(getenv("SELF_DRAFT_PROBE"))) {
+        g_self_draft_probe = 1;
+        { const char *v = getenv("SELF_DRAFT_K"); if (v && atoi(v) > 0) g_sd_draft_k = atoi(v); }
+        fprintf(stderr, "  draft width: top-%d\n", g_sd_draft_k);
+        fprintf(stderr, "SELF_DRAFT_PROBE on: top-1 (draft) vs top-4 (target) per token"
+                        " — generation runs ~2x slower during the measurement\n");
+    }
     int in_final = 0;       /* 1 when we are in the "final" channel */
     int skip_header = 1;    /* 1 to skip the header tokens (channel, etc.) */
 
@@ -4692,12 +5840,29 @@ int main(int argc, char **argv) {
         }
 
         /* Forward for the next token */
-        tok_id = forward_token(&m, tok_id, pos);
+        if (g_self_draft_probe) {
+            /* draft: top-1 forward (transient KV), then target: top-4 forward
+             * (overwrites KV correctly). Real generation uses the top-4 token. */
+            g_force_top1 = 1; int d0 = forward_token(&m, tok_id, pos);
+            g_force_top1 = 0; int m0 = forward_token(&m, tok_id, pos);
+            g_sd_total++;
+            if (d0 == m0) { g_sd_match++; g_sd_run++; }
+            else { g_sd_runhist[g_sd_run < 7 ? g_sd_run : 7]++; g_sd_run = 0; }
+            tok_id = m0;
+        } else {
+            tok_id = forward_token(&m, tok_id, pos);
+        }
+        if (g_spec_probe) {
+            if (g_probe_ntok < g_probe_captok) g_probe_ntok++;   /* slot just filled */
+            if (g_probe_hist_n < g_probe_hist_cap) g_probe_hist[g_probe_hist_n++] = tok_id;
+        }
         pos++;
         m.n_emit++;
     }
 
     printf("\n");
+    if (g_spec_probe || g_self_draft_probe) spec_probe_report();
+    if (g_spec_probe) { free(g_probe_exp); free(g_probe_hist); }
     double gen_elapsed = now_s() - t_gen;
 
     /* Stats */

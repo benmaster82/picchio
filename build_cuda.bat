@@ -14,6 +14,7 @@ REM     e.g. GTX 1650 / RTX 20xx). RTX 30xx = sm_86, RTX 40xx = sm_89.
 REM
 REM Usage:  build_cuda.bat            (builds the DLL)
 REM         build_cuda.bat test       (also builds+runs the numeric self-test)
+REM         build_cuda.bat router-test (builds+runs the lightweight router test)
 
 setlocal
 if "%CUDA_ARCH%"=="" set CUDA_ARCH=sm_75
@@ -30,19 +31,30 @@ if errorlevel 1 (
 )
 
 echo Building picchio_cuda.dll (arch %CUDA_ARCH%, static cudart)...
-nvcc -O3 -arch=%CUDA_ARCH% --cudart static -DPGPU_BUILD_DLL -shared -o picchio_cuda.dll picchio_cuda.cu
+REM --use-local-env prevents nvcc from recursively invoking vcvars64.bat. That
+REM recursion can terminate early in restricted Windows shells even though the
+REM MSVC environment above is already complete.
+nvcc --use-local-env -ccbin cl.exe -O3 -arch=%CUDA_ARCH% --cudart static -DPGPU_BUILD_DLL -shared -o picchio_cuda.dll picchio_cuda.cu
 if errorlevel 1 ( echo Build error. & exit /b 1 )
 echo === picchio_cuda.dll built ===
 
 if /i "%1"=="test" (
     echo Building numeric self-test...
-    nvcc -O3 -arch=%CUDA_ARCH% -DPGPU_TEST -o pgpu_test.exe picchio_cuda.cu
+    nvcc --use-local-env -ccbin cl.exe -O3 -arch=%CUDA_ARCH% -DPGPU_TEST -o pgpu_test.exe picchio_cuda.cu
     if errorlevel 1 ( echo Test build error. & exit /b 1 )
     echo === running pgpu_test.exe ===
     pgpu_test.exe
 )
 
+if /i "%1"=="router-test" (
+    echo Building GPU router self-test...
+    nvcc --use-local-env -ccbin cl.exe -O3 -arch=%CUDA_ARCH% -DPGPU_ROUTER_TEST -o pgpu_router_test.exe picchio_cuda.cu
+    if errorlevel 1 ( echo Router test build error. & exit /b 1 )
+    echo === running pgpu_router_test.exe ===
+    pgpu_router_test.exe
+)
+
 echo.
-echo Done. Run the engine with GPU=1 to use it, e.g.:
-echo   set GPU=1 ^& picchio.exe C:\models\gptoss20b_i8h
+echo Done. Recommended GTX 1650 mode: GPU-guided I/O, experts on CPU:
+echo   set GPU_PREFETCH=1 ^& picchio.exe C:\models\gptoss_i3
 endlocal

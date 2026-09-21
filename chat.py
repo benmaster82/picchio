@@ -48,14 +48,23 @@ class PicchioSession:
     """Persistent Picchio process in SERVICE mode."""
 
     def __init__(self, exe, model, ctx, pin_gb, threads, model_aux, sampling=None,
-                 async_moe=False, direct=False, io_threads=None):
+                 async_moe=False, direct=False, io_threads=None, flat=None,
+                 gpu_router=False, gpu_prefetch=False, gpu_dense=False,
+                 gpu_experts=False, gpu_dense_release_host=False, expert_reuse=True,
+                 tensor_index=True):
+        if gpu_dense_release_host and not gpu_dense:
+            raise ValueError("host weight release requires gpu_dense=True")
         env = os.environ.copy()
         for name in ("INPUT", "PROMPT", "INPUT_FILE", "OUTPUT", "MODEL_AUX",
-                     "TRACE_NUMERIC", "ORACLE_DIR"):
+                     "TRACE_NUMERIC", "ORACLE_DIR", "FLAT", "GPU",
+                     "GPU_ROUTER", "GPU_PREFETCH", "GPU_DENSE", "GPU_EXPERTS",
+                     "GPU_LMHEAD", "GPU_DENSE_RELEASE_HOST", "ASYNC_MOE",
+                     "DIRECT", "IO_THREADS"):
             env.pop(name, None)
         env.update({"SERVICE": "1", "TEMPERATURE": "0", "REP": "1",
                     "CTX": str(ctx), "PIN_GB": str(pin_gb),
-                    "OMP_NUM_THREADS": str(threads)})
+                    "OMP_NUM_THREADS": str(threads), "EXPERT_REUSE": "1" if expert_reuse else "0",
+                    "TENSOR_INDEX": "1" if tensor_index else "0"})
         if sampling:
             env.update({k: str(v) for k, v in sampling.items() if v is not None})
         if async_moe:
@@ -64,6 +73,18 @@ class PicchioSession:
             env["DIRECT"] = "1"
         if io_threads is not None:
             env["IO_THREADS"] = str(io_threads)
+        if flat is not None:
+            env["FLAT"] = str(flat)
+        if gpu_router:
+            env["GPU_ROUTER"] = "1"
+        if gpu_prefetch:
+            env["GPU_PREFETCH"] = "1"
+        if gpu_dense:
+            env["GPU_DENSE"] = "1"
+        if gpu_dense_release_host:
+            env["GPU_DENSE_RELEASE_HOST"] = "1"
+        if gpu_experts:
+            env["GPU_EXPERTS"] = "1"
         # Default sampling sent with every TURN (a per-turn override is possible).
         s = sampling or {}
         self.temperature = 1.0 if s.get("TEMPERATURE") is None else float(s["TEMPERATURE"])
@@ -75,13 +96,18 @@ class PicchioSession:
             [_resolve_exe(exe), str(model)], env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, text=True, encoding="ascii",
             errors="replace", bufsize=1)
-        ready = self._line()
-        if not ready.startswith("READY "):
-            raise RuntimeError(f"service startup failed: {ready}")
-        fields = ready.split()
-        self.ctx = int(fields[1])
-        self.vocab = int(fields[2])
-        self.stop_ids = [int(x) for x in fields[3:]]
+        try:
+            ready = self._line()
+            if not ready.startswith("READY "):
+                raise RuntimeError(f"service startup failed: {ready}")
+            fields = ready.split()
+            self.ctx = int(fields[1])
+            self.vocab = int(fields[2])
+            self.stop_ids = [int(x) for x in fields[3:]]
+        except Exception:
+            self.proc.kill()
+            self.proc.wait()
+            raise
 
     def _line(self):
         line = self.proc.stdout.readline()
@@ -91,6 +117,8 @@ class PicchioSession:
 
     def turn(self, ids, max_new, keep, on_token,
              temperature=None, top_p=None, top_k=None):
+        before = self.stats()
+        self.last_timing = {}
         temp = self.temperature if temperature is None else temperature
         topp = self.top_p if top_p is None else top_p
         topk = self.top_k if top_k is None else top_k
@@ -107,6 +135,15 @@ class PicchioSession:
                 on_token(token)
             elif line.startswith("DONE "):
                 _, reason, _, pos = line.split()
+                after = self.stats()
+                for phase in ("prefill", "decode"):
+                    seconds = phase + "_seconds"
+                    tokens = phase + "_tokens"
+                    if seconds in before and seconds in after:
+                        duration = after[seconds] - before[seconds]
+                        count = after[tokens] - before[tokens]
+                        self.last_timing.update({seconds: duration, tokens: count,
+                            phase + "_tokens_per_s": count / duration if duration > 0 else None})
                 return produced, reason, int(pos)
             elif line.startswith("ERROR "):
                 raise RuntimeError(line)
@@ -123,6 +160,26 @@ class PicchioSession:
             self.proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait()
+
+    def reset(self):
+        self.proc.stdin.write("RESET\n")
+        self.proc.stdin.flush()
+        line = self._line()
+        if line != "DONE RESET 0 0":
+            raise RuntimeError(f"reset failed: {line}")
+
+    def stats(self):
+        """Return a cumulative, machine-readable snapshot from the C engine."""
+        self.proc.stdin.write("STATS\n")
+        self.proc.stdin.flush()
+        line = self._line()
+        if not line.startswith("STATS "):
+            raise RuntimeError(f"stats failed: {line}")
+        try:
+            return json.loads(line[6:])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid stats frame: {line}") from exc
 
 
 class HarmonyChat:
@@ -134,7 +191,8 @@ class HarmonyChat:
         system = (SystemContent.new()
                   .with_reasoning_effort(ReasoningEffort(reasoning.capitalize()))
                   .with_conversation_start_date(current_date))
-        self.messages = [Message.from_role_and_content(Role.SYSTEM, system)]
+        self.system_message = Message.from_role_and_content(Role.SYSTEM, system)
+        self.messages = [self.system_message]
         self.committed = []
         self.last_stats = None
         # No-reasoning mode: pre-commit the `final` channel, so the assistant's
@@ -147,6 +205,12 @@ class HarmonyChat:
             if no_reasoning else [])
         if session is not None and set(session.stop_ids) - set(self.encoding.stop_tokens()):
             raise RuntimeError(f"inconsistent runtime stop tokens: {session.stop_ids}")
+
+    def reset(self):
+        self.session.reset()
+        self.messages = [self.system_message]
+        self.committed = []
+        self.last_stats = None
 
     def render(self, user_text):
         messages = self.messages + [Message.from_role_and_content(Role.USER, user_text)]
@@ -173,12 +237,12 @@ class HarmonyChat:
         for tok in self.final_prefill:
             parser.process(tok)
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         # Stream BOTH channels live so the user always sees what is happening: the
         # reasoning prints dimmed on stderr under a "thinking ❯" header, the answer
         # prints on stdout under "picchio ❯". Keeping the answer alone on stdout
         # means redirecting/piping the command still yields a clean answer file.
-        state = {"n": 0, "channel": None}
+        state = {"n": 0, "channel": None, "first_token_at": None}
 
         def _header(ch):
             if ch == "analysis":
@@ -187,6 +251,8 @@ class HarmonyChat:
                 ui.begin_answer()
 
         def on_token(token):
+            if state["first_token_at"] is None:
+                state["first_token_at"] = time.perf_counter()
             parser.process(token)
             state["n"] += 1
             chunk = parser.last_content_delta
@@ -194,7 +260,7 @@ class HarmonyChat:
             if not (live and chunk and ch in ("analysis", "final")):
                 # Header/role tokens, or non-live (JSON) mode: just animate the spinner.
                 if state["channel"] is None:
-                    ui.thinking(state["n"], time.time() - t0)
+                    ui.thinking(state["n"], time.perf_counter() - t0)
                 return
             if state["channel"] != ch:
                 # Channel switch: close the previous line on its own stream, then
@@ -221,11 +287,15 @@ class HarmonyChat:
         else:
             ui.clear_status()
 
-        dt = time.time() - t0
+        dt = time.perf_counter() - t0
         n = len(produced)
+        ttft = (state["first_token_at"] - t0
+                if state["first_token_at"] is not None else None)
         self.last_stats = {
             "tokens": n, "elapsed": dt, "pos": pos, "ctx": self.session.ctx,
             "reused": keep, "prompt_tokens": len(full), "reason": reason,
+            "ttft": ttft,
+            **self.session.last_timing,
         }
         ui.metrics(**self.last_stats)
 
@@ -261,7 +331,7 @@ def main():
                         help="skip the analysis channel: pre-commit the final channel, "
                              "the model answers without reasoning (faster)")
     parser.add_argument("--date", default=date.today().isoformat())
-    parser.add_argument("--pin-gb", type=int, default=1)
+    parser.add_argument("--pin-gb", type=float, default=1.0)
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--io-threads", type=int,
                         help="parallel expert reads (engine default: 4)")
@@ -269,6 +339,22 @@ def main():
                         help="overlap routed expert reads with CPU expert compute")
     parser.add_argument("--direct", action="store_true",
                         help="use unbuffered expert reads (best paired with --async-moe)")
+    parser.add_argument("--flat",
+                        help="flat expert store path, or 0 to force SafeTensors")
+    parser.add_argument("--gpu-router", action="store_true",
+                        help="keep all routers resident and execute them on the GPU")
+    parser.add_argument("--gpu-prefetch", action="store_true",
+                        help="predict L+1 on the GPU and prefetch experts during current MoE")
+    parser.add_argument("--gpu-dense", action="store_true",
+                        help="keep attention Q/K/V/O as FP16 in VRAM and run projections on GPU")
+    parser.add_argument("--gpu-dense-release-host", action="store_true",
+                        help="free uploaded Q/K/V/O host weights; GPU errors terminate the session")
+    parser.add_argument("--no-expert-reuse", action="store_true",
+                        help="use the legacy allocating expert reader for comparisons")
+    parser.add_argument("--no-tensor-index", action="store_true",
+                        help="use linear tensor-name lookup for comparisons")
+    parser.add_argument("--gpu-experts", action="store_true",
+                        help="experimental expert compute offload (not recommended on 4 GB GPUs)")
     parser.add_argument("--model-aux")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0 = deterministic greedy; values ~0.7-1.0 avoid loops")
@@ -285,6 +371,8 @@ def main():
                         help="render and verify the IDs without starting Picchio")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    if args.gpu_dense_release_host and not args.gpu_dense:
+        parser.error("--gpu-dense-release-host requires --gpu-dense")
 
     if args.dry_run:
         chat = HarmonyChat(None, args.reasoning, args.date, args.no_reasoning)
@@ -310,15 +398,31 @@ def main():
         exe, model, args.ctx, args.pin_gb, args.threads,
         resolve_aux(model, args.model_aux), sampling,
         async_moe=args.async_moe, direct=args.direct,
-        io_threads=args.io_threads)
+        io_threads=args.io_threads, flat=args.flat,
+        gpu_router=args.gpu_router, gpu_prefetch=args.gpu_prefetch,
+        gpu_dense=args.gpu_dense,
+        gpu_dense_release_host=args.gpu_dense_release_host,
+        expert_reuse=not args.no_expert_reuse,
+        tensor_index=not args.no_tensor_index,
+        gpu_experts=args.gpu_experts)
     chat = HarmonyChat(session, args.reasoning, args.date, args.no_reasoning)
     single = args.prompt is not None
 
     def show_header():
         reasoning = "off" if args.no_reasoning else args.reasoning
+        gpu_features = []
+        if args.gpu_dense:
+            gpu_features.append("dense")
+        if args.gpu_prefetch:
+            gpu_features.append("prefetch")
+        elif args.gpu_router:
+            gpu_features.append("router")
+        if args.gpu_experts:
+            gpu_features.append("experts")
+        gpu_mode = "GPU " + "+".join(gpu_features) if gpu_features else None
         ui.header("GPT-OSS", model, session.ctx, args.pin_gb, args.temperature,
                   args.threads, not single, reasoning, args.async_moe,
-                  args.direct, args.io_threads)
+                  args.direct, args.io_threads, gpu_mode)
 
     show_header()
 
@@ -344,6 +448,10 @@ def main():
                 if command == "/clear":
                     ui.clear_screen()
                     show_header()
+                    continue
+                if command == "/reset":
+                    chat.reset()
+                    ui.write(ui.DIM("  Conversation and KV cache reset."))
                     continue
                 if command == "/stats":
                     ui.show_stats(chat.last_stats)

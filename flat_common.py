@@ -7,10 +7,10 @@ scales); aggregated/resident biases are not part of the streamed expert.
 """
 import hashlib
 import json
+import os
 import struct
+import atexit
 from pathlib import Path
-
-from safetensors import safe_open
 
 BS = 4096
 MAGIC = b"PCHIOFL1"
@@ -20,6 +20,40 @@ INDEX_FMT = "<QIIQ"
 INDEX_SIZE = struct.calcsize(INDEX_FMT)
 _PROJS = ("gate_up_proj", "gate_up_proj.qs", "down_proj", "down_proj.qs")
 _handles = {}
+_tensor_locs = {}
+
+
+def _close_handles():
+    for handle in _handles.values():
+        handle.close()
+    _handles.clear()
+
+
+atexit.register(_close_handles)
+
+
+def _scan_safetensors(path):
+    """Yield (name, absolute_offset, byte_length) without mmap'ing the shard."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        raw_len = f.read(8)
+        if len(raw_len) != 8:
+            raise ValueError(f"short SafeTensors header: {path}")
+        header_len = struct.unpack("<Q", raw_len)[0]
+        if header_len > 64 * 1024 * 1024 or 8 + header_len > size:
+            raise ValueError(f"invalid SafeTensors header length: {path}")
+        raw_header = f.read(header_len)
+    if len(raw_header) != header_len:
+        raise ValueError(f"short SafeTensors header: {path}")
+    header = json.loads(raw_header)
+    data_base = 8 + header_len
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        start, end = info["data_offsets"]
+        if start < 0 or end < start or data_base + end > size:
+            raise ValueError(f"invalid tensor offsets for {name}: {path}")
+        yield name, data_base + start, end - start
 
 
 def load(model):
@@ -29,11 +63,14 @@ def load(model):
     nl = cfg["num_hidden_layers"]
     ne = cfg.get("num_experts", cfg.get("num_local_experts"))
 
+    _close_handles()
+    _tensor_locs.clear()
     name2shard = {}
     for s in sorted(Path(model).glob("model-*.safetensors")):
-        with safe_open(str(s), framework="numpy") as h:
-            for k in h.keys():
-                name2shard[k] = str(s)
+        path = str(s)
+        for name, offset, length in _scan_safetensors(path):
+            name2shard[name] = path
+            _tensor_locs[name] = (path, offset, length)
 
     def qwen(L, E):
         return [f"model.layers.{L}.mlp.experts.{E}.{p}" for p in _PROJS]
@@ -51,10 +88,15 @@ def load(model):
 
 
 def tbytes(name2shard, name):
-    p = name2shard[name]
+    p, offset, length = _tensor_locs[name]
     if p not in _handles:
-        _handles[p] = safe_open(p, framework="numpy")
-    return _handles[p].get_tensor(name).tobytes()
+        _handles[p] = open(p, "rb", buffering=0)
+    handle = _handles[p]
+    handle.seek(offset)
+    payload = handle.read(length)
+    if len(payload) != length:
+        raise OSError(f"short tensor read for {name}: {len(payload)} of {length} bytes")
+    return payload
 
 
 def architecture(cfg):

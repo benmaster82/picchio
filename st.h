@@ -115,6 +115,8 @@ typedef struct {
     int n_files;
     StTensor *tensors;     /* heap-allocated [ST_MAX_TENSORS] */
     int n_tensors;
+    int *name_index;       /* immutable after startup: indices + 1, 0 = empty */
+    size_t name_index_cap;
 } StDB;
 
 /* O_DIRECT / FILE_FLAG_NO_BUFFERING toggle (DIRECT=1): bypass the OS page cache
@@ -291,6 +293,8 @@ static int st_parse_header(StDB *db, const char *header, int64_t header_len,
 /* ── Open a safetensors file ── */
 
 static int st_open_file(StDB *db, const char *path) {
+    /* Opening additional shards invalidates an index built by an earlier caller. */
+    free(db->name_index); db->name_index = NULL; db->name_index_cap = 0;
     if (db->n_files >= ST_MAX_FILES) {
         fprintf(stderr, "st: too many open files\n");
         return -1;
@@ -384,7 +388,43 @@ static int st_open_file(StDB *db, const char *path) {
 
 /* ── Find a tensor by name ── */
 
+static uint32_t st_name_hash(const char *name) {
+    uint32_t hash = 2166136261u;
+    while (*name) { hash ^= (uint8_t)*name++; hash *= 16777619u; }
+    return hash;
+}
+
+/* Build once, after every shard is opened and before worker threads start.
+ * Preserve the original first-match behavior if shard names are duplicated. */
+static int st_build_name_index(StDB *db) {
+    size_t capacity = 16;
+    while (capacity < (size_t)db->n_tensors * 2) capacity *= 2;
+    int *index = (int *)calloc(capacity, sizeof(int));
+    if (!index) return 0;
+    for (int i = 0; i < db->n_tensors; i++) {
+        size_t slot = st_name_hash(db->tensors[i].name) & (capacity - 1);
+        while (index[slot]) {
+            if (!strcmp(db->tensors[index[slot] - 1].name, db->tensors[i].name)) break;
+            slot = (slot + 1) & (capacity - 1);
+        }
+        if (!index[slot]) index[slot] = i + 1;
+    }
+    free(db->name_index);
+    db->name_index = index;
+    db->name_index_cap = capacity;
+    return 1;
+}
+
 static StTensor *st_find(StDB *db, const char *name) {
+    if (db->name_index) {
+        size_t slot = st_name_hash(name) & (db->name_index_cap - 1);
+        while (db->name_index[slot]) {
+            StTensor *tensor = &db->tensors[db->name_index[slot] - 1];
+            if (!strcmp(tensor->name, name)) return tensor;
+            slot = (slot + 1) & (db->name_index_cap - 1);
+        }
+        return NULL;
+    }
     for (int i = 0; i < db->n_tensors; i++) {
         if (strcmp(db->tensors[i].name, name) == 0)
             return &db->tensors[i];
@@ -552,6 +592,35 @@ static int64_t st_read_raw(StDB *db, StTensor *t, void *dst, int64_t max_bytes) 
 #endif
 }
 
+/* Read into a caller-owned aligned region, retaining the leading alignment
+ * padding. This avoids the bounce-buffer copy for resident expert cache slots.
+ * The returned payload may start inside `buffer`; capacity includes padding.
+ * Exact buffered fallback also handles tensors ending at an unaligned EOF. */
+static int64_t st_read_raw_aligned(StDB *db, StTensor *t, void *buffer,
+                                  size_t capacity, uint8_t **payload) {
+    StFile *sf = &db->files[t->file_idx];
+    int64_t bytes = t->offset_end - t->offset_start;
+    int64_t offset = sf->data_offset + t->offset_start;
+    if (bytes <= 0 || offset < 0 || bytes > INT64_MAX - offset - ST_ALIGN) return -1;
+    int64_t start = offset & ~(int64_t)(ST_ALIGN - 1);
+    int64_t prefix = offset - start;
+    int64_t length = (prefix + bytes + ST_ALIGN - 1) & ~(int64_t)(ST_ALIGN - 1);
+    if ((uint64_t)length > capacity || ((uintptr_t)buffer & (ST_ALIGN - 1))) return -1;
+    *payload = (uint8_t *)buffer + prefix;
+#ifdef _WIN32
+    if (st_direct) {
+        HANDLE h = st_win_handle_direct(sf, t->file_idx);
+        if (h && h != INVALID_HANDLE_VALUE &&
+            st_pread_full(h, buffer, length, start) >= prefix + bytes) return bytes;
+    }
+    return st_pread_full(st_win_handle(sf, t->file_idx), *payload, bytes, offset);
+#else
+    if (st_direct && st_pread_full(st_posix_dfd(sf), buffer, length, start) >= prefix + bytes)
+        return bytes;
+    return st_pread_full(sf->fd, *payload, bytes, offset);
+#endif
+}
+
 /* Read a portion of a tensor starting at byte_offset. */
 static int64_t st_read_raw_at(StDB *db, StTensor *t, int64_t byte_offset,
                               void *dst, int64_t nbytes) {
@@ -614,6 +683,7 @@ static int64_t st_bytes(StTensor *t) {
 /* ── Close all files ── */
 
 static void st_close(StDB *db) {
+    free(db->name_index); db->name_index = NULL; db->name_index_cap = 0;
     for (int i = 0; i < db->n_files; i++) {
 #ifdef _WIN32
         if (db->files[i].hFile != INVALID_HANDLE_VALUE)
