@@ -135,7 +135,7 @@ attention, INT3 experts).
 Binary SHA-256:
 
 ```text
-<fill in after building picchio.exe: sha256sum picchio.exe>
+d21c90d855f438eeb1c001b4a162763167f560e15943d7441769af2996bce3d1  picchio.exe
 ```
 
 ## Full change history
