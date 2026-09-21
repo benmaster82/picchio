@@ -5004,7 +5004,7 @@ static void spec_decode(Model *tgt, int *prompt, int n_prompt, int max_tokens,
 
 int main(int argc, char **argv) {
     { const char *v = getenv("EXPERT_REUSE"); if (v) g_expert_reuse = atoi(v) != 0; }
-    fprintf(stderr, "🪶 picchio v0.6.0 — MoE streaming engine\n");
+    fprintf(stderr, "🪶 picchio v0.7.0 — MoE streaming engine\n");
     fprintf(stderr, "   GPT-OSS/Qwen3-MoE · INT3/INT4 · native CPU/GPU streaming\n\n");
 
     /* ── Self-test mode ── */
