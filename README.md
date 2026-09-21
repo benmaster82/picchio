@@ -2,6 +2,16 @@
   <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS 20B/120B · Qwen3-MoE · int4 · streaming CPU" width="560">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/gpt--oss--20b-3.3_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-20b: 3.3 tok/s">
+  <img src="https://img.shields.io/badge/Qwen3--30B--A3B-2.9_tok%2Fs-2ea44f?style=flat-square" alt="Qwen3-30B-A3B: 2.9 tok/s">
+  <img src="https://img.shields.io/badge/gpt--oss--120b-1.24_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-120b: 1.24 tok/s">
+  <br>
+  <img src="https://img.shields.io/badge/language-pure_C-00599C?style=flat-square" alt="pure C">
+  <img src="https://img.shields.io/badge/runs-larger_than_RAM-blue?style=flat-square" alt="runs models larger than RAM">
+  <img src="https://img.shields.io/badge/66_GB_model-on_16_GB_RAM-orange?style=flat-square" alt="66 GB model on 16 GB RAM">
+</p>
+
 > *The woodpecker drums a hundred times a second on a huge trunk;
 > we drum 128 experts on a huge disk.*
 
@@ -18,6 +28,23 @@ without a datacenter GPU.
 
 Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
 GPT-OSS architecture.
+
+### Measured performance
+
+Warm, greedy decode on a **6-core AVX2 laptop, 16 GB RAM, internal NVMe, GTX 1650
+4 GB (idle)** — no datacenter GPU. The lever is **INT8 attention** (`--dense-bits 8`):
+attention was the largest chunk of per-token byte movement, and quantizing it
+near-losslessly roughly halves it and frees RAM for the expert cache.
+
+| Model | Converted size | F32 attention | **INT8 attention** | |
+|---|---|---:|---:|---|
+| **gpt-oss-20b** | ~14 GB | 1.4 tok/s | **3.3 tok/s** | **+136%** — matches/beats Ollama here |
+| **Qwen3-30B-A3B** | ~20 GB | 2.2 tok/s | **2.9 tok/s** | **+32%**, dense resident 4.3 → 1.6 GB |
+| **gpt-oss-120b** | ~66 GB | 0.5 tok/s | **1.24 tok/s** | streamed from disk; prefill ~60 s |
+
+The 120B — **66 GB of weights on a 16 GB machine** — runs at over a token per
+second by streaming its experts. Full methodology, a cold-start worst case, and the
+GPU analysis are in [Measured performance](#measured-performance-a-deliberate-worst-case).
 
 ### Supported models
 
@@ -580,6 +607,38 @@ Two things to read from this:
 In short: on this hardware the 120B is usable for careful, patient exchanges, not
 interactive chat. If you want responsiveness, run the 20B.
 
+### Measured on internal NVMe with INT8 attention
+
+A second, more representative sweep on **internal NVMe** with **INT8 attention**
+(`--dense-bits 8`). Machine: 6-core AVX2 CPU, 16 GB RAM, internal NVMe, GTX 1650
+4 GB (left idle — on this GPU the CPU path was fastest; see the GPU notes below).
+Decode is warm, greedy; the small models are RAM-resident, the 120B streams.
+
+| Model | experts | attention | Decode | Note |
+|---|---|---|---:|---|
+| gpt-oss-20b | INT4 | F32 | 1.4 tok/s | attention-dominated |
+| **gpt-oss-20b** | INT4 | **INT8** | **3.3 tok/s** | **+136%**; matches/beats Ollama here |
+| Qwen3-30B-A3B | INT4 | F32 | 2.2 tok/s | |
+| **Qwen3-30B-A3B** | INT4 | **INT8** | **2.9 tok/s** | **+32%**, dense resident 4.3 → 1.6 GB |
+| gpt-oss-120b | INT3 | F32 | 0.5 tok/s | streams; prefill ~108 s |
+| **gpt-oss-120b** | INT3 | **INT8** | **1.24 tok/s** | INT8-attn + faster drive; prefill ~60 s |
+
+Why INT8 attention helps so much: attention (Q/K/V/O) is the single largest chunk
+of per-token byte movement, and it was F32. Quantizing it to INT8 (near-lossless)
+roughly halves `t_attn` and frees a few GB of resident RAM. The gain is biggest
+where attention dominates (the 20B), and it also frees RAM for the expert cache.
+The 120B is disk-bound, so its decode also scales with **drive speed** — moving it
+from a slower to a faster internal NVMe roughly doubled it (0.6 → 1.24 tok/s),
+confirming the "faster SSD → higher throughput" scaling on this streaming design.
+
+> **GPU note (GTX 1650 4 GB).** On this small card the GPU paths did **not** help
+> and were left off: `GPU_DENSE`/`GPU_EXPERTS` lose to PCIe overhead on 4 GB, and
+> `GPU_PREFETCH` raised the expert-cache hit rate but the GPU-router overhead
+> exceeded the disk it saved (the async CPU path already hides the I/O), so decode
+> was net slower. On this hardware the real levers are **RAM residency** and
+> **byte reduction (INT8 attention / INT3 experts)**, not the GPU. A larger GPU
+> that fits the model in VRAM is a different regime where the GPU paths do pay off.
+
 ### If it doesn't fit on one drive
 
 You can spread the shards across two disks and pass the ones on the second disk
@@ -737,11 +796,53 @@ needs nothing at all.
 ## 11. How it works & project layout
 
 **The idea in one paragraph:** the dense weights (attention, router, embedding,
-output head) stay resident in RAM. For each token the router picks the top-4 of
-128 experts per layer; Picchio loads just those experts, computing them while an
+output head) stay resident in RAM. For each token the router picks the top-k of
+the layer's experts (4 of 128 on GPT-OSS-120B, 4 of 32 on the 20B, 8 of 128 on
+Qwen3-30B-A3B); Picchio loads just those experts, computing them while an
 LRU cache keeps recently-used experts around and a learned hot-store keeps the
 most frequently used ones pinned. Because only a few experts are touched per
 token, total disk traffic is a fraction of the model size.
+
+### Engine schema
+
+```
+PER-TOKEN FLOW (one decode step)
+================================
+
+ token ─► embed ─►┌──────────────── for each of the N layers ────────────────┐
+                  │                                                            │
+                  │  RMSNorm ─► ATTENTION  (Wq/Wk/Wv/Wo resident, INT8 or F32) │
+                  │             GQA + RoPE, reads/writes the KV cache          │
+                  │                        └─► + residual                      │
+                  │                                                            │
+                  │  RMSNorm ─► ROUTER (resident) ─► top-k expert ids          │
+                  │                     │                                      │
+                  │            ┌────────┴─ expert in RAM LRU cache? ─┐         │
+                  │           HIT                                   MISS       │
+                  │            │                          async read from SSD  │
+                  │            │                          (DIRECT, QD>1,       │
+                  │            │                           overlapped w/ compute)
+                  │            ▼                                   │           │
+                  │   INT4/INT3 dequant + dot  ◄────────────────────┘          │
+                  │   SwiGLU ─► down ─► Σ(weight·expert) ─► + residual         │
+                  └───────────────────────────┬────────────────────────────────┘
+                                               ▼
+                                RMSNorm ─► lm_head (INT8) ─► sample ─► next token
+
+MEMORY HIERARCHY
+================
+  GPU VRAM (optional) │ resident routers + GPU-guided prefetch      small, fast
+  RAM                 │ dense (attn+router+embed+head) + expert LRU  hot experts
+                      │ + learned hot-store (pins frequent experts)
+  SSD / NVMe          │ the remaining "cold" experts (bulk of model) streamed
+```
+
+The dense part is loaded once at startup. Experts are pulled on demand: a cache
+hit stays in RAM; a miss is read from the SSD by parallel I/O threads and
+overlapped with the current layer's compute (`ASYNC_MOE`). Only ~top-k experts
+per layer are touched per token, so disk traffic is a fraction of the model size.
+Everything on the streaming path (INT3/INT4 experts, INT8/F32 attention, INT8
+head) is chosen so the CPU kernels read the fewest bytes that preserve quality.
 
 ### Architecture
 
