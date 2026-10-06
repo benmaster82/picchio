@@ -1,0 +1,94 @@
+name: Hardware report
+description: Report how Picchio builds and runs on your machine — especially non-Intel, non-Windows, or unusual storage.
+title: "[hardware] "
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping widen the hardware coverage.
+
+        **You do not need a real model.** `picchio --self-test` needs no
+        dependencies and nothing downloaded, and on an ARM machine it compiles and
+        runs the NEON kernels for the first time. Filling in only the first two
+        sections below is already a useful report — leave the rest empty.
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: Model name, and the SIMD it supports if you know it (AVX2, AVX-512, AVX-VNNI, NEON, SDOT).
+      placeholder: "Apple M2 Pro (NEON + SDOT) / AMD Ryzen 9 7950X (Zen 4, AVX-512 + VNNI)"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and compiler
+      placeholder: "macOS 15.1, clang 16 / Ubuntu 24.04, gcc 13 / Windows 11, MinGW-w64 13"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: selftest
+    attributes:
+      label: Does `picchio --self-test` pass?
+      options:
+        - "Passes"
+        - "Builds, but the self-test fails"
+        - "Does not build"
+        - "Not tried"
+    validations:
+      required: true
+
+  - type: textarea
+    id: selftest_output
+    attributes:
+      label: Build and self-test output
+      description: Paste the compiler output if it failed to build, and the `--self-test` output. Rendered as a code block, no backticks needed.
+      render: text
+
+  - type: markdown
+    attributes:
+      value: "---\nEverything below is optional — only if you ran a real or synthetic model."
+
+  - type: input
+    id: ram
+    attributes:
+      label: RAM
+      placeholder: "64 GB"
+
+  - type: input
+    id: storage
+    attributes:
+      label: Storage holding the model
+      description: Type and interface matter more than capacity — this is usually the bottleneck.
+      placeholder: "Samsung 990 Pro NVMe PCIe 4.0 / SATA SSD / NFS over 1 GbE"
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and conversion
+      placeholder: "gpt-oss-120b, INT3 experts + INT8 attention / MiniMax-M2, INT4 + INT8"
+
+  - type: input
+    id: flags
+    attributes:
+      label: Flags used
+      placeholder: "--pin-gb 20 --async-moe --direct --io-threads 4"
+
+  - type: textarea
+    id: stats
+    attributes:
+      label: Stats block
+      description: |
+        The block Picchio prints at the end of a run — tok/s, cache hit rate, disk reads,
+        `t_attn` / `t_moe` / `t_head`, RSS. This is the most useful part of the report.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Surprises, crashes, numbers that look wrong, or a family-specific fixture that failed (see section 10 of the README).

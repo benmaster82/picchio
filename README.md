@@ -30,6 +30,20 @@ without a datacenter GPU.
 Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for the
 GPT-OSS architecture.
 
+> [!NOTE]
+> **Contributors welcome — especially if your hardware is not like mine.**
+> Everything here was measured on two Intel/Windows laptops. Whole code paths have
+> therefore never executed on real silicon: the **ARM NEON/SDOT** kernels have never
+> even been *compiled*, and the **AVX-VNNI** integer kernel cannot dispatch on my
+> Comet Lake CPU. Linux and macOS I/O, Zen 4+, Apple Silicon, SATA versus high-end
+> NVMe, larger RAM — all unmeasured.
+>
+> **You do not need to download a 100 GB model to help.** `picchio --self-test`
+> exercises every SIMD kernel against a synthetic model in a few seconds, with no
+> dependencies and nothing to download. See
+> [Help wanted: hardware coverage](#help-wanted-hardware-coverage) for what is
+> missing and how to report it.
+
 ### Measured performance
 
 Warm, greedy decode on a **6-core AVX2 laptop, 16 GB RAM, internal NVMe, GTX 1650
@@ -810,6 +824,51 @@ python test_forward.py test_model    # validates the forward pass against the or
 
 The built-in `picchio --self-test` (section 3) is the quickest sanity check and
 needs nothing at all.
+
+### Exercising each model family without downloading a model
+
+Every supported family has a tiny synthetic fixture, so the whole engine can be
+run end to end on a laptop with no checkpoint at all:
+
+| What | Command | Needs | Covers |
+|---|---|---|---|
+| **All SIMD kernels** | `picchio --self-test` | nothing | RMSNorm, softmax, F32/INT4/INT3 matmul, SiLU, RoPE, async-MoE reduction, pipeline byte-identity. The forward pass it runs is **GPT-OSS-shaped**. |
+| **GPT-OSS path** | `python make_test_model.py` then `picchio test_model` | numpy, safetensors | sliding+full attention, attention sinks, clipped SwiGLU |
+| **Qwen3-MoE path** | `python test_qwen_smoke.py` | torch, transformers | per-head QK-Norm, softmax-normalised routing, **and** the converter, flat store, `DIRECT`/`ASYNC_MOE` and `SERVICE` paths |
+| **MiniMax-M2 path** | `python fuse_minimax_test_model.py minimax_test_model minimax_test_model_picchio` then `picchio minimax_test_model_picchio` | numpy, safetensors | partial RoPE, whole-vector QK-Norm, sigmoid routing |
+
+The MiniMax fixture (`minimax_test_model/`, ~132 KB) is committed because it is not
+safely regenerable — see the note in section 13. The other two are generated
+locally and are gitignored.
+
+Note what `--self-test` does *not* reach: its synthetic model sets the GPT-OSS
+flags, so the Qwen3 and MiniMax branches of the forward pass are only covered by
+their own fixtures above.
+
+### Help wanted: hardware coverage
+
+Picchio's throughput is dominated by RAM size and storage speed, and its hottest
+loops are hand-written SIMD. All published numbers come from two Intel/Windows
+laptops, which leaves real gaps:
+
+| Gap | Status |
+|---|---|
+| **ARM NEON + SDOT** kernels (`quant.h`) | Never compiled, let alone run — Apple Silicon, ARM servers, Raspberry Pi |
+| **AVX-VNNI** integer kernel (`idot_rows_vnni`) | Compiled, but cannot dispatch on my Comet Lake CPU. Needs Intel Ice Lake / Alder Lake+ or AMD Zen 4+ |
+| **Linux / macOS I/O** (`pread`, `mmap`, `O_DIRECT` in `st.h`) | Only the Windows branch has been exercised |
+| **Storage** | One entry-level NVMe. SATA SSD, high-end NVMe, RAID and network storage are unknown |
+| **RAM** | Only 16 GB and 32 GB measured, and the expert-cache hit rate is the single biggest performance lever |
+| **GPU** | The experimental paths were only tried on a 4 GB card |
+
+The lowest-effort contribution is genuinely useful: run `picchio --self-test` on
+anything unusual and report whether it builds and passes. On an ARM machine that
+alone compiles and runs the NEON kernels for the first time.
+
+If you can go further, any real run prints a stats block (tok/s, expert-cache hit
+rate, disk reads, `t_attn` / `t_moe` / `t_head`, RSS) — that, plus your CPU, RAM,
+storage and OS, is exactly what is missing. Please open an
+[issue](https://github.com/benmaster82/picchio/issues/new?template=hardware-report.yml);
+there is a template that asks for these fields.
 
 ---
 
