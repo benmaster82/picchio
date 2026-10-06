@@ -35,7 +35,11 @@
 
 /* ── Constants ── */
 
-#define ST_MAX_TENSORS  32768   /* max tensors per file (GPT-OSS has ~1300/shard × 15) */
+#define ST_MAX_TENSORS  131072  /* max tensors TOTAL across the whole StDB (all shards
+                                    combined, db->n_tensors is one shared counter) — not
+                                    per file despite the array's per-file-ish name. GPT-OSS/
+                                    Qwen3 need ~20k; MiniMax-M2's 256 experts × 62 layers ×
+                                    4 tensors alone is ~63k, so this leaves ~2x headroom. */
 #define ST_MAX_NAME     256    /* max tensor name length */
 #define ST_MAX_FILES    64     /* max open files (shards) */
 

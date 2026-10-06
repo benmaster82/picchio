@@ -38,6 +38,21 @@ import chat_ui as ui
 # ── Terminal UI (mirrors chat.py) ────────────────────────────────────
 # Decoration goes to stderr; stdout carries only the model's text.
 
+def as_id_list(rendered):
+    """Normalise apply_chat_template(tokenize=True) to list[int].
+
+    transformers 4.x returns a plain list; 5.x returns a BatchEncoding, whose
+    len() is the number of keys and whose iteration yields key names — so
+    without this the TURN frame ships the literal text "input_ids
+    attention_mask" and the engine exits on the unparseable ids.
+    """
+    if hasattr(rendered, "keys") and "input_ids" in rendered:
+        rendered = rendered["input_ids"]
+    if rendered and isinstance(rendered[0], (list, tuple)):
+        rendered = rendered[0]          # batch dimension
+    return [int(x) for x in rendered]
+
+
 def _resolve_exe(exe):
     """Resolve exe to an absolute path. Windows' CreateProcess (used by
     subprocess.Popen with an explicit executable) doesn't reliably find a
@@ -153,10 +168,10 @@ class Qwen3Chat:
         kwargs = dict(add_generation_prompt=True, tokenize=True)
         # enable_thinking is honored by Qwen3 templates; guard for older versions.
         try:
-            return self.tok.apply_chat_template(
-                self.messages, enable_thinking=not self.no_reasoning, **kwargs)
+            return as_id_list(self.tok.apply_chat_template(
+                self.messages, enable_thinking=not self.no_reasoning, **kwargs))
         except TypeError:
-            return self.tok.apply_chat_template(self.messages, **kwargs)
+            return as_id_list(self.tok.apply_chat_template(self.messages, **kwargs))
 
     def ask(self, user_text, max_new, temperature=None, live=True):
         self.messages.append({"role": "user", "content": user_text})

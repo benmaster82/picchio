@@ -165,6 +165,15 @@ typedef struct {
     int use_sinks;        /* 1: attention sinks are mandatory (GPT-OSS) */
     int expert_bits;      /* expert quant width: 4 = INT4 gs64 (default), 3 = INT3 gs64 */
     int8_t layer_type[128]; /* per layer: 0=sliding_attention, 1=full_attention */
+    /* MiniMax-M2 additions. */
+    int rotary_dim;        /* RoPE rotates only the first rotary_dim of head_dim;
+                               defaults to head_dim (full rotation, all other archs) */
+    int qk_norm_whole;     /* 1: QK-Norm is ONE RMSNorm over the whole concatenated
+                               multi-head Q (or K) vector (MiniMax); 0: per-head (Qwen3) */
+    int sigmoid_route;     /* 1: sigmoid router scoring; top-k SELECTED using
+                               (sigmoid_score + router_bias), but the mixing weight is
+                               the unbiased sigmoid score, renormalized over the
+                               selected top-k (MiniMax). Overrides router_norm. */
 } Cfg;
 
 /* ═══════════════════════════════════════════════════════════
@@ -187,8 +196,9 @@ typedef struct {
     float *bv;            /* [n_kv_heads * head_dim] */
     float *bo;            /* [D] */
     float *sinks;         /* [n_heads] attention sink logits */
-    float *q_norm;        /* [head_dim] QK-Norm weight for Q (Qwen3); NULL otherwise */
-    float *k_norm;        /* [head_dim] QK-Norm weight for K (Qwen3); NULL otherwise */
+    float *q_norm;        /* [head_dim] per-head (Qwen3) or [n_heads*head_dim] whole-
+                              vector (MiniMax) QK-Norm weight for Q; NULL otherwise */
+    float *k_norm;        /* same, [head_dim] or [n_kv_heads*head_dim], for K */
 
     int layer_type;       /* 0=sliding_attention, 1=full_attention */
 
@@ -513,10 +523,13 @@ static int cfg_load(Cfg *c, const char *model_path) {
     char arch[64];
     json_str(json, "model_type", arch, sizeof(arch), "gpt_oss");
     int is_qwen = (strstr(arch, "qwen") != NULL) || (strstr(arch, "Qwen") != NULL);
-    c->qk_norm        = is_qwen ? 1 : 0;
-    c->swiglu_clipped = is_qwen ? 0 : 1;
-    c->router_norm    = is_qwen ? 1 : 0;
-    c->use_sinks      = is_qwen ? 0 : 1;
+    int is_minimax = (strstr(arch, "minimax") != NULL) || (strstr(arch, "MiniMax") != NULL);
+    c->qk_norm        = (is_qwen || is_minimax) ? 1 : 0;
+    c->qk_norm_whole  = is_minimax ? 1 : 0;
+    c->swiglu_clipped = (is_qwen || is_minimax) ? 0 : 1;
+    c->router_norm    = is_qwen ? 1 : 0;        /* minimax uses sigmoid_route instead */
+    c->sigmoid_route  = is_minimax ? 1 : 0;
+    c->use_sinks      = (is_qwen || is_minimax) ? 0 : 1;
     c->expert_bits    = json_int(json, "picchio_expert_bits", 4);  /* 3 = INT3 gs64 */
 
     c->hidden       = json_int(json, "hidden_size", 2880);
@@ -524,6 +537,11 @@ static int cfg_load(Cfg *c, const char *model_path) {
     c->n_heads      = json_int(json, "num_attention_heads", 64);
     c->n_kv_heads   = json_int(json, "num_key_value_heads", 8);
     c->head_dim     = json_int(json, "head_dim", 64);
+    /* Partial RoPE (MiniMax): only the first rotary_dim of each head rotates;
+     * the rest passes through untouched. Absent in every other arch's config,
+     * so the default of head_dim makes rope_apply/yarn_inv_freq rotate the
+     * whole head exactly as before — a no-op change for GPT-OSS/Qwen3. */
+    c->rotary_dim   = json_int(json, "rotary_dim", c->head_dim);
     c->n_experts    = json_int(json, "num_local_experts",
                                json_int(json, "num_experts", 128));
     c->topk         = json_int(json, "num_experts_per_tok", 4);
@@ -555,6 +573,7 @@ static int cfg_load(Cfg *c, const char *model_path) {
     c->has_shared   = json_int(json, "num_shared_experts", 0) > 0 ? 1 : 0;
     c->n_shared     = json_int(json, "num_shared_experts", 0);
     c->has_attn_bias = json_bool(json, "attention_bias", 1);
+    if (is_minimax) c->has_attn_bias = 0;  /* MiniMax config has no such key; GPTQ linears have no bias */
 
     /* Layer types: alternating sliding/full attention */
     char layer_types[128][64];
@@ -571,8 +590,8 @@ static int cfg_load(Cfg *c, const char *model_path) {
             for (int i = n_types; i < c->n_layers; i++)
                 c->layer_type[i] = c->layer_type[i % n_types];
         }
-    } else if (is_qwen) {
-        /* Qwen3-MoE: every layer is full attention (no sliding window). */
+    } else if (is_qwen || is_minimax) {
+        /* Qwen3-MoE / MiniMax-M2: every layer is full attention (no sliding window). */
         for (int i = 0; i < c->n_layers; i++) c->layer_type[i] = 1;
     } else {
         /* GPT-OSS default: alternate sliding/full */
@@ -582,7 +601,7 @@ static int cfg_load(Cfg *c, const char *model_path) {
 
     /* Stop tokens. GPT-OSS uses the Harmony terminators; Qwen3 uses the ChatML
      * end-of-turn id from config (eos_token_id, typically 151645 <|im_end|>). */
-    if (is_qwen) {
+    if (is_qwen || is_minimax) {
         c->stop_ids[0] = json_int(json, "eos_token_id", 151645);
         c->n_stop = 1;
     } else {
@@ -595,10 +614,10 @@ static int cfg_load(Cfg *c, const char *model_path) {
 
     /* Summary */
     fprintf(stderr, "  model: %s (%s)\n", arch,
-            is_qwen ? "Qwen3-MoE" : "GPT-OSS");
-    fprintf(stderr, "  config: D=%d L=%d H=%d KV=%d hd=%d E=%d top%d\n",
+            is_minimax ? "MiniMax-M2" : is_qwen ? "Qwen3-MoE" : "GPT-OSS");
+    fprintf(stderr, "  config: D=%d L=%d H=%d KV=%d hd=%d rot=%d E=%d top%d\n",
             c->hidden, c->n_layers, c->n_heads, c->n_kv_heads,
-            c->head_dim, c->n_experts, c->topk);
+            c->head_dim, c->rotary_dim, c->n_experts, c->topk);
     fprintf(stderr, "  config: moe_inter=%d vocab=%d ctx=%d sw=%d eps=%.0e\n",
             c->moe_inter, c->vocab, c->ctx_len, c->sliding_window, c->eps);
 
@@ -609,8 +628,17 @@ static int cfg_load(Cfg *c, const char *model_path) {
  *  RoPE (standard, not interleaved)
  * ═══════════════════════════════════════════════════════════ */
 
+/* rotary_dim == head_dim for every arch but MiniMax (partial RoPE). Only
+ * cfg_load() sets it, so configs built by hand (build_synth_model) leave it 0
+ * in their zero-initialised Cfg — fall back to head_dim rather than silently
+ * disabling RoPE, which no self-test could catch since both forward paths
+ * would skip it alike. */
+static inline int cfg_rotary_dim(const Cfg *c) {
+    return c->rotary_dim > 0 ? c->rotary_dim : c->head_dim;
+}
+
 static float yarn_inv_freq(const Cfg *c, int j) {
-    int dim = c->head_dim;
+    int dim = cfg_rotary_dim(c);
     float pos_freq = powf(c->theta, 2.0f * j / dim);
     float extrap = 1.0f / pos_freq;
     if (c->rope_factor <= 1.0f) return extrap;
@@ -635,7 +663,12 @@ static float yarn_inv_freq(const Cfg *c, int j) {
 
 static void rope_apply(float *q, float *k, int pos, int head_dim,
                        int n_q_heads, int n_kv_heads, const Cfg *c) {
-    int half = head_dim / 2;
+    /* Partial RoPE (MiniMax): rotary_dim < head_dim means only the first
+     * rotary_dim channels of each head are touched (half = rotary_dim/2 pairs
+     * them up exactly as the full-head case does for head_dim); channels
+     * [rotary_dim, head_dim) are left untouched since the loop below never
+     * reaches them. rotary_dim == head_dim for every other arch (no-op). */
+    int half = cfg_rotary_dim(c) / 2;
     for (int kind = 0; kind < 2; kind++) {
         float *base = kind == 0 ? q : k;
         int heads = kind == 0 ? n_q_heads : n_kv_heads;
@@ -752,10 +785,17 @@ static void gqa_attention(float *out, const float *x, Layer *l,
         snprintf(n, sizeof(n), "layer%d.v_bias", layer); oracle_dump(n, v, 3, sk);
     }
 
-    /* QK-Norm (Qwen3): RMSNorm over head_dim on every Q and K head, before RoPE. */
+    /* QK-Norm, before RoPE. Qwen3: RMSNorm over head_dim, per head (shared weight).
+     * MiniMax: ONE RMSNorm over the whole concatenated multi-head vector, with a
+     * weight as long as that whole vector (not shared across heads). */
     if (c->qk_norm && l->q_norm && l->k_norm) {
-        rmsnorm_heads(q, l->q_norm, H, hd, c->eps);
-        rmsnorm_heads(k, l->k_norm, KVH, hd, c->eps);
+        if (c->qk_norm_whole) {
+            rmsnorm(q, q, l->q_norm, H * hd, c->eps);
+            rmsnorm(k, k, l->k_norm, KVH * hd, c->eps);
+        } else {
+            rmsnorm_heads(q, l->q_norm, H, hd, c->eps);
+            rmsnorm_heads(k, l->k_norm, KVH, hd, c->eps);
+        }
     }
 
     /* RoPE / YaRN */
@@ -1928,7 +1968,11 @@ static void router_scores_into(Model *m, int layer, const float *x,
                                const Cfg *c, float *scores) {
     int D = c->hidden, E = c->n_experts;
     Layer *l = &m->L[layer];
-    if (g_gpu_router && g_pgpu_router_scores) {
+    /* MiniMax: router_bias is a POST-sigmoid selection-only correction (see
+     * moe_forward/router_weights), not a linear bias folded into the raw
+     * logit — and the GPU router kernel assumes the latter, so skip it here
+     * and always use the CPU reference loop for sigmoid_route. */
+    if (!c->sigmoid_route && g_gpu_router && g_pgpu_router_scores) {
         double t0 = now_s();
         int rc = g_pgpu_router_scores(scores, x, l->router, l->router_bias,
                                       E, D, l->router);
@@ -1937,7 +1981,7 @@ static void router_scores_into(Model *m, int layer, const float *x,
         if (rc == 0) return;
     }
     for (int e = 0; e < E; e++) {
-        float dot = l->router_bias ? l->router_bias[e] : 0.0f;
+        float dot = (l->router_bias && !c->sigmoid_route) ? l->router_bias[e] : 0.0f;
         const float *rw = l->router + (int64_t)e * D;
         for (int i = 0; i < D; i++) dot += x[i] * rw[i];
         scores[e] = dot;
@@ -1973,14 +2017,25 @@ static void predict_topk_into(Model *m, int nl, const float *x,
 }
 
 /* Turn the selected top-k router logits into mixture weights.
- *   scores[]  : full router logits over E (may be overwritten in the Qwen path).
+ *   scores[]  : full router logits over E, UNBIASED raw dot products (may be
+ *               overwritten in the Qwen path). Selection (sel[]) may have used
+ *               a different, biased score (see moe_forward) — scores[] itself
+ *               is never bias-adjusted.
  *   sel[]     : chosen expert ids (top-k).
  *   weights[] : in/out. For GPT-OSS it already holds the top-k raw logits.
  * GPT-OSS: softmax over the top-k logits. Qwen3: softmax over ALL experts, then
- * renormalize the selected top-k probabilities to sum to 1 (norm_topk_prob). */
+ * renormalize the selected top-k probabilities to sum to 1 (norm_topk_prob).
+ * MiniMax: the weight is the UNBIASED sigmoid score of each selected expert
+ * (not softmax — sigmoid scores are independent per expert), renormalized to
+ * sum to 1 over the selected top-k. */
 static void router_weights(const Cfg *c, float *scores, const int *sel,
                            float *weights, int K, int E) {
-    if (c->router_norm) {
+    if (c->sigmoid_route) {
+        float s = 0.0f;
+        for (int k = 0; k < K; k++) { weights[k] = sigmoidf(scores[sel[k]]); s += weights[k]; }
+        if (s < 1e-12f) s = 1e-12f;
+        for (int k = 0; k < K; k++) weights[k] /= s;
+    } else if (c->router_norm) {
         softmax(scores, E);
         float s = 0.0f;
         for (int k = 0; k < K; k++) { weights[k] = scores[sel[k]]; s += weights[k]; }
@@ -1998,9 +2053,23 @@ static void moe_forward(float *out, const float *x, Model *m,
     int D = c->hidden;
     int E = c->n_experts;
     int K = c->topk;
-    /* 1. Router: compute a score for each expert */
+    /* 1. Router: compute a score for each expert (unbiased raw logit) */
     float *scores = falloc(E);
     router_scores_into(m, layer, x, c, scores);
+
+    /* MiniMax: top-k SELECTION uses (sigmoid(logit) + correction_bias), but
+     * scores[] itself stays the unbiased raw logit — router_weights() below
+     * recovers the unbiased sigmoid score from it for the mixing weight. */
+    float *sel_scores = scores;
+    float *sigmoid_biased = NULL;
+    if (c->sigmoid_route) {
+        sigmoid_biased = falloc(E);
+        Layer *ly = &m->L[layer];
+        for (int e = 0; e < E; e++)
+            sigmoid_biased[e] = sigmoidf(scores[e]) +
+                (ly->router_bias ? ly->router_bias[e] : 0.0f);
+        sel_scores = sigmoid_biased;
+    }
 
     /* 2. Top-K selection */
     int sel[64];          /* selected experts */
@@ -2012,11 +2081,12 @@ static void moe_forward(float *out, const float *x, Model *m,
         for (int e = 0; e < E; e++) {
             int already = 0;
             for (int j = 0; j < k; j++) if (sel[j] == e) { already = 1; break; }
-            if (!already && scores[e] > best_s) { best_s = scores[e]; best = e; }
+            if (!already && sel_scores[e] > best_s) { best_s = sel_scores[e]; best = e; }
         }
         sel[k] = best;
         weights[k] = best_s;
     }
+    free(sigmoid_biased);
 
     /* SPEC_PROBE: record this decode token's routing (top-k experts per layer).
      * moe_forward runs only in single-token decode (prefill uses its own batched
@@ -2253,9 +2323,10 @@ static void moe_forward(float *out, const float *x, Model *m,
         if (es->d_bias) {
             for (int i = 0; i < D; i++) expert_out[i] += es->d_bias[i];
         }
-        if (g_trace_numeric && layer == 0) {
-            char stage[64]; snprintf(stage, sizeof(stage), "expert%d_output", sel[k]);
+        if (g_trace_numeric) {
+            char stage[64]; snprintf(stage, sizeof(stage), "expert_apply%d_output", sel[k]);
             trace_vector(stage, layer, expert_out, D);
+            fprintf(stderr, "  numeric expert_apply w=%.7g\n", weights[k] * c->routed_scale);
         }
         if (g_oracle_dir) {
             char n[128]; snprintf(n, sizeof(n), "layer%d.expert%d.output", layer, k);
@@ -2935,6 +3006,11 @@ static void expert_apply(ESlot *es, const float *x, float *dst, float w,
 
     matmul_qt(eo, gu, &es->d, 1);
     if (es->d_bias) for (int i = 0; i < D; i++) eo[i] += es->d_bias[i];
+    if (g_trace_numeric) {
+        char stage[64]; snprintf(stage, sizeof(stage), "expert_apply%d_output", es->eid);
+        trace_vector(stage, es->layer, eo, D);
+        fprintf(stderr, "  numeric expert_apply w=%.7g\n", w);
+    }
     for (int i = 0; i < D; i++) dst[i] += w * eo[i];
 
     free(gu); free(eo);
@@ -2958,6 +3034,7 @@ static void run_prefill_range(Model *m, float *H, int n, int pos_base,
     int *sel_all = (int *)malloc((size_t)n * K * sizeof(int));
     float *w_all = (float *)malloc((size_t)n * K * sizeof(float));
     float *scores = falloc(E);
+    float *sel_scores_buf = c->sigmoid_route ? falloc(E) : NULL;
     int *uniq = (int *)malloc((size_t)E * sizeof(int));
     unsigned char *seen = (unsigned char *)malloc((size_t)E);
     if (!XN || !sel_all || !w_all || !uniq || !seen) {
@@ -2988,10 +3065,19 @@ static void run_prefill_range(Model *m, float *H, int n, int pos_base,
             rmsnorm(xn, h, ly->post_ln, D, c->eps);
 
             for (int e = 0; e < E; e++) {
-                float dot = ly->router_bias ? ly->router_bias[e] : 0.0f;
+                float dot = (ly->router_bias && !c->sigmoid_route) ? ly->router_bias[e] : 0.0f;
                 const float *rw = ly->router + (int64_t)e * D;
                 for (int i = 0; i < D; i++) dot += xn[i] * rw[i];
                 scores[e] = dot;
+            }
+            /* MiniMax: select on (sigmoid(logit) + correction_bias); scores[]
+             * stays the unbiased raw logit for router_weights() below. */
+            float *sel_scores = scores;
+            if (c->sigmoid_route) {
+                for (int e = 0; e < E; e++)
+                    sel_scores_buf[e] = sigmoidf(scores[e]) +
+                        (ly->router_bias ? ly->router_bias[e] : 0.0f);
+                sel_scores = sel_scores_buf;
             }
             int *sel = sel_all + (size_t)p * K;
             float *wgt = w_all + (size_t)p * K;
@@ -3000,11 +3086,17 @@ static void run_prefill_range(Model *m, float *H, int n, int pos_base,
                 for (int e = 0; e < E; e++) {
                     int already = 0;
                     for (int j = 0; j < k; j++) if (sel[j] == e) { already = 1; break; }
-                    if (!already && scores[e] > best_s) { best_s = scores[e]; best = e; }
+                    if (!already && sel_scores[e] > best_s) { best_s = sel_scores[e]; best = e; }
                 }
                 sel[k] = best; wgt[k] = best_s;
             }
             router_weights(c, scores, sel, wgt, K, E);
+            if (g_trace_numeric) {
+                fprintf(stderr, "  numeric route(prefill) L=%d p=%d:", l, p);
+                for (int k = 0; k < K; k++)
+                    fprintf(stderr, " e%d=%.7g", sel[k], wgt[k]);
+                fprintf(stderr, "\n");
+            }
             for (int k = 0; k < K; k++) {
                 if (m->eusage[l]) m->eusage[l][sel[k]]++;
                 if (m->eheat[l]) m->eheat[l][sel[k]]++;
@@ -3071,7 +3163,7 @@ static void run_prefill_range(Model *m, float *H, int n, int pos_base,
     }
 
     free(XN); free(hn); free(attn_out); free(sel_all); free(w_all);
-    free(scores); free(uniq); free(seen);
+    free(scores); free(sel_scores_buf); free(uniq); free(seen);
 }
 
 static int forward_prefill(Model *m, const int *ids, int n, int pos_base) {
@@ -3401,6 +3493,7 @@ static void build_synth_model(Model *m) {
     c->n_heads = 4;
     c->n_kv_heads = 2;
     c->head_dim = 16;  /* 64 / 4 */
+    c->rotary_dim = 16;  /* full-head rotation, like every arch except MiniMax */
     c->n_experts = 4;
     c->topk = 2;
     c->moe_inter = 128;  /* 2 * D */
@@ -3996,17 +4089,21 @@ static int load_dense_weights(Model *m, StDB *db) {
             loaded += (H*hd + KVH*hd + KVH*hd + D) * 4;
         }
 
-        /* QK-Norm weights (Qwen3): one [head_dim] vector shared across heads. */
+        /* QK-Norm weights. Qwen3: one [head_dim] vector shared across heads.
+         * MiniMax: one vector as long as the whole concatenated multi-head
+         * Q (or K) buffer — [n_heads*head_dim] / [n_kv_heads*head_dim]. */
         if (c->qk_norm) {
+            int qn_len = c->qk_norm_whole ? H * hd : hd;
+            int kn_len = c->qk_norm_whole ? KVH * hd : hd;
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
-            ly->q_norm = load_f32_tensor(db, name, hd);
+            ly->q_norm = load_f32_tensor(db, name, qn_len);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
-            ly->k_norm = load_f32_tensor(db, name, hd);
+            ly->k_norm = load_f32_tensor(db, name, kn_len);
             if (!ly->q_norm || !ly->k_norm) {
                 fprintf(stderr, "  error: QK-Norm weights missing at layer %d\n", l);
                 return -1;
             }
-            loaded += 2 * hd * 4;
+            loaded += (qn_len + kn_len) * 4;
         }
 
         /* Attention sink logits (one per query head). Mandatory for GPT-OSS,
@@ -4037,6 +4134,13 @@ static int load_dense_weights(Model *m, StDB *db) {
         }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.router.bias", l);
         ly->router_bias = load_f32_tensor(db, name, c->n_experts);  /* GPT-OSS only */
+        if (!ly->router_bias) {
+            /* MiniMax: sigmoid-routing correction bias (selection only, see
+             * sigmoid_route in router_weights/moe_forward). */
+            snprintf(name, sizeof(name),
+                     "model.layers.%d.block_sparse_moe.e_score_correction_bias", l);
+            ly->router_bias = load_f32_tensor(db, name, c->n_experts);
+        }
         g_quiet_missing = 0;
         if (!ly->router) {
             fprintf(stderr, "  error: router weights missing at layer %d\n", l);
@@ -5004,8 +5108,8 @@ static void spec_decode(Model *tgt, int *prompt, int n_prompt, int max_tokens,
 
 int main(int argc, char **argv) {
     { const char *v = getenv("EXPERT_REUSE"); if (v) g_expert_reuse = atoi(v) != 0; }
-    fprintf(stderr, "🪶 picchio v0.7.0 — MoE streaming engine\n");
-    fprintf(stderr, "   GPT-OSS/Qwen3-MoE · INT3/INT4 · native CPU/GPU streaming\n\n");
+    fprintf(stderr, "🪶 picchio v0.8.0 — MoE streaming engine\n");
+    fprintf(stderr, "   GPT-OSS/Qwen3-MoE/MiniMax-M2 · INT3/INT4 · native CPU/GPU streaming\n\n");
 
     /* ── Self-test mode ── */
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
