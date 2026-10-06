@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS 20B/120B · Qwen3-MoE · int4 · streaming CPU" width="560">
+  <img src="assets/picchio.svg" alt="picchio · it drums the model off the disk · GPT-OSS 20B/120B · Qwen3-MoE · MiniMax-M2 · int4 · streaming CPU" width="560">
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/gpt--oss--20b-3.3_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-20b: 3.3 tok/s">
   <img src="https://img.shields.io/badge/Qwen3--30B--A3B-2.9_tok%2Fs-2ea44f?style=flat-square" alt="Qwen3-30B-A3B: 2.9 tok/s">
   <img src="https://img.shields.io/badge/gpt--oss--120b-1.24_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-120b: 1.24 tok/s">
+  <img src="https://img.shields.io/badge/MiniMax--M2-0.48_tok%2Fs-2ea44f?style=flat-square" alt="MiniMax-M2: 0.48 tok/s">
   <br>
   <img src="https://img.shields.io/badge/language-pure_C-00599C?style=flat-square" alt="pure C">
   <img src="https://img.shields.io/badge/runs-larger_than_RAM-blue?style=flat-square" alt="runs models larger than RAM">
@@ -15,9 +16,9 @@
 > *The woodpecker drums a hundred times a second on a huge trunk;
 > we drum 128 experts on a huge disk.*
 
-**A streaming Mixture-of-Experts (MoE) inference engine for the GPT-OSS models
-(20B and 120B), written in pure C, that runs models larger than your RAM on
-ordinary consumer hardware.**
+**A streaming Mixture-of-Experts (MoE) inference engine written in pure C, that
+runs models larger than your RAM on ordinary consumer hardware — GPT-OSS (20B and
+120B), Qwen3-MoE, and MiniMax-M2 (230 B).**
 
 Most of a MoE model's weight is in its *experts*, and only a handful of experts
 are used for each token. Picchio keeps only the small "dense" part of the model
@@ -41,6 +42,13 @@ near-losslessly roughly halves it and frees RAM for the expert cache.
 | **gpt-oss-20b** | ~14 GB | 1.4 tok/s | **3.3 tok/s** | **+136%** — matches/beats Ollama here |
 | **Qwen3-30B-A3B** | ~20 GB | 2.2 tok/s | **2.9 tok/s** | **+32%**, dense resident 4.3 → 1.6 GB |
 | **gpt-oss-120b** | ~66 GB | 0.5 tok/s | **1.24 tok/s** | streamed from disk; prefill ~60 s |
+| **MiniMax-M2** † | ~122 GB | — | **0.48 tok/s** | 230 B / ~10 B active; fully disk-bound |
+
+† MiniMax-M2 does not fit the 16 GB machine above at all, so it was measured on a
+**12-core AVX2 laptop, 32 GB RAM, entry-level NVMe**, with
+`--pin-gb 20 --async-moe --direct`. Its number is therefore **not comparable**
+with the three rows above it. Breakdown, including what did *not* help, is in
+[Measured performance (MiniMax-M2)](#measured-performance-minimax-m2).
 
 The 120B — **66 GB of weights on a 16 GB machine** — runs at over a token per
 second by streaming its experts. Full methodology, a cold-start worst case, and the
