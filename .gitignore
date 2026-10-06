@@ -33,6 +33,7 @@ gptoss120b_meta/
 *.tmp
 __pycache__/
 do.sh
+convert_minimax_retry.sh
 .qwen_smoke_tmp/
 
 # Hot-store (generated at runtime)
@@ -54,3 +55,10 @@ dev/
 *.picchioflat
 test_model_i3/
 test_model_i4/
+
+# MiniMax-M2: minimax_test_model/ and its Picchio-named twin are deliberately
+# NOT ignored (~250 KB). Unlike test_model/, they are not reliably regenerable:
+# the oracle is only correct on transformers < 5.0 (see the version guard in
+# make_minimax_test_model.py), so the committed copy IS the reference.
+minimax_test_model_deep/
+minimax_test_model_deep_picchio/
