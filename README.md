@@ -17,7 +17,7 @@
 > we drum 128 experts on a huge disk.*
 
 **A streaming Mixture-of-Experts (MoE) inference engine written in pure C, that
-runs models larger than your RAM on ordinary consumer hardware — GPT-OSS (20B and
+runs models larger than your RAM on ordinary consumer hardware - GPT-OSS (20B and
 120B), Qwen3-MoE, and MiniMax-M2 (230 B).**
 
 Most of a MoE model's weight is in its *experts*, and only a handful of experts
