@@ -31,12 +31,12 @@ Inspired by [Colibri](https://github.com/JustVugg/colibri) (GLM), adapted for th
 GPT-OSS architecture.
 
 > [!NOTE]
-> **Contributors welcome — especially if your hardware is not like mine.**
+> **Contributors welcome - especially if your hardware is not like mine.**
 > Everything here was measured on two Intel/Windows laptops. Whole code paths have
 > therefore never executed on real silicon: the **ARM NEON/SDOT** kernels have never
 > even been *compiled*, and the **AVX-VNNI** integer kernel cannot dispatch on my
 > Comet Lake CPU. Linux and macOS I/O, Zen 4+, Apple Silicon, SATA versus high-end
-> NVMe, larger RAM — all unmeasured.
+> NVMe, larger RAM - all unmeasured.
 >
 > **You do not need to download a 100 GB model to help.** `picchio --self-test`
 > exercises every SIMD kernel against a synthetic model in a few seconds, with no
@@ -47,16 +47,16 @@ GPT-OSS architecture.
 ### Measured performance
 
 Warm, greedy decode on a **6-core AVX2 laptop, 16 GB RAM, internal NVMe, GTX 1650
-4 GB (idle)** — no datacenter GPU. The lever is **INT8 attention** (`--dense-bits 8`):
+4 GB (idle)** - no datacenter GPU. The lever is **INT8 attention** (`--dense-bits 8`):
 attention was the largest chunk of per-token byte movement, and quantizing it
 near-losslessly roughly halves it and frees RAM for the expert cache.
 
 | Model | Converted size | F32 attention | **INT8 attention** | |
 |---|---|---:|---:|---|
-| **gpt-oss-20b** | ~14 GB | 1.4 tok/s | **3.3 tok/s** | **+136%** — matches/beats Ollama here |
+| **gpt-oss-20b** | ~14 GB | 1.4 tok/s | **3.3 tok/s** | **+136%** - matches/beats Ollama here |
 | **Qwen3-30B-A3B** | ~20 GB | 2.2 tok/s | **2.9 tok/s** | **+32%**, dense resident 4.3 → 1.6 GB |
 | **gpt-oss-120b** | ~66 GB | 0.5 tok/s | **1.24 tok/s** | streamed from disk; prefill ~60 s |
-| **MiniMax-M2** † | ~122 GB | — | **0.48 tok/s** | 230 B / ~10 B active; fully disk-bound |
+| **MiniMax-M2** † | ~122 GB | - | **0.48 tok/s** | 230 B / ~10 B active; fully disk-bound |
 
 † MiniMax-M2 does not fit the 16 GB machine above at all, so it was measured on a
 **12-core AVX2 laptop, 32 GB RAM, entry-level NVMe**, with
@@ -64,7 +64,7 @@ near-losslessly roughly halves it and frees RAM for the expert cache.
 with the three rows above it. Breakdown, including what did *not* help, is in
 [Measured performance (MiniMax-M2)](#measured-performance-minimax-m2).
 
-The 120B — **66 GB of weights on a 16 GB machine** — runs at over a token per
+The 120B - **66 GB of weights on a 16 GB machine** - runs at over a token per
 second by streaming its experts. Full methodology, a cold-start worst case, and the
 GPU analysis are in [Measured performance](#measured-performance-a-deliberate-worst-case).
 
@@ -90,7 +90,7 @@ MiniMax-M2 is gated the same way, on three quirks of its own: **partial RoPE**
 QK-Norm** (one RMSNorm across the entire concatenated multi-head Q or K, not per
 head), and **sigmoid routing** where the correction bias selects the top-k but
 the mixing weight is the *unbiased* sigmoid score, renormalized. It is by far the
-largest model here — 122 GB converted, so it streams from disk on any consumer
+largest model here - 122 GB converted, so it streams from disk on any consumer
 machine. See [Running a MiniMax-M2 model](#13-running-a-minimax-m2-model).
 
 The converter and complete runtime path are covered by both a synthetic Qwen3-MoE
@@ -310,7 +310,7 @@ This downloads several GB and writes a converted model of about **14 GB** to the
 output folder. It only needs to be done once.
 
 > **Smaller experts (`--expert-bits 3`).** By default experts are INT4 (gs64).
-> Adding `--expert-bits 3` packs them at INT3 gs64 instead — about **22% fewer
+> Adding `--expert-bits 3` packs them at INT3 gs64 instead - about **22% fewer
 > expert bytes on disk and in RAM** (~26% on the experts, ~16% on the whole
 > model), at a small quality cost. The INT3 matmul is AVX2-vectorized (the
 > bit-plane layout is chosen for SIMD), so the smaller experts can actually run
@@ -325,12 +325,12 @@ output folder. It only needs to be done once.
 > python transcode_i4_to_i3.py --input C:\models\gptoss20b_i8h --output C:\models\gptoss20b_i3
 > ```
 > It dequantizes each INT4 expert and repacks it as INT3 (INT8 head, F32
-> attention, etc. copied unchanged), writing a marked container — no download.
+> attention, etc. copied unchanged), writing a marked container - no download.
 > Slightly lower quality than converting from the original (INT4→INT3 compounds a
 > little error), but validated to keep answers correct on a real 20B.
 
 > **Faster attention (`--dense-bits 8`).** By default attention (Q/K/V/O) is kept
-> F32. Adding `--dense-bits 8` stores it as INT8 (per-row scales) — near-lossless,
+> F32. Adding `--dense-bits 8` stores it as INT8 (per-row scales) - near-lossless,
 > ~4× fewer attention bytes. Attention is the single largest chunk of per-token
 > byte movement, so this is the **biggest measured speedup lever**: **+32% decode
 > on Qwen3-30B-A3B, +~130% on gpt-oss-20b** (where attention dominates), plus a few
@@ -339,7 +339,7 @@ output folder. It only needs to be done once.
 > (validated on 30B and 120B). Combine with `--expert-bits 3/4` freely.
 >
 > **No re-download: transcode attention to INT8.** Retrofit an existing converted
-> model with [`transcode_attn_to_int8.py`](transcode_attn_to_int8.py) — it
+> model with [`transcode_attn_to_int8.py`](transcode_attn_to_int8.py) - it
 > requantizes only the attention weights (experts copied unchanged), no download:
 > ```powershell
 > python transcode_attn_to_int8.py --input C:\models\gptoss20b_i4 --output C:\models\gptoss20b_i4d8
@@ -431,7 +431,7 @@ summary, live generation status, and per-response performance metrics.
 |---|---|
 | `--temperature 0.7` | Randomness. **Use ~0.7 for normal conversation.** The default `0` (greedy) is deterministic but can make the model loop in its "thinking" channel without answering. |
 | `--max-tokens 200` | Maximum length of the reply. |
-| `--no-reasoning` | Skip the internal "analysis" (chain-of-thought) and answer directly. Faster, but **can degrade multi-turn chats on large models** (see Troubleshooting) — prefer `--reasoning low` if answers deteriorate after a few turns. |
+| `--no-reasoning` | Skip the internal "analysis" (chain-of-thought) and answer directly. Faster, but **can degrade multi-turn chats on large models** (see Troubleshooting) - prefer `--reasoning low` if answers deteriorate after a few turns. |
 | `--show-analysis` | Deprecated: the reasoning is now always streamed live (dimmed, under a `thinking ❯` header) next to the answer. |
 | `--top-p`, `--top-k`, `--seed` | Standard sampling controls. |
 | `--async-moe --direct` | Experimental decode pipeline: overlap unbuffered expert reads with CPU expert compute. Tune read concurrency with `--io-threads` (start from `4`). |
@@ -645,7 +645,7 @@ interactive chat. If you want responsiveness, run the 20B.
 
 A second, more representative sweep on **internal NVMe** with **INT8 attention**
 (`--dense-bits 8`). Machine: 6-core AVX2 CPU, 16 GB RAM, internal NVMe, GTX 1650
-4 GB (left idle — on this GPU the CPU path was fastest; see the GPU notes below).
+4 GB (left idle - on this GPU the CPU path was fastest; see the GPU notes below).
 Decode is warm, greedy; the small models are RAM-resident, the 120B streams.
 
 | Model | experts | attention | Decode | Note |
@@ -661,7 +661,7 @@ Why INT8 attention helps so much: attention (Q/K/V/O) is the single largest chun
 of per-token byte movement, and it was F32. Quantizing it to INT8 (near-lossless)
 roughly halves `t_attn` and frees a few GB of resident RAM. The gain is biggest
 where attention dominates (the 20B), and it also frees RAM for the expert cache.
-The 120B is disk-bound, so its decode also scales with **drive speed** — moving it
+The 120B is disk-bound, so its decode also scales with **drive speed** - moving it
 from a slower to a faster internal NVMe roughly doubled it (0.6 → 1.24 tok/s),
 confirming the "faster SSD → higher throughput" scaling on this streaming design.
 
@@ -723,7 +723,7 @@ flags map onto these). The most useful:
 | `IDOT` | `0` | `1` = integer expert kernel (int8 activation × int4 weight). Uses AVX-VNNI (`dpbusd`) where the CPU supports it, else AVX2; a small approximation, so off by default. |
 | `DROP` | `0` | `1` = drop just-read pages from the OS page cache after each read (Linux), keeping peak RAM at "dense + cache" when streaming a model larger than RAM. |
 | `DIRECT` | `0` | `1` = unbuffered expert reads (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`), bypassing the OS page cache. A win on fast internal NVMe where the buffered path is page-cache-bound; little effect on a USB bridge. Opt-in, with a buffered fallback per read. |
-| `ECAP` | auto | Expert cache slots **per layer** (override of the auto-sizing derived from `PIN_GB`). Set `= num_experts` to keep the whole expert tier resident once the model fits in RAM (e.g. `ECAP=32` for a 20B) — after a warm-up pass no expert is streamed again. |
+| `ECAP` | auto | Expert cache slots **per layer** (override of the auto-sizing derived from `PIN_GB`). Set `= num_experts` to keep the whole expert tier resident once the model fits in RAM (e.g. `ECAP=32` for a 20B) - after a warm-up pass no expert is streamed again. |
 | `DRAFT_MODEL` | (none) | Path to a small **draft model** for speculative decoding (bare-metal path). The draft is a tiny dense model converted as a 1-expert MoE (see `convert.py` on a dense checkpoint) and is loaded fully resident. Experimental. |
 | `SPEC_K` | `4` | Draft tokens proposed per verify round when `DRAFT_MODEL` is set. |
 | `SPEC_PROBE` | `0` | Diagnostic (no effect on generation): records per-token expert routing + token stream, then reports n-gram acceptance and expert-union at exit. |
@@ -735,7 +735,7 @@ flags map onto these). The most useful:
 > output is byte-identical to greedy. It **wins only when the target is
 > memory-resident** (so batching amortizes RAM/compute) **and the draft has high
 > acceptance**. On a disk-bound target where `ASYNC_MOE` already hides the I/O, the
-> batched verify's expert-union I/O is exposed and speculation is a net loss —
+> batched verify's expert-union I/O is exposed and speculation is a net loss -
 > measured on this hardware. Kept as scaffolding for larger-RAM / GPU setups.
 
 Performance notes:
@@ -838,7 +838,7 @@ run end to end on a laptop with no checkpoint at all:
 | **MiniMax-M2 path** | `python fuse_minimax_test_model.py minimax_test_model minimax_test_model_picchio` then `picchio minimax_test_model_picchio` | numpy, safetensors | partial RoPE, whole-vector QK-Norm, sigmoid routing |
 
 The MiniMax fixture (`minimax_test_model/`, ~132 KB) is committed because it is not
-safely regenerable — see the note in section 13. The other two are generated
+safely regenerable - see the note in section 13. The other two are generated
 locally and are gitignored.
 
 Note what `--self-test` does *not* reach: its synthetic model sets the GPT-OSS
@@ -853,7 +853,7 @@ laptops, which leaves real gaps:
 
 | Gap | Status |
 |---|---|
-| **ARM NEON + SDOT** kernels (`quant.h`) | Never compiled, let alone run — Apple Silicon, ARM servers, Raspberry Pi |
+| **ARM NEON + SDOT** kernels (`quant.h`) | Never compiled, let alone run - Apple Silicon, ARM servers, Raspberry Pi |
 | **AVX-VNNI** integer kernel (`idot_rows_vnni`) | Compiled, but cannot dispatch on my Comet Lake CPU. Needs Intel Ice Lake / Alder Lake+ or AMD Zen 4+ |
 | **Linux / macOS I/O** (`pread`, `mmap`, `O_DIRECT` in `st.h`) | Only the Windows branch has been exercised |
 | **Storage** | One entry-level NVMe. SATA SSD, high-end NVMe, RAID and network storage are unknown |
@@ -865,7 +865,7 @@ anything unusual and report whether it builds and passes. On an ARM machine that
 alone compiles and runs the NEON kernels for the first time.
 
 If you can go further, any real run prints a stats block (tok/s, expert-cache hit
-rate, disk reads, `t_attn` / `t_moe` / `t_head`, RSS) — that, plus your CPU, RAM,
+rate, disk reads, `t_attn` / `t_moe` / `t_head`, RSS) - that, plus your CPU, RAM,
 storage and OS, is exactly what is missing. Please open an
 [issue](https://github.com/benmaster82/picchio/issues/new?template=hardware-report.yml);
 there is a template that asks for these fields.
@@ -938,15 +938,15 @@ head) is chosen so the CPU kernels read the fewest bytes that preserve quality.
 | Activation | clipped SwiGLU | clipped SwiGLU | plain SwiGLU (SiLU) | plain SwiGLU (SiLU) |
 | Converted size | ~14 GB | ~66 GB | ~20 GB | ~122 GB |
 
-Quantization (all families): experts are INT4 (group-scaled, 64) — or INT3 gs64
+Quantization (all families): experts are INT4 (group-scaled, 64) - or INT3 gs64
 with `--expert-bits 3`, which `convert_minimax.py` does not yet offer; the embedding
 and output head are INT8; attention is F32 by default, or **INT8 with
-`--dense-bits 8`** (near-lossless, the biggest speedup lever — see section 4). The
+`--dense-bits 8`** (near-lossless, the biggest speedup lever - see section 4). The
 engine reads every dimension from `config.json` and flips the family-specific
 behaviors from the model's `model_type`, so the GPT-OSS path is byte-for-byte
 unchanged. A dense (non-MoE) checkpoint is converted as a 1-expert MoE
-(single MLP as expert 0 + a zero router), so the streaming engine runs it unchanged
-— handy for a small resident draft model.
+(single MLP as expert 0 + a zero router), so the streaming engine runs it
+unchanged, which is handy for a small resident draft model.
 
 ### Files in this repository
 
@@ -1092,7 +1092,7 @@ comparison against `transformers` and a long multi-turn session remain pending.
 [MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) is a 230 B-parameter MoE
 that activates only ~10 B per token across 62 layers of 256 experts. Converted it
 is **~122 GB**, so unlike the other families it does not fit in RAM on any consumer
-machine — it streams from disk end to end. Expect it to be I/O-bound.
+machine - it streams from disk end to end. Expect it to be I/O-bound.
 
 ### a) Install the dependencies
 
@@ -1113,8 +1113,8 @@ hf download ModelCloud/MiniMax-M2-GPTQMODEL-W4A16 --local-dir D:\models\MiniMax-
 
 That is a **126 GB** download. `HF_HUB_DISABLE_XET=1` and a bounded
 `--max-workers` are there on purpose: the accelerated Xet path opened dozens of
-concurrent connections and stalled on the test machine. The download is resumable
-— rerun the same command after an interruption.
+concurrent connections and stalled on the test machine. The download is
+resumable: rerun the same command after an interruption.
 
 ### c) Convert
 
@@ -1125,15 +1125,15 @@ python convert_minimax.py --input D:\models\MiniMax-M2-GPTQ-INT4 --output D:\mod
 
 It dequantizes each GPTQ linear, fuses the gate/up expert matrices, and requantizes
 to Picchio's native INT4 gs64. On start it prints the checkpoint's zero-point
-offset, e.g. `GPTQ checkpoint zero-point offset: +1 (v1 'gptq' format)` — that line
+offset, e.g. `GPTQ checkpoint zero-point offset: +1 (v1 'gptq' format)` - that line
 matters (see [What differs under the hood](#what-differs-under-the-hood-1)).
 
 Add `--delete-source` to remove each source shard right after it is read, which
 keeps peak disk use near the size of one copy instead of two. It is **destructive**:
 the original checkpoint is gone afterwards, so a reconversion means re-downloading.
 
-The converter copies the metadata the runtime and the bridge need — `config.json`,
-the tokenizer files, `chat_template.jinja` — so the output directory is
+The converter copies the metadata the runtime and the bridge need - `config.json`,
+the tokenizer files, `chat_template.jinja` - so the output directory is
 self-contained. One step is left, building the binary vocabulary:
 
 ```powershell
@@ -1163,7 +1163,7 @@ limit lands mid-reasoning the bridge says so rather than printing nothing.
 
 ### Measured performance (MiniMax-M2)
 
-On a **12-core AVX2 laptop, 32 GB RAM, D: on an entry-level NVMe (KIOXIA BG4)** —
+On a **12-core AVX2 laptop, 32 GB RAM, D: on an entry-level NVMe (KIOXIA BG4)** -
 a different, larger machine than the 16 GB laptop used for the table at the top of
 this README, so these numbers are not comparable with those:
 
@@ -1175,7 +1175,7 @@ this README, so these numbers are not comparable with those:
 
 `--pin-gb` is the dominant lever here, because the experts total ~119 GB and even
 a 20 GB cache holds only ~17% of them while each token touches 496 of them across
-62 layers. Raising `--io-threads` past the default 4 changed nothing — the NVMe is
+62 layers. Raising `--io-threads` past the default 4 changed nothing - the NVMe is
 not queue-depth limited. `IDOT=1` bought ~5% but visibly changed the output, which
 is expected (the integer expert kernel is approximate) and not a good trade.
 
@@ -1202,7 +1202,7 @@ opposed to `"gptq_v2"`) stores its zero-points **pre-decremented by 1**; GPTQMod
 adds them back at load time. Dequantizing without that `+1` biases every weight by
 exactly `+1 × scale`. Per weight that is only ~30% of the weight standard deviation
 and looks harmless, but across a matmul it adds `c·Σx` to every output, and since
-`x` leaves an RMSNorm with positive gains that sum is large and positive — so every
+`x` leaves an RMSNorm with positive gains that sum is large and positive - so every
 projection picks up a positive bias, RMSNorm never recenters it, and over 62 layers
 the hidden state explodes into noise. The symptom is fluent-looking garbage.
 `convert_minimax.py` reads `checkpoint_format` and refuses to guess. A cheap guard
