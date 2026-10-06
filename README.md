@@ -48,20 +48,28 @@ GPU analysis are in [Measured performance](#measured-performance-a-deliberate-wo
 
 ### Supported models
 
-The same streaming core serves two MoE families. The engine reads every dimension
+The same streaming core serves three MoE families. The engine reads every dimension
 from `config.json` and flips the family-specific behaviors from the model's
-`model_type`, so adding the second family left the GPT-OSS path byte-for-byte
-unchanged.
+`model_type`, so each new family left the earlier paths byte-for-byte unchanged.
 
 | Family | Models | Converted size | Chat bridge |
 |---|---|---|---|
 | **GPT-OSS** | `gpt-oss-20b`, `gpt-oss-120b` | ~14 GB / ~66 GB | [`chat.py`](chat.py) (Harmony) |
 | **Qwen3-MoE** | e.g. `Qwen3-30B-A3B` | ~20 GB | [`chat_qwen.py`](chat_qwen.py) (ChatML) |
+| **MiniMax-M2** | `MiniMax-M2` (230B / 10B active) | ~122 GB | [`chat_minimax.py`](chat_minimax.py) |
 
 The Qwen3 support is config-gated: QK-Norm, plain SwiGLU, softmax-normalized
 top-k routing, and full attention (no sinks, no sliding window) are switched on
 only for Qwen checkpoints. See [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
 and [`PORTING_QWEN3.md`](PORTING_QWEN3.md).
+
+MiniMax-M2 is gated the same way, on three quirks of its own: **partial RoPE**
+(only the first `rotary_dim`=64 of each 128-wide head rotates), **whole-vector
+QK-Norm** (one RMSNorm across the entire concatenated multi-head Q or K, not per
+head), and **sigmoid routing** where the correction bias selects the top-k but
+the mixing weight is the *unbiased* sigmoid score, renormalized. It is by far the
+largest model here — 122 GB converted, so it streams from disk on any consumer
+machine. See [Running a MiniMax-M2 model](#13-running-a-minimax-m2-model).
 
 The converter and complete runtime path are covered by both a synthetic Qwen3-MoE
 smoke test and a short end-to-end run on a converted Qwen3-30B-A3B checkpoint.
@@ -72,7 +80,7 @@ the original full-precision model, not basic loading, generation, or ChatML chat
 its assigned dense layers and KV state, although both currently still need the
 converted model files on local disk. Only the small residual-stream vector crosses
 the network, and the output is byte-identical to a single node. See
-[Distributed inference across two machines](#13-distributed-inference-across-two-machines).
+[Distributed inference across two machines](#14-distributed-inference-across-two-machines).
 
 > **New to this?** Read the sections in order. Every command below is complete:
 > nothing is assumed. Windows commands are shown for **PowerShell**; Linux/macOS
@@ -94,8 +102,9 @@ the network, and the output is byte-identical to a single node. See
 10. [Verifying correctness (optional)](#10-verifying-correctness-optional)
 11. [How it works & project layout](#11-how-it-works--project-layout)
 12. [Running a Qwen3-MoE model](#12-running-a-qwen3-moe-model)
-13. [Distributed inference across two machines](#13-distributed-inference-across-two-machines)
-14. [License](#14-license)
+13. [Running a MiniMax-M2 model](#13-running-a-minimax-m2-model)
+14. [Distributed inference across two machines](#14-distributed-inference-across-two-machines)
+15. [License](#15-license)
 
 ---
 
@@ -848,24 +857,26 @@ head) is chosen so the CPU kernels read the fewest bytes that preserve quality.
 
 ### Architecture
 
-| Property | GPT-OSS 20B | GPT-OSS 120B | Qwen3 30B-A3B |
-|---|---|---|---|
-| Total parameters | 21 B | 117 B | 30.5 B |
-| Active per token | ~3.6 B | ~5.1 B | ~3.3 B |
-| Hidden size | 2880 | 2880 | 2048 |
-| Layers (all MoE) | 24 | 36 | 48 |
-| Experts / layer | 32 | 128 | 128 |
-| Active experts / token | 4 (top-4) | 4 (top-4) | 8 (top-8) |
-| Attention | GQA, sliding-window + full, attention sinks, YaRN | same | GQA + QK-Norm, full only |
-| Activation | clipped SwiGLU | clipped SwiGLU | plain SwiGLU (SiLU) |
-| Converted size | ~14 GB | ~66 GB | ~20 GB |
+| Property | GPT-OSS 20B | GPT-OSS 120B | Qwen3 30B-A3B | MiniMax-M2 |
+|---|---|---|---|---|
+| Total parameters | 21 B | 117 B | 30.5 B | 230 B |
+| Active per token | ~3.6 B | ~5.1 B | ~3.3 B | ~10 B |
+| Hidden size | 2880 | 2880 | 2048 | 3072 |
+| Layers (all MoE) | 24 | 36 | 48 | 62 |
+| Experts / layer | 32 | 128 | 128 | 256 |
+| Active experts / token | 4 (top-4) | 4 (top-4) | 8 (top-8) | 8 (top-8) |
+| Attention | GQA, sliding-window + full, attention sinks, YaRN | same | GQA + QK-Norm, full only | GQA, full only, partial RoPE (64/128) + whole-vector QK-Norm |
+| Routing | softmax top-k | softmax top-k | softmax-normalized top-k | sigmoid; bias selects, unbiased score weights |
+| Activation | clipped SwiGLU | clipped SwiGLU | plain SwiGLU (SiLU) | plain SwiGLU (SiLU) |
+| Converted size | ~14 GB | ~66 GB | ~20 GB | ~122 GB |
 
-Quantization (both families): experts are INT4 (group-scaled, 64) — or INT3 gs64
-with `--expert-bits 3`; the embedding and output head are INT8; attention is F32 by
-default, or **INT8 with `--dense-bits 8`** (near-lossless, the biggest speedup lever
-— see section 4). The engine reads every dimension from `config.json` and flips the
-family-specific behaviors from the model's `model_type`, so the GPT-OSS path is
-byte-for-byte unchanged. A dense (non-MoE) checkpoint is converted as a 1-expert MoE
+Quantization (all families): experts are INT4 (group-scaled, 64) — or INT3 gs64
+with `--expert-bits 3`, which `convert_minimax.py` does not yet offer; the embedding
+and output head are INT8; attention is F32 by default, or **INT8 with
+`--dense-bits 8`** (near-lossless, the biggest speedup lever — see section 4). The
+engine reads every dimension from `config.json` and flips the family-specific
+behaviors from the model's `model_type`, so the GPT-OSS path is byte-for-byte
+unchanged. A dense (non-MoE) checkpoint is converted as a 1-expert MoE
 (single MLP as expert 0 + a zero router), so the streaming engine runs it unchanged
 — handy for a small resident draft model.
 
@@ -881,6 +892,7 @@ tok.h                  Built-in approximate tokenizer (fallback for bare-metal r
 Makefile / build.bat   Build for Linux/macOS and Windows
 
 convert.py             Convert a GPT-OSS (MXFP4/BF16) or Qwen3-MoE (BF16) model to INT4
+convert_minimax.py     Convert a MiniMax-M2 GPTQ-INT4 checkpoint to Picchio INT4
 convert_streaming.py   Shard-by-shard download+convert for the GPT-OSS 120B
 convert_streaming_qwen.py  Shard-by-shard download+convert for a Qwen3-MoE model
 export_vocab.py        Build the binary tokenizer file
@@ -890,6 +902,7 @@ transcode_attn_to_int8.py  Requantize attention F32 -> INT8 in place (no re-down
 
 chat.py                Token-exact GPT-OSS chat bridge (Harmony)
 chat_qwen.py           Qwen3-MoE chat bridge (ChatML via transformers)
+chat_minimax.py        MiniMax-M2 chat bridge (always-on reasoning, think/answer split)
 picchio_logo.py        Shared terminal logo/banner for the chat bridges
 server.py              OpenAI-compatible HTTP API server
 requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
@@ -897,6 +910,11 @@ requirements-chat.txt  Dependency for chat.py / server.py (openai-harmony)
 make_test_model.py     Generate a tiny synthetic model for validation
 test_forward.py        Numeric oracle to validate the forward pass
 test_qwen_smoke.py     End-to-end synthetic Qwen3-MoE smoke test (optional deps)
+make_minimax_test_model.py  Build a tiny MiniMax-M2 fixture + oracle from upstream code
+fuse_minimax_test_model.py  Rewrite that fixture into Picchio's tensor naming
+minimax_forward_check.c     Standalone MiniMax-M2 forward pass (validation scratch)
+verify_minimax.py           Diff that forward pass against the oracle, logit by logit
+reference/minimax_m2/       Vendored upstream MiniMax-M2 modeling code (Apache-2.0)
 
 net_bench.py           Measure LAN latency/throughput (sizing the distributed split)
 pipe_node.py           Prototype of the 2-stage pipeline with byte-identity check
@@ -1001,7 +1019,158 @@ comparison against `transformers` and a long multi-turn session remain pending.
 
 ---
 
-## 13. Distributed inference across two machines
+## 13. Running a MiniMax-M2 model
+
+[MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) is a 230 B-parameter MoE
+that activates only ~10 B per token across 62 layers of 256 experts. Converted it
+is **~122 GB**, so unlike the other families it does not fit in RAM on any consumer
+machine — it streams from disk end to end. Expect it to be I/O-bound.
+
+### a) Install the dependencies
+
+```powershell
+pip install torch safetensors numpy huggingface_hub transformers
+```
+
+### b) Get a GPTQ-INT4 checkpoint
+
+The published weights are FP8. The practical route today is the community
+GPTQ-INT4 quantization, which `convert_minimax.py` consumes directly:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:HF_HUB_DISABLE_XET = "1"
+hf download ModelCloud/MiniMax-M2-GPTQMODEL-W4A16 --local-dir D:\models\MiniMax-M2-GPTQ-INT4 --max-workers 4
+```
+
+That is a **126 GB** download. `HF_HUB_DISABLE_XET=1` and a bounded
+`--max-workers` are there on purpose: the accelerated Xet path opened dozens of
+concurrent connections and stalled on the test machine. The download is resumable
+— rerun the same command after an interruption.
+
+### c) Convert
+
+```powershell
+$env:PYTHONUTF8 = "1"
+python convert_minimax.py --input D:\models\MiniMax-M2-GPTQ-INT4 --output D:\models\minimax_m2_i4 --dense-bits 8
+```
+
+It dequantizes each GPTQ linear, fuses the gate/up expert matrices, and requantizes
+to Picchio's native INT4 gs64. On start it prints the checkpoint's zero-point
+offset, e.g. `GPTQ checkpoint zero-point offset: +1 (v1 'gptq' format)` — that line
+matters (see [What differs under the hood](#what-differs-under-the-hood-1)).
+
+Add `--delete-source` to remove each source shard right after it is read, which
+keeps peak disk use near the size of one copy instead of two. It is **destructive**:
+the original checkpoint is gone afterwards, so a reconversion means re-downloading.
+
+Then build the tokenizer file and copy the tokenizer metadata the chat bridge needs:
+
+```powershell
+python export_vocab.py D:\models\minimax_m2_i4\tokenizer.json D:\models\minimax_m2_i4\picchio_vocab.bin
+```
+
+The converter copies `config.json`; `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.jinja`, `special_tokens_map.json`, `added_tokens.json`, `vocab.json`
+and `merges.txt` must sit next to it too, or `AutoTokenizer` will find no chat
+template and no EOS.
+
+### d) Chat
+
+```powershell
+python chat_minimax.py --model D:\models\minimax_m2_i4 --ctx 4096 --pin-gb 20 --async-moe --direct
+```
+
+Omit the prompt for an interactive session; `/help` lists the commands. Options
+mirror the other bridges, plus `--show-thinking` (below).
+
+### Reasoning is always on
+
+MiniMax-M2's chat template ends its generation prompt with a literal `<think>`, so
+every reply *starts inside* a reasoning block: the model emits its reasoning, then
+`</think>`, then the user-facing answer. There is no `enable_thinking` switch to
+turn this off, unlike Qwen3. `chat_minimax.py` splits the reply on the `</think>`
+token and by default hides the reasoning behind a progress spinner; pass
+`--show-thinking` to stream it under a dim `THINKING` heading.
+
+Budget for it: `--max-tokens` has to cover the reasoning *and* the answer. If the
+limit lands mid-reasoning the bridge says so rather than printing nothing.
+
+### Measured performance (MiniMax-M2)
+
+On a **12-core AVX2 laptop, 32 GB RAM, D: on an entry-level NVMe (KIOXIA BG4)** —
+a different, larger machine than the 16 GB laptop used for the table at the top of
+this README, so these numbers are not comparable with those:
+
+| Configuration | tok/s | Expert-cache hit |
+|---|---:|---:|
+| `--pin-gb 12` | 0.34 | 42.9% |
+| `+ --async-moe --direct` | 0.40 | 42.9% |
+| `+ --pin-gb 20` | **0.48** | 54.6% |
+
+`--pin-gb` is the dominant lever here, because the experts total ~119 GB and even
+a 20 GB cache holds only ~17% of them while each token touches 496 of them across
+62 layers. Raising `--io-threads` past the default 4 changed nothing — the NVMe is
+not queue-depth limited. `IDOT=1` bought ~5% but visibly changed the output, which
+is expected (the integer expert kernel is approximate) and not a good trade.
+
+Unlike the other families, repeat runs do **not** get faster: the learned hot-store
+converged immediately and the resident expert set stopped changing. For comparison,
+`gpt-oss-120b` reaches ~2 tok/s on this same machine, because it streams roughly 4×
+less expert data per token (128 experts × 36 layers at INT3, against 256 × 62 at
+INT4).
+
+The remaining lever not yet implemented is **INT3 experts** (~22% fewer bytes, so
+more fit in cache *and* less to read). The engine already supports it
+(`picchio_expert_bits: 3`, `matmul_i3_gs`); `convert_minimax.py` currently hardcodes
+INT4 for experts.
+
+### What differs under the hood
+
+Detection is by `model_type: "minimax"` in `config.json`, and the three
+architectural switches are described under
+[Supported models](#supported-models). Two further details are worth recording,
+because both are quiet failure modes:
+
+**The GPTQ v1 zero-point.** A `checkpoint_format: "gptq"` checkpoint (v1, as
+opposed to `"gptq_v2"`) stores its zero-points **pre-decremented by 1**; GPTQModel
+adds them back at load time. Dequantizing without that `+1` biases every weight by
+exactly `+1 × scale`. Per weight that is only ~30% of the weight standard deviation
+and looks harmless, but across a matmul it adds `c·Σx` to every output, and since
+`x` leaves an RMSNorm with positive gains that sum is large and positive — so every
+projection picks up a positive bias, RMSNorm never recenters it, and over 62 layers
+the hidden state explodes into noise. The symptom is fluent-looking garbage.
+`convert_minimax.py` reads `checkpoint_format` and refuses to guess. A cheap guard
+for any GPTQ conversion: dequantize one weight matrix and assert its mean is ≈ 0.
+
+**The tensor-count ceiling.** `ST_MAX_TENSORS` in [`st.h`](st.h) is a budget for the
+*whole* tensor database, not per shard. MiniMax-M2's 256 experts × 62 layers × 4
+tensors is ~63 k on its own; the old 32 768 limit silently stopped registering
+tensors partway through loading instead of reporting an error. It is now 131 072.
+
+Current validation status: the C forward pass matches the real upstream
+`MiniMaxM2ForCausalLM` on a synthetic fixture to `max|Δlogit| = 1e-6`
+(`minimax_forward_check.c` + `verify_minimax.py`), and the architecture was
+cross-checked line by line against llama.cpp's own `minimax-m2.cpp`, which agrees
+on all three switches. The converted 230 B checkpoint loads all 64 349 tensors and
+generates coherent text. A full-model numeric oracle comparison against
+`transformers` is still pending.
+
+**On reproducing that fixture:** `minimax_test_model/` and its Picchio-named twin
+are committed (~250 KB) precisely because they are *not* safely regenerable today.
+transformers' own in-tree MiniMax-M2 support has a RoPE defect
+([#48241](https://github.com/huggingface/transformers/issues/48241)): the default
+RoPE path ignores `partial_rotary_factor` and rotates the full 128-wide head
+instead of MiniMax's 64. On transformers ≥ 5.0 the vendored upstream code hits that
+same path, so regenerating the oracle there would quietly produce a *wrong*
+reference and make a correct engine look broken.
+`make_minimax_test_model.py` refuses to run on 5.x for that reason; pin
+`transformers<5.0` if you really need to rebuild it. The same defect is why
+`transformers` is not currently a trustworthy oracle for this architecture.
+
+---
+
+## 14. Distributed inference across two machines
 
 Picchio can split inference across **two machines on the same network**. The layers
 are cut at a boundary: the **coordinator** (machine A) loads the first layers plus
@@ -1078,6 +1247,6 @@ The design notes and the measurement harnesses (`net_bench.py` for LAN latency,
 
 ---
 
-## 14. License
+## 15. License
 
 MIT. See [`LICENSE`](LICENSE).
