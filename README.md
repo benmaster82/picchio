@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/gpt--oss--20b-3.3_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-20b: 3.3 tok/s">
   <img src="https://img.shields.io/badge/Qwen3--30B--A3B-2.9_tok%2Fs-2ea44f?style=flat-square" alt="Qwen3-30B-A3B: 2.9 tok/s">
   <img src="https://img.shields.io/badge/gpt--oss--120b-1.24_tok%2Fs-2ea44f?style=flat-square" alt="gpt-oss-120b: 1.24 tok/s">
-  <img src="https://img.shields.io/badge/MiniMax--M2-0.48_tok%2Fs-2ea44f?style=flat-square" alt="MiniMax-M2: 0.48 tok/s">
+  <img src="https://img.shields.io/badge/MiniMax--M2-0.48_tok%2Fs_%2832_GB_RAM%29-2ea44f?style=flat-square" alt="MiniMax-M2: 0.48 tok/s (32 GB RAM)">
   <br>
   <img src="https://img.shields.io/badge/language-pure_C-00599C?style=flat-square" alt="pure C">
   <img src="https://img.shields.io/badge/runs-larger_than_RAM-blue?style=flat-square" alt="runs models larger than RAM">
