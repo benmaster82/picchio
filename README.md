@@ -1073,16 +1073,13 @@ Add `--delete-source` to remove each source shard right after it is read, which
 keeps peak disk use near the size of one copy instead of two. It is **destructive**:
 the original checkpoint is gone afterwards, so a reconversion means re-downloading.
 
-Then build the tokenizer file and copy the tokenizer metadata the chat bridge needs:
+The converter copies the metadata the runtime and the bridge need — `config.json`,
+the tokenizer files, `chat_template.jinja` — so the output directory is
+self-contained. One step is left, building the binary vocabulary:
 
 ```powershell
 python export_vocab.py D:\models\minimax_m2_i4\tokenizer.json D:\models\minimax_m2_i4\picchio_vocab.bin
 ```
-
-The converter copies `config.json`; `tokenizer.json`, `tokenizer_config.json`,
-`chat_template.jinja`, `special_tokens_map.json`, `added_tokens.json`, `vocab.json`
-and `merges.txt` must sit next to it too, or `AutoTokenizer` will find no chat
-template and no EOS.
 
 ### d) Chat
 
@@ -1165,8 +1162,8 @@ on all three switches. The converted 230 B checkpoint loads all 64 349 tensors a
 generates coherent text. A full-model numeric oracle comparison against
 `transformers` is still pending.
 
-**On reproducing that fixture:** `minimax_test_model/` and its Picchio-named twin
-are committed (~250 KB) precisely because they are *not* safely regenerable today.
+**On reproducing that fixture:** `minimax_test_model/` is committed (~132 KB)
+precisely because it is *not* safely regenerable today.
 transformers' own in-tree MiniMax-M2 support has a RoPE defect
 ([#48241](https://github.com/huggingface/transformers/issues/48241)): the default
 RoPE path ignores `partial_rotary_factor` and rotates the full 128-wide head

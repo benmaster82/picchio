@@ -105,6 +105,47 @@ def dequant_gptq_linear(qweight: np.ndarray, qzeros: np.ndarray,
     return dequant.T  # -> [OUT, IN], the nn.Linear.weight convention
 
 
+#   config.json         picchio.c reads every dimension from it.
+#   tokenizer.*, vocab, merges, chat_template, special/added tokens
+#                       AutoTokenizer in chat_minimax.py needs the full set;
+#                       without tokenizer_config.json and chat_template.jinja it
+#                       finds no chat template and no EOS id.
+#   generation_config.json  carried for completeness.
+# Deliberately NOT copied: quantize_config.json (describes the *source* GPTQ
+# packing, meaningless once requantized) and model.safetensors.index.json (maps
+# the source shard layout, so it would actively mislead here).
+_SIDECAR_FILES = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+)
+
+
+def copy_sidecar_files(inp: Path, out: Path) -> None:
+    """Copy the metadata the runtime and the chat bridge need alongside the
+    weights, so the output directory is self-contained and loadable as-is."""
+    copied, missing = [], []
+    for name in _SIDECAR_FILES:
+        src = inp / name
+        if src.is_file():
+            shutil.copy2(src, out / name)
+            copied.append(name)
+        else:
+            missing.append(name)
+    print(f"\ncopied {len(copied)} metadata files: {', '.join(copied)}")
+    if missing:
+        print(f"  not present in the source (may be fine): {', '.join(missing)}")
+    if not (out / "config.json").is_file():
+        print("  WARNING: no config.json in the output — picchio.exe cannot load "
+              "this directory until you place one there.")
+
+
 def zero_offset_for_checkpoint(model_dir: Path) -> int:
     """1 for a v1 ("gptq") checkpoint, 0 for v2 ("gptq_v2"). See
     dequant_gptq_linear's docstring for why this matters so much."""
@@ -327,9 +368,13 @@ def main():
         print(f"  WARNING: {len(raw_pending)} GPTQ linears never completed "
               f"(missing qweight/qzeros/scales/g_idx): {list(raw_pending)[:3]} ...")
 
+    copy_sidecar_files(inp, out)
+
     print(f"\ndone. gptq linears dequantized: {stats['gptq_dequant']}, "
           f"dense f32: {stats['dense_f32']/1e6:.1f} MB, dense i8: {stats['dense_i8']/1e6:.1f} MB, "
           f"expert i4: {stats['expert_i4']/1e6:.1f} MB, other: {stats['other']/1e6:.1f} MB")
+    print(f"\nnext: python export_vocab.py {out}/tokenizer.json {out}/picchio_vocab.bin")
+    print(f"      python chat_minimax.py --model {out} --ctx 4096 --pin-gb 20 --async-moe --direct")
 
 
 if __name__ == "__main__":

@@ -56,9 +56,15 @@ dev/
 test_model_i3/
 test_model_i4/
 
-# MiniMax-M2: minimax_test_model/ and its Picchio-named twin are deliberately
-# NOT ignored (~250 KB). Unlike test_model/, they are not reliably regenerable:
-# the oracle is only correct on transformers < 5.0 (see the version guard in
-# make_minimax_test_model.py), so the committed copy IS the reference.
+# MiniMax-M2: minimax_test_model/ is deliberately NOT ignored (~132 KB). Unlike
+# test_model/ it is not reliably regenerable — the oracle is only correct on
+# transformers < 5.0 (see the version guard in make_minimax_test_model.py), so
+# the committed copy IS the reference.
+#
+# Its Picchio-named twin IS ignored: fuse_minimax_test_model.py rebuilds it
+# byte-identically from the above, using only numpy + safetensors, so it carries
+# none of that version hazard. Regenerate with:
+#   python fuse_minimax_test_model.py minimax_test_model minimax_test_model_picchio
+minimax_test_model_picchio/
 minimax_test_model_deep/
 minimax_test_model_deep_picchio/
