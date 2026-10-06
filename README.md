@@ -174,9 +174,10 @@ from the [Releases page](https://github.com/benmaster82/picchio/releases/latest)
 - Download **`picchio.exe`** and place it in the project folder. Release assets
   use this exact stable name, so every command below works without renaming it.
 - It is a **static build**: no MinGW DLLs, runs from anywhere.
-- Releases can lag the source tree. Version 0.7.0 adds INT8 attention
-  (`--dense-bits 8`), dense-model conversion, and speculative-decoding
-  scaffolding on top of 0.6.0's `.picchioflat`, direct I/O, `ASYNC_MOE`, INT3,
+- Releases can lag the source tree. Version 0.8.0 adds the **MiniMax-M2** family
+  (230 B / ~10 B active) with its converter and chat bridge, on top of 0.7.0's
+  INT8 attention (`--dense-bits 8`), dense-model conversion and speculative-decoding
+  scaffolding, and 0.6.0's `.picchioflat`, direct I/O, `ASYNC_MOE`, INT3,
   Qwen3-MoE, and two-node pipeline; compile from source only when you need
   changes newer than the latest release.
 - Requires **Windows x64 with an AVX2/FMA CPU** (2013 or newer). The binary is
