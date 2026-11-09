@@ -348,8 +348,9 @@ same question produced a correct answer. `chat.py` therefore exposes
 as not to alter the tests.
 
 Real two-turn conversation on the 20B: the second turn reused 279 of 294 positions,
-i.e. 95%, processing only 15, and the answer was correct. The cache hit rises with
-use thanks to the hot-store, from 67.1% to 79.2% in the same session.
+i.e. 95%, processing only 15, and the answer was correct. The observed cache hit
+rose from 67.1% to 79.2% in the same session. Experts remain in the in-process LRU;
+this observation does not demonstrate a benefit from persistent routing counts.
 
 **Model location.** Copying the container from the external SSD measured 52.7 MB/s
 sequential, a value consistent with a USB 2.0 link and not with the drive's
@@ -919,9 +920,12 @@ active experts per token (vs 8 in GLM), predictability may differ, to be measure
 ### 2.4 Per-layer LRU cache
 
 Each MoE layer has a pool of reusable `ESlot`s (expert slots). The policy is LRU:
-the least recently used expert is evicted. In addition, a "learned" hot-store
-(.picchio_usage) tracks per-expert frequency and automatically pins the hottest
-ones.
+the least recently used expert is evicted. `.picchio_usage` tracks per-expert
+frequency across sessions. By default it only restores counters; optional
+`HOTSTORE_PRELOAD=N` loads at most N positive-frequency experts per owned layer
+into the existing evictable LRU, capped by its capacity. `eheat` is incremented
+but does not drive promotion, and the `pin`/`npin`
+structures are not populated. See [the issue #8 investigation](docs/issue-8-hotstore.md).
 
 ### 2.5 Dual-SSD
 

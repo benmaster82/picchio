@@ -271,7 +271,7 @@ typedef struct {
     ESlot **pin;          /* pinned experts (never evicted) */
     int *npin;
     uint32_t **eusage;    /* persistent per-expert counters */
-    uint32_t **eheat;     /* recent heat (for promotion) */
+    uint32_t **eheat;     /* session routing counts; no promotion policy yet */
 
     /* Working set of the current forward */
     ESlot ws[32];         /* experts in flight (max topk per batch) */
@@ -3381,7 +3381,8 @@ static void service_stats(Model *m, int pos, int cap) {
  *  PERSISTENT HOT-STORE (.picchio_usage)
  *
  *  Saves the routing counters between sessions.
- *  On the next startup, the hottest experts are preloaded.
+ *  Startup restores counters. HOTSTORE_PRELOAD optionally warms the ordinary
+ *  evictable LRU; no experts are permanently pinned.
  * ═══════════════════════════════════════════════════════════ */
 
 static const char *g_model_path_global = NULL;
@@ -3438,24 +3439,80 @@ static void hotstore_load(Model *m) {
     if (fread(&n_layers, 4, 1, f) != 1) { fclose(f); return; }
     if (fread(&n_experts, 4, 1, f) != 1) { fclose(f); return; }
     
-    if ((int)n_layers != c->n_layers || (int)n_experts != c->n_experts) {
-        fprintf(stderr, "  hot-store: dimensions do not match, ignoring\n");
+    if (version != 1 || n_layers != (uint32_t)c->n_layers ||
+        n_experts != (uint32_t)c->n_experts) {
+        fprintf(stderr, "  hot-store: version or dimensions do not match, ignoring\n");
         fclose(f);
         return;
     }
     
+    /* Validate the complete payload before publishing any counters. A partial
+     * file must not silently bias the warm start toward its first layers. */
+    size_t count = (size_t)c->n_layers * c->n_experts;
+    uint32_t *usage = calloc(count, sizeof(uint32_t));
+    if (!usage) { fclose(f); return; }
+    if (fread(usage, sizeof(uint32_t), count, f) != count) {
+        fprintf(stderr, "  hot-store: incomplete counters, ignoring\n");
+        free(usage); fclose(f); return;
+    }
     uint64_t total_usage = 0;
     for (int l = 0; l < c->n_layers; l++) {
         if (m->eusage[l]) {
-            fread(m->eusage[l], sizeof(uint32_t), c->n_experts, f);
+            memcpy(m->eusage[l], usage + (size_t)l * c->n_experts,
+                   (size_t)c->n_experts * sizeof(uint32_t));
             for (int e = 0; e < c->n_experts; e++)
                 total_usage += m->eusage[l][e];
         }
     }
     
+    free(usage);
     fclose(f);
     fprintf(stderr, "  hot-store loaded: %llu routings recorded\n",
             (unsigned long long)total_usage);
+}
+
+/* Synchronous startup only, before prefetch/async workers are started.
+ * Select at most the existing per-layer capacity, skip zero-frequency entries,
+ * and use the normal loader/slots so quantization and storage paths are shared.
+ * Load colder entries first so the hottest gets the newest LRU timestamp. */
+static int hotstore_preload(Model *m, int layer_lo, int layer_hi) {
+    const char *value = getenv("HOTSTORE_PRELOAD");
+    if (!value) return 0;
+    char *end;
+    double requested = strtod(value, &end);
+    if (end == value || *end || !isfinite(requested) || requested < 0 ||
+        requested > INT_MAX || requested != floor(requested)) {
+        fprintf(stderr, "error: HOTSTORE_PRELOAD must be a nonnegative integer slots/layer\n");
+        return -1;
+    }
+    int limit = requested > m->ecap ? m->ecap : (int)requested;
+    if (!limit) return 0;
+    int *selected = malloc((size_t)limit * sizeof(int));
+    if (!selected) { fprintf(stderr, "error: hot-store selection allocation failed\n"); return -1; }
+    double start = now_s();
+    int loaded = 0;
+    for (int l = layer_lo; l < layer_hi; l++) {
+        int n = 0;
+        for (int k = 0; k < limit; k++) {
+            int best = -1;
+            for (int e = 0; e < m->c.n_experts; e++) {
+                if (!m->eusage[l][e]) continue;
+                int used = 0;
+                for (int j = 0; j < n; j++) if (selected[j] == e) used = 1;
+                if (!used && (best < 0 || m->eusage[l][e] > m->eusage[l][best])) best = e;
+            }
+            if (best < 0) break;
+            selected[n++] = best;  /* ties: lower expert ID first */
+        }
+        for (int k = n - 1; k >= 0; k--) {
+            cache_lookup(m, l, selected[k]);
+            loaded++;
+        }
+    }
+    free(selected);
+    fprintf(stderr, "  hot-store preload: %d experts, max %d slots/layer, %.3f s (evictable LRU)\n",
+            loaded, limit, now_s() - start);
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -5446,6 +5503,7 @@ int main(int argc, char **argv) {
 
     /* Load the hot-store from a previous session */
     hotstore_load(&m);
+    if (hotstore_preload(&m, g_pipe_lo, g_pipe_hi) != 0) { st_close(&db); return 1; }
 
     /* ── 4. Load the tokenizer ──
      * Only the bare-metal text path uses the built-in tokenizer. In SERVICE mode

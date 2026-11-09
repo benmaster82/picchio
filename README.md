@@ -392,8 +392,10 @@ python chat.py "Write a short greeting in English." --model C:\models\gptoss20b_
 
 - **`--model`**: the folder you converted in step 4. **You must pass this**
   (the built-in default points at a 120B path and won't match your setup).
-- **`--pin-gb`**: how many GB of RAM to spend on the expert cache. More = faster
-  (fewer disk reads). `4` is a good start on a 16 GB machine.
+- **`--pin-gb`**: expert-cache budget in GiB (not permanently pinned experts).
+  A larger cache can reduce reads, but may slow inference if it creates memory
+  pressure or leaves less room for the OS page cache. `4` is a starting point
+  on a 16 GB machine; measure throughput and memory use before increasing it.
 - **`--ctx`**: context window in tokens (how much conversation history fits).
   `1024` is fine to start.
 
@@ -593,8 +595,8 @@ and are streamed on demand:
 
 ![Picchio loading the 120B: reading config, opening all 15 shards, dense weights loaded at 5.04 GB resident](assets/screenshot-120b-startup.png)
 
-The first turn is slow (it streams every expert from disk); later turns reuse the
-KV prefix and the learned hot-store, so they speed up. You can see this in a real
+The first turn loads the required experts on demand; later turns can reuse the
+KV prefix and experts still in the in-process LRU cache. You can see KV reuse in a real
 three-turn session: the `reused` counter on each stats line climbs from `0/82` to
 `169/187` to `291/307` as the KV-cache prefix is carried over between turns.
 
@@ -615,7 +617,7 @@ Test configuration:
 | Model | GPT-OSS-120B, INT4 (gs64) experts, F32 attention (~66 GB) |
 | Storage | external SSD (shards split across two drives via `--model-aux`) |
 | Launch | `--no-reasoning --ctx 4096 --pin-gb 6 --threads 6 --temperature 0` |
-| Expert cache | 6 GB pinned (`--pin-gb 6`), 4 parallel I/O threads |
+| Expert cache | 6 GiB LRU budget (`--pin-gb 6`), 4 parallel I/O threads |
 
 Three-turn chat, generating 16 tokens per turn:
 
@@ -702,6 +704,7 @@ flags map onto these). The most useful:
 | `MODEL` | (none) | Path to the converted model folder (or pass it as the first argument). |
 | `PIN_GB` | **auto** | GB of RAM for the expert cache. **The single biggest performance knob.** Auto-sizing considers physical RAM, RAM currently available, the estimated dense allocation, and the exact INT3/INT4 expert size. A bigger cache means fewer disk reads. Setting a value overrides the auto-sizing. |
 | `CTX` | 512 | KV-cache size in tokens (max prompt+generation length). |
+| `HOTSTORE_PRELOAD` | `0` | Startup experts per owned layer, selected from `.picchio_usage` by frequency and capped by existing LRU capacity. Experts remain evictable. Compare startup plus generation time; see the [benchmark protocol](docs/issue-8-hotstore.md). |
 | `OMP_NUM_THREADS` | all cores | Number of CPU threads for the matmuls. |
 | `MAX` | 128 | Max tokens to generate (bare-metal run only). |
 | `TEMPERATURE` | 1.0 | Sampling temperature (`0` = greedy). |
@@ -878,9 +881,21 @@ there is a template that asks for these fields.
 output head) stay resident in RAM. For each token the router picks the top-k of
 the layer's experts (4 of 128 on GPT-OSS-120B, 4 of 32 on the 20B, 8 of 128 on
 Qwen3-30B-A3B); Picchio loads just those experts, computing them while an
-LRU cache keeps recently-used experts around and a learned hot-store keeps the
-most frequently used ones pinned. Because only a few experts are touched per
-token, total disk traffic is a fraction of the model size.
+LRU cache keeps recently-used experts around. `.picchio_usage` persists routing
+counts between processes; optional `HOTSTORE_PRELOAD` warms the evictable LRU
+from those counts. No experts are permanently pinned. Because only a
+few experts are touched per token, total disk traffic is a fraction of the model size.
+
+Persistent routing statistics, the in-process expert cache, the OS page cache,
+and KV prefix reuse are separate mechanisms. By default, loading `.picchio_usage`
+only restores statistics. Set `HOTSTORE_PRELOAD=4` to load up to four previously
+used experts per owned layer at startup (clamped to the existing LRU capacity).
+The startup log reports loaded experts and preload time; compare total startup
+plus generation latency before enabling this for your workload. Stale counts can
+slow unrelated prompts. Files are checked for version, dimensions and complete
+counters, but do not identify checkpoints: do not reuse a usage file from another
+model with matching dimensions. See the [issue #8 investigation and benchmark
+protocol](docs/issue-8-hotstore.md) for the code findings and Qwen comparison plan.
 
 ### Engine schema
 
@@ -912,7 +927,7 @@ MEMORY HIERARCHY
 ================
   GPU VRAM (optional) │ resident routers + GPU-guided prefetch      small, fast
   RAM                 │ dense (attn+router+embed+head) + expert LRU  hot experts
-                      │ + learned hot-store (pins frequent experts)
+                      │ routing counters (optional LRU warm start; no pinning)
   SSD / NVMe          │ the remaining "cold" experts (bulk of model) streamed
 ```
 
@@ -1179,8 +1194,9 @@ a 20 GB cache holds only ~17% of them while each token touches 496 of them acros
 not queue-depth limited. `IDOT=1` bought ~5% but visibly changed the output, which
 is expected (the integer expert kernel is approximate) and not a good trade.
 
-Unlike the other families, repeat runs do **not** get faster: the learned hot-store
-converged immediately and the resident expert set stopped changing. For comparison,
+In these MiniMax measurements, repeat runs did **not** get faster. Persistent
+routing statistics do not control cache placement, so this observation cannot
+be attributed to hot-store convergence. For comparison,
 `gpt-oss-120b` reaches ~2 tok/s on this same machine, because it streams roughly 4×
 less expert data per token (128 experts × 36 layers at INT3, against 256 × 62 at
 INT4).
