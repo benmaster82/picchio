@@ -61,14 +61,14 @@ an existing async, GPU or IDOT compute path took precedence.
 
 ```powershell
 .\build.bat
-.\dev\venv\Scripts\python.exe -X utf8 test_moe_grouped.py --exe .\picchio.exe
+python -X utf8 test_moe_grouped.py --exe .\picchio.exe
 ```
 
 On Linux/macOS use your Python environment and `--exe ./picchio`. The test needs
 numpy and safetensors. It creates only temporary synthetic model files.
 
 Tests compare legacy and grouped execution for synthetic GPT-OSS, Qwen and
-MiniMax configurations, F32/INT3/INT4 gs64/INT4 per-row experts, and 1/2/4 CPU
+MiniMax configurations, F32/INT3/INT4 gs64/INT4 per-row experts, and 1/2/4/6 CPU
 threads. They require byte-identical oracle tensors (including logits and
 routing), greedy token/finish frames, scratch reuse, eviction with a small cache,
 KV prefix truncation, RESET, and the production prefill/async/IDOT fallback paths.
@@ -98,22 +98,78 @@ and 8.02 GB final RSS, the same reported final RSS as the reference. Internal
 timers must not be summed as independent wall-clock intervals.
 
 These are two runs per mode on one prompt and one machine, not a broad
-performance guarantee. The option stays disabled by default. Longer prompts,
-different models, thread counts and storage-limited/async workloads still need
-separate performance measurements.
+performance guarantee. The option stays disabled by default. Additional models,
+longer contexts and storage-limited/async workloads still need repeated performance
+measurements; the expanded validation below covers more exact CPU settings.
+
+## Expanded release validation (2026-11-12)
+
+The same exact CPU implementation was tested with 4/6 threads and 2/4 GiB expert
+budgets on the machine above, now with context 1024. All modes generated identical
+raw token IDs, finish reasons and positions. Validation included:
+
+- A 34-token prompt with 32 generated tokens under each thread/cache setting.
+- A 393-token prompt with 24 generated tokens at 4 threads / 4 GiB.
+- Three conversational turns at 4 threads / 4 GiB. Both modes answered `OK`,
+  `ORIONE-42`, and `verde`, reusing 39 and then 75 KV-prefix tokens.
+- RESET between workloads and unchanged model-owned scratch across turns.
+
+The matrix contains 16 real-model turns, plus two turns in a repeated short pair.
+Prefill and decode were measured separately. Fresh processes were used per mode
+and setting; the long and conversational workloads shared their process after
+RESET, retaining its expert cache. OS page-cache state was uncontrolled.
+
+| Short workload: threads / cache | Reference total | Grouped total | Reference decode | Grouped decode |
+| --- | --- | --- | --- | --- |
+| 4 / 4 GiB, repeated pair | 30.94 s | 28.85 s | 15.74 s | 13.57 s |
+| 6 / 4 GiB | 27.27 s | 26.25 s | 13.55 s | 12.36 s |
+| 4 / 2 GiB | 32.27 s | 29.82 s | 17.09 s | 14.92 s |
+| 6 / 2 GiB | 28.21 s | 27.20 s | 15.09 s | 13.83 s |
+
+These are exploratory pairs, not averages from a large benchmark. Six threads
+with 4 GiB was fastest among the measured short configurations on this i7;
+the result does not override the contributor's different Linux hardware in #8.
+
+Two large timing outliers are retained in the raw records: the initial 4-thread /
+4-GiB reference short turn took 240.40 s (224.85 s decode), and the grouped long
+turn took 570.57 s (556.93 s prefill). Their causes were not established. The short
+pair was repeated, yielding the first table row. No speedup is calculated from
+the anomalous original short pair.
+
+For the long workload, reference/grouped decode was 15.10 / 13.63 s, but the full
+turn was 186.12 / 570.57 s because of the prefill outlier. Grouped expert decode
+does not execute during that batched prefill. The slower full-turn observation
+is not hidden or represented as an end-to-end gain. The option stays off by default.
+
+Raw IDs, timings, counters and caveats are in the [validation record](benchmarks/grouped-qwen-windows-2026-11-12.json).
+To reproduce with an existing converted model and local tokenizer, activate your
+Python model environment and run:
+
+```powershell
+python -X utf8 benchmark_qwen_cpu.py --exe .\picchio.exe --model ..\models\qwen3_30b_i4 --output grouped-validation.json
+```
+
+On Linux use your Python environment and `--exe ./picchio`. The harness requires
+Transformers/tokenizers, uses only local model/tokenizer files, and explicitly
+disables IDOT, GPU, prefetch, direct I/O and async MoE. `--threads` and `--cache-gib`
+accept lists; `--short-only` omits long/conversational workloads. It retains logs
+and partial results if a run fails, with protocol timeouts and owned-process
+cleanup. Later runs also record optional Windows process CPU time to help
+investigate wall-time stalls; that metric was not present in the original matrix.
+Linux/macOS runtime coverage remains outstanding.
 
 ## Trying it locally
 
-From the repository in PowerShell:
+From the repository in PowerShell, with your Python model environment activated:
 
 ```powershell
 $env:MOE_GROUPED = '1'
-.\dev\venv\Scripts\python.exe -X utf8 chat_qwen.py --model ..\models\qwen3_30b_i4 --exe .\dev\picchio-grouped.exe --ctx 512 --pin-gb 4 --threads 4 --io-threads 4 --no-reasoning
+python -X utf8 chat_qwen.py --model ..\models\qwen3_30b_i4 --ctx 512 --pin-gb 4 --threads 4 --io-threads 4 --no-reasoning
 ```
 
-The separate executable is used for local validation when a running chat holds
-the original `picchio.exe` open. After a normal rebuild, omit `--exe` to use the
-standard executable. Set `MOE_GROUPED=0` for the reference scheduler.
+This uses the standard rebuilt executable. Local developers can select a separate
+test executable with `--exe PATH` while an existing chat holds `picchio.exe` open.
+Set `MOE_GROUPED=0` for the reference scheduler.
 
 Measure identical prompts/tokens, thread count, cache budget and storage settings.
 Alternate the two modes and report startup, generation, attention, MoE, memory

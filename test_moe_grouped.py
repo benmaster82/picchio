@@ -101,7 +101,7 @@ def main():
                 model = root / f'{family}-{bits}'
                 fixture(model, bits, family)
                 reference = run(exe, model, 0, 1, root)
-                for threads in (1, 2, 4):
+                for threads in (1, 2, 4, 6):
                     candidate = run(exe, model, 1, threads, root)
                     assert candidate[0] == reference[0], (family, bits, threads, 'tokens')
                     assert candidate[1] == reference[1], (family, bits, threads, 'oracle tensors')
