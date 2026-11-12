@@ -705,6 +705,7 @@ flags map onto these). The most useful:
 | `PIN_GB` | **auto** | GB of RAM for the expert cache. **The single biggest performance knob.** Auto-sizing considers physical RAM, RAM currently available, the estimated dense allocation, and the exact INT3/INT4 expert size. A bigger cache means fewer disk reads. Setting a value overrides the auto-sizing. |
 | `CTX` | 512 | KV-cache size in tokens (max prompt+generation length). |
 | `HOTSTORE_PRELOAD` | `0` | Startup experts per owned layer, selected from `.picchio_usage` by frequency and capped by existing LRU capacity. Experts remain evictable. Compare startup plus generation time; see the [benchmark protocol](docs/issue-8-hotstore.md). |
+| `MOE_GROUPED` | `0` | Experimental CPU decode: schedule selected experts in one OpenMP team and reuse model-owned scratch. Same kernels and router-order reduction. Async I/O retains its existing scheduler; IDOT/trace and GPU expert work retain their existing compute paths. See [design and validation](docs/grouped-cpu-experts.md). |
 | `OMP_NUM_THREADS` | all cores | Number of CPU threads for the matmuls. |
 | `MAX` | 128 | Max tokens to generate (bare-metal run only). |
 | `TEMPERATURE` | 1.0 | Sampling temperature (`0` = greedy). |

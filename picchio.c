@@ -276,6 +276,12 @@ typedef struct {
     /* Working set of the current forward */
     ESlot ws[32];         /* experts in flight (max topk per batch) */
 
+    /* Decode scratch, owned by the single forward caller (not I/O workers).
+     * Sized lazily and reused across layers/turns. Draft models own their copy. */
+    float *moe_scratch;
+    int64_t moe_scratch_n;
+    uint64_t moe_scratch_allocs, moe_grouped_calls;
+
     /* Profiling */
     uint64_t eclock;      /* monotonic counter for LRU */
     uint64_t hits, miss, ereq; /* cache statistics */
@@ -2045,6 +2051,79 @@ static void router_weights(const Cfg *c, float *scores, const int *sel,
     }
 }
 
+static int g_moe_grouped = 0;
+
+/* Scheduling inspired by Pithos: all selected experts share one parallel team.
+ * No Pithos kernels/formats are copied. Keep Picchio's per-row arithmetic and
+ * router-order reduction, including bias, clipped/plain SwiGLU and scaling. */
+static void moe_grouped(float *out, const float *x, ESlot **slots, int K,
+                        const float *weights, float *gu_all, float *eo_all,
+                        int layer, const Cfg *c) {
+    int D = c->hidden, I = c->moe_inter, half = I / 2;
+    int gu_tiles = (I + 63) / 64, down_tiles = (D + 63) / 64;
+    double start = now_s();
+    #pragma omp parallel
+    {
+        #pragma omp for collapse(2) schedule(static)
+        for (int k = 0; k < K; k++) for (int tile = 0; tile < gu_tiles; tile++) {
+            int begin = tile * 64, end = begin + 64; if (end > I) end = I;
+            float *gu = gu_all + (int64_t)k * I;
+            matmul_qt_rows(gu, x, &slots[k]->gu, begin, end);
+            if (slots[k]->gu_bias)
+                for (int i = begin; i < end; i++) gu[i] += slots[k]->gu_bias[i];
+        }
+        #pragma omp for schedule(static)
+        for (int k = 0; k < K; k++) {
+            float *gu = gu_all + (int64_t)k * I;
+            if (g_oracle_dir) {
+                char name[128]; int64_t shape[2] = {1, I};
+                snprintf(name, sizeof(name), "layer%d.expert%d.gate_up", layer, k);
+                oracle_dump(name, gu, 2, shape);
+            }
+            /* Sequential within each expert: activation writes into the same
+             * buffer that holds interleaved gate/up pairs. */
+            for (int i = 0; i < half; i++) {
+                float gate = gu[2 * i], up = gu[2 * i + 1];
+                if (c->swiglu_clipped) {
+                    if (gate > c->swiglu_limit) gate = c->swiglu_limit;
+                    if (up > c->swiglu_limit) up = c->swiglu_limit;
+                    if (up < -c->swiglu_limit) up = -c->swiglu_limit;
+                    gu[i] = (up + 1.0f) * gate * sigmoidf(c->swiglu_alpha * gate);
+                } else gu[i] = gate * sigmoidf(gate) * up;
+            }
+            if (g_oracle_dir) {
+                char name[128]; int64_t shape[2] = {1, half};
+                snprintf(name, sizeof(name), "layer%d.expert%d.activated", layer, k);
+                oracle_dump(name, gu, 2, shape);
+            }
+        }
+        #pragma omp for collapse(2) schedule(static)
+        for (int k = 0; k < K; k++) for (int tile = 0; tile < down_tiles; tile++) {
+            int begin = tile * 64, end = begin + 64; if (end > D) end = D;
+            float *eo = eo_all + (int64_t)k * D;
+            matmul_qt_rows(eo, gu_all + (int64_t)k * I, &slots[k]->d, begin, end);
+            if (slots[k]->d_bias)
+                for (int i = begin; i < end; i++) eo[i] += slots[k]->d_bias[i];
+        }
+    }
+    for (int k = 0; k < K; k++) {
+        float *eo = eo_all + (int64_t)k * D;
+        float w = weights[k] * c->routed_scale;
+        if (g_oracle_dir) {
+            char name[128]; int64_t shape[2] = {1, D};
+            snprintf(name, sizeof(name), "layer%d.expert%d.output", layer, k);
+            oracle_dump(name, eo, 2, shape);
+            float *contribution = falloc(D);
+            for (int i = 0; i < D; i++) contribution[i] = w * eo[i];
+            snprintf(name, sizeof(name), "layer%d.expert%d.contribution", layer, k);
+            oracle_dump(name, contribution, 2, shape);
+            free(contribution);
+        }
+        for (int i = 0; i < D; i++) out[i] += w * eo[i];
+    }
+    g_expert_compute_seconds += now_s() - start;
+}
+
 static void expert_apply(ESlot *es, const float *x, float *dst, float w,
                          const Cfg *c);
 
@@ -2054,7 +2133,19 @@ static void moe_forward(float *out, const float *x, Model *m,
     int E = c->n_experts;
     int K = c->topk;
     /* 1. Router: compute a score for each expert (unbiased raw logit) */
-    float *scores = falloc(E);
+    if (g_moe_grouped) {
+        int64_t needed = E + (int64_t)c->topk * (c->moe_inter + (int64_t)D);
+        if (needed > m->moe_scratch_n) {
+            float *fresh = falloc(needed);
+            free(m->moe_scratch);
+            m->moe_scratch = fresh;
+            m->moe_scratch_n = needed;
+            m->moe_scratch_allocs++;
+        }
+    }
+    float *scores = g_moe_grouped ? m->moe_scratch : falloc(E);
+    float *scratch_gu = g_moe_grouped ? m->moe_scratch + E : NULL;
+    float *scratch_eo = g_moe_grouped ? scratch_gu + (int64_t)c->topk * c->moe_inter : NULL;
     router_scores_into(m, layer, x, c, scores);
 
     /* MiniMax: top-k SELECTION uses (sigmoid(logit) + correction_bias), but
@@ -2153,7 +2244,7 @@ static void moe_forward(float *out, const float *x, Model *m,
     /* 5. Load and compute each expert. ASYNC_MOE lets ready experts run while
      * other selected misses are still being read. Validation and GPU modes use
      * the established blocking path. */
-    float *expert_out = calloc(D, sizeof(float));
+    float *expert_out = g_moe_grouped ? scratch_eo : calloc(D, sizeof(float));
     memset(out, 0, D * sizeof(float));
 
     ESlot *slots[64];
@@ -2271,13 +2362,25 @@ static void moe_forward(float *out, const float *x, Model *m,
         }
     }
 
-    for (int k = 0; !gpu_done && !async_done && k < K; k++) {
+    int grouped_done = 0;
+    if (g_moe_grouped && !gpu_done && !async_done && !g_trace_numeric) {
+        int supported = 1;
+        for (int k = 0; k < K; k++)
+            if (!slots[k] || slots[k]->eid < 0 ||
+                !qt_rows_supported(&slots[k]->gu) || !qt_rows_supported(&slots[k]->d)) supported = 0;
+        if (supported) {
+            moe_grouped(out, x, slots, K, weights, scratch_gu, scratch_eo, layer, c);
+            m->moe_grouped_calls++;
+            grouped_done = 1;
+        }
+    }
+    for (int k = 0; !gpu_done && !async_done && !grouped_done && k < K; k++) {
         ESlot *es = slots[k];
         if (es->eid < 0) continue;  /* load error */
         double compute_start = now_s();
 
         int I = c->moe_inter;  /* 5760 = gate_up fused */
-        float *gu = falloc(I);
+        float *gu = g_moe_grouped ? scratch_gu : falloc(I);
 
         /* gate_up fused: one matmul for [5760, 2880] × x */
         matmul_qt(gu, x, &es->gu, 1);
@@ -2345,7 +2448,7 @@ static void moe_forward(float *out, const float *x, Model *m,
         for (int i = 0; i < D; i++)
             out[i] += w * expert_out[i];
 
-        free(gu);
+        if (!g_moe_grouped) free(gu);
         g_expert_compute_seconds += now_s() - compute_start;
     }
 
@@ -2355,7 +2458,7 @@ static void moe_forward(float *out, const float *x, Model *m,
         oracle_dump_vec(n, out, D);
     }
 
-    free(scores); free(expert_out);
+    if (!g_moe_grouped) { free(scores); free(expert_out); }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -3260,6 +3363,11 @@ static int prefill_tokens(Model *m, const int *ids, int n, int pos_base) {
 static void stats_dump(Model *m) {
     fprintf(stderr, "\n── picchio stats ──\n");
     fprintf(stderr, "forward:    %llu\n", (unsigned long long)m->n_fw);
+    if (m->moe_grouped_calls)
+        fprintf(stderr, "grouped decode: %llu layers, %llu scratch allocations, %.1f KiB scratch\n",
+                (unsigned long long)m->moe_grouped_calls,
+                (unsigned long long)m->moe_scratch_allocs,
+                m->moe_scratch_n * sizeof(float) / 1024.0);
     fprintf(stderr, "token out:  %llu\n", (unsigned long long)m->n_emit);
     fprintf(stderr, "cache hit:  %llu / %llu (%.1f%%)\n",
             (unsigned long long)m->hits,
@@ -3326,6 +3434,7 @@ static void service_stats(Model *m, int pos, int cap) {
     }
 #endif
     printf("STATS {"
+           "\"moe_grouped_calls\":%llu,\"moe_scratch_allocs\":%llu,\"moe_scratch_bytes\":%llu,"
            "\"position\":%d,\"capacity\":%d,"
            "\"prefill_tokens\":%llu,\"decode_tokens\":%llu,"
            "\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f,"
@@ -3347,6 +3456,9 @@ static void service_stats(Model *m, int pos, int cap) {
            "\"prefetch_issued\":%llu,"
            "\"prefetch_read_seconds\":%.9f,\"predict_hits_a\":%llu,"
            "\"predict_hits_b\":%llu,\"predict_total\":%llu}\n",
+           (unsigned long long)m->moe_grouped_calls,
+           (unsigned long long)m->moe_scratch_allocs,
+           (unsigned long long)m->moe_scratch_n * sizeof(float),
            pos, cap,
            (unsigned long long)g_service_prefill_tokens,
            (unsigned long long)g_service_decode_tokens,
@@ -5164,6 +5276,7 @@ static void spec_decode(Model *tgt, int *prompt, int n_prompt, int max_tokens,
 }
 
 int main(int argc, char **argv) {
+    { const char *v = getenv("MOE_GROUPED"); if (v) g_moe_grouped = atoi(v) != 0; }
     { const char *v = getenv("EXPERT_REUSE"); if (v) g_expert_reuse = atoi(v) != 0; }
     fprintf(stderr, "🪶 picchio v0.8.0 — MoE streaming engine\n");
     fprintf(stderr, "   GPT-OSS/Qwen3-MoE/MiniMax-M2 · INT3/INT4 · native CPU/GPU streaming\n\n");

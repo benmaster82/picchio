@@ -118,10 +118,9 @@ static inline int hsum256_i32(__m256i v) {
 
 /* ── Matmul F32: y[S,O] = x[S,I] @ W^T ── */
 
-static void matmul_f32(float *y, const float *x, const float *W,
-                       int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+static inline void matmul_f32_rows(float *y, const float *x, const float *W,
+                       int S, int I, int O, int begin, int end) {
+    for (int o = begin; o < end; o++) {
         const float *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
@@ -151,12 +150,18 @@ static void matmul_f32(float *y, const float *x, const float *W,
     }
 }
 
+static void matmul_f32(float *y, const float *x, const float *W,
+                       int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++)
+        matmul_f32_rows(y, x, W, S, I, O, o, o + 1);
+}
+
 /* ── Matmul INT8: y[S,O] = x[S,I] @ W_q8^T * scale ── */
 
-static void matmul_q8(float *y, const float *x, const int8_t *q,
-                      const float *scale, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+static inline void matmul_q8_rows(float *y, const float *x, const int8_t *q,
+                      const float *scale, int S, int I, int O, int begin, int end) {
+    for (int o = begin; o < end; o++) {
         const int8_t *w = q + (int64_t)o * I;
         float sc = scale[o];
         for (int s = 0; s < S; s++) {
@@ -189,14 +194,20 @@ static void matmul_q8(float *y, const float *x, const int8_t *q,
     }
 }
 
+static void matmul_q8(float *y, const float *x, const int8_t *q,
+                      const float *scale, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++)
+        matmul_q8_rows(y, x, q, scale, S, I, O, o, o + 1);
+}
+
 /* ── Matmul INT4: y[S,O] = x[S,I] @ W_i4^T * scale ── */
 /* INT4 packed: 2 values/byte, value = nibble - 8 (range [-8, 7]) */
 
-static void matmul_i4(float *y, const float *x, const uint8_t *q4,
-                      const float *scale, int S, int I, int O) {
+static inline void matmul_i4_rows(float *y, const float *x, const uint8_t *q4,
+                      const float *scale, int S, int I, int O, int begin, int end) {
     int rb = (I + 1) / 2;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (int o = begin; o < end; o++) {
         const uint8_t *w = q4 + (int64_t)o * rb;
         float sc = scale[o];
         for (int s = 0; s < S; s++) {
@@ -256,16 +267,22 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4,
     }
 }
 
+static void matmul_i4(float *y, const float *x, const uint8_t *q4,
+                      const float *scale, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++)
+        matmul_i4_rows(y, x, q4, scale, S, I, O, o, o + 1);
+}
+
 /* ── Matmul INT4 Group-Scaled (gs64): one scale every 64 values ── */
 /* scale layout: [O, n_groups] where n_groups = ceil(I / 64)
  * Packed data: identical to INT4 (2 nibbles/byte, value = nibble - 8) */
 
-static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
-                         const float *scale, int S, int I, int O, int gs) {
+static inline void matmul_i4_gs_rows(float *y, const float *x, const uint8_t *q4,
+                         const float *scale, int S, int I, int O, int gs, int begin, int end) {
     int rb = (I + 1) / 2;
     int n_groups = (I + gs - 1) / gs;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (int o = begin; o < end; o++) {
         const uint8_t *w = q4 + (int64_t)o * rb;
         const float *sc = scale + (int64_t)o * n_groups;
         for (int s = 0; s < S; s++) {
@@ -320,6 +337,13 @@ static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
             y[(int64_t)s * O + o] = a;
         }
     }
+}
+
+static void matmul_i4_gs(float *y, const float *x, const uint8_t *q4,
+                         const float *scale, int S, int I, int O, int gs) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++)
+        matmul_i4_gs_rows(y, x, q4, scale, S, I, O, gs, o, o + 1);
 }
 
 /* ── Matmul INT4 gs64, IDOT path: INT8-quantized activation × INT4 weight ──
@@ -505,13 +529,12 @@ static inline int quant_idot_vnni(void) { return q_idot_vnni; }
  * bandwidth and RAM at a small quality cost. Packing fixes gs=64. */
 #define I3_GROUP  64
 #define I3_GBYTES 24
-static void matmul_i3_gs(float *y, const float *x, const uint8_t *q3,
-                         const float *scale, int S, int I, int O, int gs) {
+static inline void matmul_i3_gs_rows(float *y, const float *x, const uint8_t *q3,
+                         const float *scale, int S, int I, int O, int gs, int begin, int end) {
     (void)gs;
     int n_groups = (I + I3_GROUP - 1) / I3_GROUP;
     int64_t row_bytes = (int64_t)n_groups * I3_GBYTES;
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
+    for (int o = begin; o < end; o++) {
         const uint8_t *wr = q3 + (int64_t)o * row_bytes;
         const float *sc = scale + (int64_t)o * n_groups;
         for (int s = 0; s < S; s++) {
@@ -603,6 +626,13 @@ static void matmul_i3_gs(float *y, const float *x, const uint8_t *q3,
     }
 }
 
+static void matmul_i3_gs(float *y, const float *x, const uint8_t *q3,
+                         const float *scale, int S, int I, int O, int gs) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++)
+        matmul_i3_gs_rows(y, x, q3, scale, S, I, O, gs, o, o + 1);
+}
+
 /* Quantize F32 rows to INT3 gs64 (mirror of the Python converter, used by the
  * self-test). Writes packed planes into `q3` and one F32 scale per group. */
 static void quantize_rows_i3_gs(const float *w, uint8_t *q3, float *scale, int O, int I) {
@@ -636,6 +666,24 @@ static void quantize_rows_i3_gs(const float *w, uint8_t *q3, float *scale, int O
 }
 
 /* ── Dispatcher: picks the kernel based on the format ── */
+
+/* Serial row ranges for a caller-owned parallel team. Same dot-product order
+ * as the ordinary kernels; the output keeps the full matrix row stride.
+ * IDOT has separate activation preparation and is deliberately excluded. */
+static int qt_rows_supported(const QT *w) {
+    return w->fmt == 0 || w->fmt == 1 || w->fmt == 5 ||
+           (w->fmt == 2 && !q_idot_enabled);
+}
+
+static void matmul_qt_rows(float *y, const float *x, const QT *w, int begin, int end) {
+    if (w->fmt == 0) matmul_f32_rows(y, x, w->qf, 1, w->I, w->O, begin, end);
+    else if (w->fmt == 1) matmul_q8_rows(y, x, w->q8, w->s, 1, w->I, w->O, begin, end);
+    else if (w->fmt == 5) matmul_i3_gs_rows(y, x, w->q4, w->s, 1, w->I, w->O, w->block_size, begin, end);
+    else if (w->fmt == 2 && w->block_size > 0)
+        matmul_i4_gs_rows(y, x, w->q4, w->s, 1, w->I, w->O, w->block_size, begin, end);
+    else if (w->fmt == 2) matmul_i4_rows(y, x, w->q4, w->s, 1, w->I, w->O, begin, end);
+    else { fprintf(stderr, "unsupported grouped row format %d\n", w->fmt); exit(1); }
+}
 
 static void matmul_qt(float *y, const float *x, QT *w, int S) {
     if (w->fmt == 0) { matmul_f32(y, x, w->qf, S, w->I, w->O); return; }
